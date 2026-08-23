@@ -1,0 +1,18 @@
+
+> Deepseek@0.1.0 build:prod
+> node scripts/build-wrapper.js prod
+
+[build-wrapper] 自动生成 backend-blob.js...
+内嵌完成: D:\codes\youdao\Deepseek\app\src\services\backend-blob.js
+原始大小: 4463.5 KB
+Base64 长度: 5951.4 KB
+[build-wrapper] backend-blob.js 生成完成
+preferring built-in module 'fs' over local alternative at 'fs', pass 'preferBuiltins: false' to disable this behavior or 'preferBuiltins: true' to disable this warning
+preferring built-in module 'http' over local alternative at 'http', pass 'preferBuiltins: false' to disable this behavior or 'preferBuiltins: true' to disable this warning
+preferring built-in module 'fs' over local alternative at 'fs', pass 'preferBuiltins: false' to disable this behavior or 'preferBuiltins: true' to disable this warning
+preferring built-in module 'http' over local alternative at 'http', pass 'preferBuiltins: false' to disable this behavior or 'preferBuiltins: true' to disable this warning
+[33m未找到以下模块,可能会导致应用运行时异常(如模块为原生模块请忽略):
+global,fs,http
+[0m
+[32m应用构建成功,目录: D:\codes\youdao\Deepseek\app\.falcon_[0m
+[build-wrapper] 开始 qjsc 预编译...

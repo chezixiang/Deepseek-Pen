@@ -1,0 +1,613 @@
+//! DeepSeek HTTP 客户端 —— 原始 API 调用层
+//!
+//! 无状态管理：无缓存、无重试、无会话状态。
+//! 每个方法对应一个 REST 端点（详见 docs/ds-api-reference.md）。
+//! 流方法（completion/edit_message）返回原始字节流，由上层解析 SSE。
+//!
+//! 仅包含最小业务逻辑：HTTP 错误码和业务错误码解析（into_result）。
+
+use bytes::Bytes;
+use futures::{Stream, TryStreamExt};
+use log::warn;
+use rquest::multipart::{Form, Part};
+use rquest_util::Emulation;
+use serde::{Deserialize, Serialize};
+use std::pin::Pin;
+use thiserror::Error;
+
+// API 端点常量
+const ENDPOINT_USERS_LOGIN: &str = "/users/login";
+const ENDPOINT_CHAT_SESSION_CREATE: &str = "/chat_session/create";
+const ENDPOINT_CHAT_SESSION_DELETE: &str = "/chat_session/delete";
+#[allow(dead_code)]
+const ENDPOINT_CHAT_SESSION_UPDATE_TITLE: &str = "/chat_session/update_title";
+const ENDPOINT_CHAT_CREATE_POW_CHALLENGE: &str = "/chat/create_pow_challenge";
+const ENDPOINT_CHAT_COMPLETION: &str = "/chat/completion";
+#[allow(dead_code)]
+const ENDPOINT_CHAT_EDIT_MESSAGE: &str = "/chat/edit_message";
+const ENDPOINT_CHAT_STOP_STREAM: &str = "/chat/stop_stream";
+const ENDPOINT_FILE_UPLOAD: &str = "/file/upload_file";
+const ENDPOINT_FILE_FETCH: &str = "/file/fetch_files";
+
+#[derive(Debug, Error)]
+pub enum ClientError {
+    /// HTTP 层错误（网络、超时、DNS 等）
+    #[error("HTTP error: {0}")]
+    Http(#[from] rquest::Error),
+
+    /// HTTP 状态码非 2xx
+    #[error("HTTP status {status}: {body}")]
+    Status { status: u16, body: String },
+
+    /// 业务错误：API 返回 HTTP 200 但 biz_code 非 0
+    #[error("Business error: code={code}, msg={msg}")]
+    Business { code: i64, msg: String },
+
+    /// 登录触发数美/人机验证，需要用户透传完成
+    #[error("Captcha required: {body}")]
+    CaptchaRequired { body: String },
+
+    /// JSON 解析失败
+    #[error("JSON parse error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    /// Header 值包含非法字符
+    #[error("Invalid header value: {0}")]
+    InvalidHeader(String),
+
+    /// 数据验证失败
+    #[error("Validation error: {0}")]
+    Validation(String),
+}
+
+#[derive(Debug, Deserialize)]
+struct Envelope<T> {
+    pub code: i64,
+    pub msg: String,
+    pub data: Option<EnvelopeData<T>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EnvelopeData<T> {
+    pub biz_code: i64,
+    pub biz_msg: String,
+    pub biz_data: Option<T>,
+}
+
+impl<T: serde::de::DeserializeOwned> Envelope<T> {
+    fn into_result(self) -> Result<T, ClientError> {
+        if self.code != 0 {
+            return Err(ClientError::Business {
+                code: self.code,
+                msg: self.msg,
+            });
+        }
+        let data = self.data.ok_or_else(|| ClientError::Business {
+            code: -1,
+            msg: "missing data".into(),
+        })?;
+        if data.biz_code != 0 {
+            return Err(ClientError::Business {
+                code: data.biz_code,
+                msg: data.biz_msg,
+            });
+        }
+        match data.biz_data {
+            Some(t) => Ok(t),
+            None => {
+                // 允许 biz_data 为 null，尝试从 null 构造 T（仅当 T 是 Option 时成功）
+                serde_json::from_value(serde_json::Value::Null).map_err(|_| ClientError::Business {
+                    code: -1,
+                    msg: "missing biz_data".into(),
+                })
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct LoginPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mobile: Option<String>,
+    pub password: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub area_code: Option<String>,
+    pub device_id: String,
+    pub os: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LoginData {
+    pub code: i64,
+    pub msg: String,
+    pub user: UserInfo,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UserInfo {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub token: String,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub mobile_number: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateSessionData {
+    pub id: String,
+}
+
+// biz_data 里面嵌套 chat_session 对象
+#[derive(Debug, Deserialize)]
+struct CreateSessionWrapper {
+    pub chat_session: CreateSessionData,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UploadFileData {
+    pub id: String,
+    #[allow(dead_code)]
+    pub status: String,
+    #[allow(dead_code)]
+    pub file_name: String,
+    #[allow(dead_code)]
+    pub file_size: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FetchFilesData {
+    pub files: Vec<FileInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FileInfo {
+    #[allow(dead_code)]
+    pub id: String,
+    pub status: String,
+    pub file_name: String,
+    #[allow(dead_code)]
+    pub file_size: i64,
+    #[serde(default)]
+    pub token_usage: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChallengeData {
+    pub algorithm: String,
+    pub challenge: String,
+    pub salt: String,
+    pub signature: String,
+    pub difficulty: i64,
+    #[allow(dead_code)]
+    pub expire_after: i64,
+    pub expire_at: i64,
+    pub target_path: String,
+}
+
+// 包装类型：biz_data 里面嵌套了 challenge 对象
+#[derive(Debug, Deserialize)]
+struct ChallengeWrapper {
+    challenge: ChallengeData,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompletionPayload {
+    pub chat_session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_message_id: Option<i64>,
+    pub model_type: String,
+    pub prompt: String,
+    pub ref_file_ids: Vec<String>,
+    pub thinking_enabled: bool,
+    pub search_enabled: bool,
+    pub preempt: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[allow(dead_code)]
+pub struct EditMessagePayload {
+    pub chat_session_id: String,
+    pub message_id: i64,
+    pub prompt: String,
+    pub search_enabled: bool,
+    pub thinking_enabled: bool,
+    pub model_type: String,
+}
+
+#[derive(Debug, Serialize)]
+#[allow(dead_code)]
+pub struct UpdateTitlePayload {
+    pub chat_session_id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StopStreamPayload {
+    pub chat_session_id: String,
+    pub message_id: i64,
+}
+
+/// Check if a response is an AWS WAF Challenge (US IP restriction)
+fn is_waf_challenge(resp: &rquest::Response) -> bool {
+    resp.status().as_u16() == 202 && resp.headers().get("x-amzn-waf-action").is_some()
+}
+
+/// 粗略判断登录响应是否包含数美/人机验证信息。
+fn is_captcha_body(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    (lower.contains("captcha")
+        || lower.contains("verify")
+        || lower.contains("risk")
+        || lower.contains("shumei")
+        || lower.contains("数美"))
+        && (lower.contains("organization")
+            || lower.contains("appid")
+            || lower.contains("rid")
+            || lower.contains("register")
+            || lower.contains("captchauuid"))
+}
+
+/// Print a hint when WAF challenge is detected
+fn print_waf_hint() {
+    warn!(target: "ds_core::client", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    warn!(target: "ds_core::client", "  AWS WAF Challenge detected.");
+    warn!(target: "ds_core::client", "  DeepSeek CloudFront WAF blocks US-based IPs.");
+    warn!(target: "ds_core::client", "  Rust HTTP clients can't execute the JS challenge.");
+    warn!(target: "ds_core::client", "");
+    warn!(target: "ds_core::client", "  To fix this, configure a non-US proxy in config.toml:");
+    warn!(target: "ds_core::client", "    [proxy]");
+    warn!(target: "ds_core::client", "    url = \"http://127.0.0.1:7890\"");
+    warn!(target: "ds_core::client", "");
+    warn!(target: "ds_core::client", "  https://github.com/niyue/ds-free-api");
+    warn!(target: "ds_core::client", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+}
+
+#[derive(Clone)]
+pub struct DsClient {
+    http: rquest::Client,
+    api_base: String,
+    wasm_url: String,
+    user_agent: String,
+    client_version: String,
+    client_platform: String,
+    client_locale: String,
+}
+
+impl DsClient {
+    pub fn new(
+        api_base: String,
+        wasm_url: String,
+        user_agent: String,
+        client_version: String,
+        client_platform: String,
+        client_locale: String,
+        proxy_url: Option<&str>,
+    ) -> Self {
+        let mut builder = rquest::Client::builder()
+            .emulation(Emulation::Chrome136)
+            .redirect(rquest::redirect::Policy::limited(10));
+        if let Some(url) = proxy_url.and_then(|u| rquest::Proxy::all(u).ok()) {
+            builder = builder.proxy(url);
+        }
+        Self {
+            http: builder.build().expect("构建 HTTP 客户端失败"),
+            api_base,
+            wasm_url,
+            user_agent,
+            client_version,
+            client_platform,
+            client_locale,
+        }
+    }
+
+    fn auth_headers(&self, token: &str) -> Result<rquest::header::HeaderMap, ClientError> {
+        let mut h = rquest::header::HeaderMap::new();
+        h.insert(
+            rquest::header::USER_AGENT,
+            rquest::header::HeaderValue::from_str(&self.user_agent)
+                .map_err(|e| ClientError::InvalidHeader(format!("User-Agent: {e}")))?,
+        );
+        h.insert(
+            rquest::header::AUTHORIZATION,
+            rquest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|e| ClientError::InvalidHeader(format!("Authorization: {e}")))?,
+        );
+        h.insert(
+            "X-Client-Version",
+            rquest::header::HeaderValue::from_str(&self.client_version)
+                .map_err(|e| ClientError::InvalidHeader(format!("X-Client-Version: {e}")))?,
+        );
+        h.insert(
+            "X-Client-Platform",
+            rquest::header::HeaderValue::from_str(&self.client_platform)
+                .map_err(|e| ClientError::InvalidHeader(format!("X-Client-Platform: {e}")))?,
+        );
+        h.insert(
+            "X-Client-Locale",
+            rquest::header::HeaderValue::from_str(&self.client_locale)
+                .map_err(|e| ClientError::InvalidHeader(format!("X-Client-Locale: {e}")))?,
+        );
+        Ok(h)
+    }
+
+    fn auth_headers_with_pow(
+        &self,
+        token: &str,
+        pow_response: &str,
+    ) -> Result<rquest::header::HeaderMap, ClientError> {
+        let mut h = self.auth_headers(token)?;
+        h.insert(
+            "X-Ds-Pow-Response",
+            rquest::header::HeaderValue::from_str(pow_response)
+                .map_err(|e| ClientError::InvalidHeader(format!("X-Ds-Pow-Response: {e}")))?,
+        );
+        Ok(h)
+    }
+
+    async fn parse_envelope<T: serde::de::DeserializeOwned>(
+        resp: rquest::Response,
+    ) -> Result<T, ClientError> {
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Status {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let envelope: Envelope<T> = resp.json().await?;
+        envelope.into_result()
+    }
+
+    pub async fn login(&self, payload: &LoginPayload) -> Result<LoginData, ClientError> {
+        let mut h = rquest::header::HeaderMap::new();
+        h.insert(
+            rquest::header::USER_AGENT,
+            rquest::header::HeaderValue::from_str(&self.user_agent)
+                .map_err(|e| ClientError::InvalidHeader(format!("User-Agent: {e}")))?,
+        );
+        let resp = self
+            .http
+            .post(format!("{}{}", self.api_base, ENDPOINT_USERS_LOGIN))
+            .headers(h)
+            .json(payload)
+            .send()
+            .await?;
+
+        if is_waf_challenge(&resp) {
+            print_waf_hint();
+            return Err(ClientError::Status {
+                status: 202,
+                body: "WAF Challenge: use a non-US proxy".into(),
+            });
+        }
+
+        Self::parse_envelope::<LoginData>(resp).await
+    }
+
+    pub async fn create_session(&self, token: &str) -> Result<String, ClientError> {
+        let resp = self
+            .http
+            .post(format!("{}{}", self.api_base, ENDPOINT_CHAT_SESSION_CREATE))
+            .headers(self.auth_headers(token)?)
+            .json(&serde_json::json!({}))
+            .send()
+            .await?;
+        let wrapper: CreateSessionWrapper = Self::parse_envelope(resp).await?;
+        let session_id = wrapper.chat_session.id;
+        if session_id.is_empty() {
+            return Err(ClientError::Validation(
+                "会话 ID 为空，上游未返回 chat_session.id".to_string(),
+            ));
+        }
+        Ok(session_id)
+    }
+
+    pub async fn delete_session(&self, token: &str, session_id: &str) -> Result<(), ClientError> {
+        let resp = self
+            .http
+            .post(format!("{}{}", self.api_base, ENDPOINT_CHAT_SESSION_DELETE))
+            .headers(self.auth_headers(token)?)
+            .json(&serde_json::json!({ "chat_session_id": session_id }))
+            .send()
+            .await?;
+        Self::parse_envelope::<Option<()>>(resp).await?;
+        Ok(())
+    }
+
+    pub async fn create_pow_challenge(
+        &self,
+        token: &str,
+        target_path: &str,
+    ) -> Result<ChallengeData, ClientError> {
+        let resp = self
+            .http
+            .post(format!(
+                "{}{}",
+                self.api_base, ENDPOINT_CHAT_CREATE_POW_CHALLENGE
+            ))
+            .headers(self.auth_headers(token)?)
+            .json(&serde_json::json!({ "target_path": target_path }))
+            .send()
+            .await?;
+        let wrapper: ChallengeWrapper = Self::parse_envelope(resp).await?;
+        let challenge = wrapper.challenge;
+        Ok(challenge)
+    }
+
+    pub async fn completion(
+        &self,
+        token: &str,
+        pow_response: &str,
+        payload: &CompletionPayload,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Bytes, ClientError>> + Send>>, ClientError> {
+        let resp = self
+            .http
+            .post(format!("{}{}", self.api_base, ENDPOINT_CHAT_COMPLETION))
+            .headers(self.auth_headers_with_pow(token, pow_response)?)
+            .json(payload)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Status {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        Ok(Box::pin(resp.bytes_stream().map_err(ClientError::Http)))
+    }
+
+    #[allow(dead_code)]
+    pub async fn edit_message(
+        &self,
+        token: &str,
+        pow_response: &str,
+        payload: &EditMessagePayload,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Bytes, ClientError>> + Send>>, ClientError> {
+        let resp = self
+            .http
+            .post(format!("{}{}", self.api_base, ENDPOINT_CHAT_EDIT_MESSAGE))
+            .headers(self.auth_headers_with_pow(token, pow_response)?)
+            .json(payload)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Status {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        Ok(Box::pin(resp.bytes_stream().map_err(ClientError::Http)))
+    }
+
+    #[allow(dead_code)]
+    pub async fn update_title(
+        &self,
+        token: &str,
+        payload: &UpdateTitlePayload,
+    ) -> Result<(), ClientError> {
+        let resp = self
+            .http
+            .post(format!(
+                "{}{}",
+                self.api_base, ENDPOINT_CHAT_SESSION_UPDATE_TITLE
+            ))
+            .headers(self.auth_headers(token)?)
+            .json(payload)
+            .send()
+            .await?;
+        Self::parse_envelope::<serde::de::IgnoredAny>(resp).await?;
+        Ok(())
+    }
+
+    /// 取消正在进行的流式输出，不需要 PoW
+    pub async fn stop_stream(
+        &self,
+        token: &str,
+        payload: &StopStreamPayload,
+    ) -> Result<(), ClientError> {
+        let resp = self
+            .http
+            .post(format!("{}{}", self.api_base, ENDPOINT_CHAT_STOP_STREAM))
+            .headers(self.auth_headers(token)?)
+            .json(payload)
+            .send()
+            .await?;
+        Self::parse_envelope::<Option<()>>(resp).await?;
+        Ok(())
+    }
+
+    /// 上传文件，返回文件元数据（id, status 等）
+    pub async fn upload_file(
+        &self,
+        token: &str,
+        pow_response: &str,
+        filename: &str,
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<UploadFileData, ClientError> {
+        let part = Part::bytes(bytes)
+            .file_name(filename.to_string())
+            .mime_str(content_type)?;
+        let form = Form::new().part("file", part);
+
+        let resp = self
+            .http
+            .post(format!("{}{}", self.api_base, ENDPOINT_FILE_UPLOAD))
+            .headers(self.auth_headers_with_pow(token, pow_response)?)
+            .multipart(form)
+            .send()
+            .await?;
+        Self::parse_envelope::<UploadFileData>(resp).await
+    }
+
+    /// 查询文件状态，返回文件列表（含 status: PENDING/SUCCESS/FAILED）
+    pub async fn fetch_files(
+        &self,
+        token: &str,
+        file_ids: &[String],
+    ) -> Result<FetchFilesData, ClientError> {
+        let ids = file_ids.join(",");
+        let resp = self
+            .http
+            .get(format!("{}{}", self.api_base, ENDPOINT_FILE_FETCH))
+            .headers(self.auth_headers(token)?)
+            .query(&[("file_ids", &ids)])
+            .send()
+            .await?;
+        Self::parse_envelope::<FetchFilesData>(resp).await
+    }
+
+    pub async fn get_wasm(&self) -> Result<Bytes, ClientError> {
+        let resp = self.http.get(&self.wasm_url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Status {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(resp.bytes().await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CreateSessionWrapper, Envelope};
+
+    #[test]
+    fn parses_nested_chat_session_id() {
+        let envelope: Envelope<CreateSessionWrapper> = serde_json::from_str(
+            r#"{
+                "code": 0,
+                "msg": "",
+                "data": {
+                    "biz_code": 0,
+                    "biz_msg": "",
+                    "biz_data": {
+                        "chat_session": {
+                            "id": "01234567-89ab-cdef-0123-456789abcdef"
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("nested chat_session response should deserialize");
+
+        let wrapper = envelope.into_result().expect("envelope should be successful");
+        assert_eq!(wrapper.chat_session.id, "01234567-89ab-cdef-0123-456789abcdef");
+    }
+}

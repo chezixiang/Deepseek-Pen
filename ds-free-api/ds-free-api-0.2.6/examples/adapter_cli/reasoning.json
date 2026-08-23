@@ -1,0 +1,7 @@
+{
+  "model": "deepseek-expert",
+  "messages": [
+    { "role": "user", "content": "分析一下 Rust 异步运行时的工作原理" }
+  ],
+  "reasoning_effort": "high"
+}

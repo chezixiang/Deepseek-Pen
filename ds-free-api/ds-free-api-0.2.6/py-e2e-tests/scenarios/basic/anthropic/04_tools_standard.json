@@ -1,0 +1,33 @@
+{
+  "name": "标准工具调用",
+  "endpoint": "anthropic",
+  "category": "basic",
+  "models": ["deepseek-default", "deepseek-expert"],
+  "request": {
+    "system": "你是一个天气助手，使用 get_weather 工具查询天气。",
+    "messages": [
+      {"role": "user", "content": "北京今天天气怎么样？"}
+    ],
+    "max_tokens": 4096,
+    "tools": [
+      {
+        "type": "custom",
+        "name": "get_weather",
+        "description": "获取指定城市的天气信息",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "city": {"type": "string", "description": "城市名称"}
+          },
+          "required": ["city"]
+        }
+      }
+    ],
+    "tool_choice": {"type": "auto"},
+    "stream": false
+  },
+  "checks": {
+    "has_tool_use": true,
+    "stop_reason": "tool_use"
+  }
+}

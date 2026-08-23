@@ -1,0 +1,18 @@
+{
+  "name": "基础对话",
+  "endpoint": "anthropic",
+  "category": "basic",
+  "models": ["deepseek-default", "deepseek-expert"],
+  "request": {
+    "system": "你是 ds-free-api 助手，简洁回答问题。",
+    "messages": [
+      {"role": "user", "content": "你好"}
+    ],
+    "max_tokens": 4096,
+    "stream": false
+  },
+  "checks": {
+    "content_not_empty": true,
+    "stop_reason": "end_turn"
+  }
+}

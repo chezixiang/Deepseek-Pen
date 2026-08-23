@@ -1,0 +1,392 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+
+  build-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: web/.node-version
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+        working-directory: web
+      - name: Build frontend
+        run: npm run build
+        working-directory: web
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: web-dist
+          path: web/dist/
+          if-no-files-found: error
+  build-linux-gnu:
+    needs: [build-frontend]
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            suffix: linux-x86_64-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            suffix: linux-aarch64-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download frontend assets
+        uses: actions/download-artifact@v8
+        with:
+          name: web-dist
+          path: web/dist/
+      - name: Resolve tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+          cache-key: ${{ matrix.target }}
+      - name: Install build dependencies (aarch64)
+        if: ${{ matrix.runner == 'ubuntu-24.04-arm' }}
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake pkg-config g++
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          name="ds-free-api-${{ steps.meta.outputs.tag }}-${{ matrix.suffix }}"
+          mkdir -p "$name"
+          cp "target/${{ matrix.target }}/release/ds-free-api" "$name/"
+          cp LICENSE README.md README.en.md config.example.toml "$name/"
+          tar czf "$name.tar.gz" "$name"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.suffix }}
+          path: "*.tar.gz"
+          if-no-files-found: error
+
+  build-linux-musl:
+    needs: [build-frontend]
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            suffix: linux-x86_64-musl
+            package: x86_64-linux-musl-cross
+            apt_packages: ""
+            custom_env:
+              CC: x86_64-linux-musl-gcc
+              CXX: x86_64-linux-musl-g++
+              CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: x86_64-linux-musl-g++
+              RUSTC_LINKER: x86_64-linux-musl-g++
+          - target: aarch64-unknown-linux-musl
+            suffix: linux-aarch64-musl
+            package: aarch64-linux-musl-cross
+            apt_packages: crossbuild-essential-arm64
+            custom_env:
+              CC: aarch64-linux-musl-gcc
+              CXX: aarch64-linux-musl-g++
+              CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-g++
+              RUSTC_LINKER: aarch64-linux-musl-g++
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download frontend assets
+        uses: actions/download-artifact@v8
+        with:
+          name: web-dist
+          path: web/dist/
+      - name: Resolve tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+          cache-key: ${{ matrix.target }}
+      - name: Install base dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake perl pkg-config libclang-dev musl-tools
+      - name: Install target-specific APT dependencies
+        if: ${{ matrix.apt_packages != '' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt_packages }}
+      - name: Install musl cross-compiler
+        run: |
+          wget https://github.com/musl-cc/musl.cc/releases/latest/download/${{ matrix.package }}.tgz
+          tar xzf ${{ matrix.package }}.tgz -C /opt
+          echo "/opt/${{ matrix.package }}/bin/" >> "$GITHUB_PATH"
+      - name: Build
+        env: ${{ matrix.custom_env }}
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          name="ds-free-api-${{ steps.meta.outputs.tag }}-${{ matrix.suffix }}"
+          mkdir -p "$name"
+          cp "target/${{ matrix.target }}/release/ds-free-api" "$name/"
+          cp LICENSE README.md README.en.md config.example.toml "$name/"
+          tar czf "$name.tar.gz" "$name"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.suffix }}
+          path: "*.tar.gz"
+          if-no-files-found: error
+
+  build-macos:
+    needs: [build-frontend]
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            suffix: macos-x86_64
+          - target: aarch64-apple-darwin
+            suffix: macos-aarch64
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download frontend assets
+        uses: actions/download-artifact@v8
+        with:
+          name: web-dist
+          path: web/dist/
+      - name: Resolve tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+          cache-key: ${{ matrix.target }}
+      - name: Install dependencies
+        run: |
+          brew update
+          brew install --formula cmake pkg-config llvm
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          name="ds-free-api-${{ steps.meta.outputs.tag }}-${{ matrix.suffix }}"
+          mkdir -p "$name"
+          cp "target/${{ matrix.target }}/release/ds-free-api" "$name/"
+          cp LICENSE README.md README.en.md config.example.toml "$name/"
+          tar czf "$name.tar.gz" "$name"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.suffix }}
+          path: "*.tar.gz"
+          if-no-files-found: error
+
+  build-windows:
+    needs: [build-frontend]
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            suffix: windows-x86_64
+          - target: aarch64-pc-windows-msvc
+            suffix: windows-aarch64
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download frontend assets
+        uses: actions/download-artifact@v8
+        with:
+          name: web-dist
+          path: web/dist/
+      - name: Resolve tag
+        id: meta
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            "tag=${{ github.event.inputs.tag }}" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            "tag=${{ github.ref_name }}" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+          cache-key: ${{ matrix.target }}
+      - name: Install dependencies
+        shell: cmd
+        run: |
+          choco install cmake -y
+          choco install strawberryperl -y
+          choco install pkgconfiglite -y
+          choco install llvm -y
+          choco install nasm -y
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "ds-free-api-${{ steps.meta.outputs.tag }}-${{ matrix.suffix }}"
+          New-Item -ItemType Directory -Force -Path $name
+          Copy-Item "target/${{ matrix.target }}/release/ds-free-api.exe" "$name/"
+          Copy-Item LICENSE, README.md, README.en.md, config.example.toml "$name/"
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.suffix }}
+          path: "*.zip"
+          if-no-files-found: error
+
+  docker:
+    needs: [build-linux-musl]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download musl binaries
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+
+      - name: Extract binaries to Docker build context
+        run: |
+          mkdir -p target/docker/amd64 target/docker/arm64
+          tar xzf dist/linux-x86_64-musl/*.tar.gz -C target/docker/amd64 --strip-components=1
+          tar xzf dist/linux-aarch64-musl/*.tar.gz -C target/docker/arm64 --strip-components=1
+
+      - name: Lowercase owner for Docker tag
+        id: docker_meta
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ steps.docker_meta.outputs.owner }}/ds-free-api:${{ steps.meta.outputs.tag }}
+            ghcr.io/${{ steps.docker_meta.outputs.owner }}/ds-free-api:latest
+
+  release:
+    needs: [build-linux-gnu, build-linux-musl, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify version matches Cargo.toml
+        run: |
+          CARGO_VERSION=$(grep '^version =' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          TAG="${{ steps.meta.outputs.tag }}"
+          TAG_VERSION="${TAG#v}"
+          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
+            echo "Mismatch: Cargo.toml version=$CARGO_VERSION, tag=$TAG_VERSION"
+            exit 1
+          fi
+
+      - name: Extract changelog
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          VERSION="${TAG#v}"
+          awk "/## \[$VERSION\]/{flag=1;next}/## \[/{flag=0}flag" CHANGELOG.md > release_notes.md
+          if [ ! -s release_notes.md ]; then
+            echo "No changelog entry found for $VERSION"
+            exit 1
+          fi
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+
+      - name: Remove frontend artifact from release
+        run: rm -rf dist/web-dist
+
+      - name: Flatten structure
+        run: |
+          find dist -mindepth 2 -type f -exec mv -t dist/ {} +
+          find dist -mindepth 1 -type d -empty -delete
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz *.zip > ../SHA256SUMS
+          mv ../SHA256SUMS .
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: false
+          body_path: release_notes.md
+          draft: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

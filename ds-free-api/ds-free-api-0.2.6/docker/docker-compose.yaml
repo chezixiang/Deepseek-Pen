@@ -1,0 +1,18 @@
+# Docker compose entry point — run from project root:
+#   docker compose -f docker/docker-compose.yaml up -d
+
+services:
+  ds-free-api:
+    image: ghcr.io/niyueee/ds-free-api:latest
+    container_name: ds-free-api
+    restart: unless-stopped
+    ports:
+      - "22217:22217"
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+    environment:
+      - RUST_LOG=info
+      - DS_DATA_DIR=/app/data
+      - DS_CONFIG_PATH=/app/config/config.toml
+      - TZ=Asia/Shanghai

@@ -1,0 +1,9 @@
+# Tool-generated state
+.mimosa/
+.zcode/
+
+# Deepseek-specific probe artifacts
+.probe/
+
+# Dependencies
+node_modules/

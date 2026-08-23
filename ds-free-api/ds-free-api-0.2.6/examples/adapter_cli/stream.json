@@ -1,0 +1,8 @@
+{
+  "model": "deepseek-default",
+  "messages": [
+    { "role": "user", "content": "用三句话说明什么是 TCP" }
+  ],
+  "stream": true,
+  "stream_options": { "include_usage": true }
+}

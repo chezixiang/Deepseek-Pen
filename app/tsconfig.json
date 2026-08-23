@@ -1,0 +1,20 @@
+{
+    "compilerOptions": {
+        "target": "ES2020",
+        "lib": [
+            "ES2020",
+            "dom"
+        ],
+        "module": "esnext",
+        "strict": true,
+        "moduleResolution": "node",
+        "typeRoots": [
+            "./src/@types",
+            "./node_modules/@dictpen/types"
+        ]
+    },
+    "include": [
+        "src",
+        "./node_modules/@dictpen/types/**/*.d.ts"
+    ]
+}

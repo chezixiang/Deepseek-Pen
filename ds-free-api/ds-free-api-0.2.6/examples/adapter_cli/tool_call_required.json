@@ -1,0 +1,23 @@
+{
+  "model": "deepseek-default",
+  "messages": [
+    { "role": "user", "content": "查询北京今天的天气" }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "获取指定城市的天气",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": { "type": "string", "description": "城市名" }
+          },
+          "required": ["city"]
+        }
+      }
+    }
+  ],
+  "tool_choice": "required"
+}

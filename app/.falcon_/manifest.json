@@ -1,0 +1,36 @@
+{
+  "appName": "Deepseek",
+  "version": "0.1.0",
+  "appid": "8000000000182376",
+  "icon": "app_icon.png",
+  "quickjs": {
+    "version": "20200705",
+    "bigNum": false
+  },
+  "cert": {
+    "app.js.bin": {
+      "size": 3514,
+      "md5": "d8b264759176a6060a5a5cb84e2790fa"
+    },
+    "index.js.bin": {
+      "size": 35034,
+      "md5": "8e18742340bc069fbf9c667d871b7d98"
+    },
+    "native-1e27628a.js.bin": {
+      "size": 6118251,
+      "md5": "57edbd7b1456becf961d9d1e7df0ac3f"
+    },
+    "settings.js.bin": {
+      "size": 15964,
+      "md5": "7cdb970d576624667c187b0a42dbb460"
+    },
+    "startup.js.bin": {
+      "size": 4237,
+      "md5": "61a025faed36129d0066e657d46ef8ee"
+    },
+    "store-6fec488a.js.bin": {
+      "size": 17083,
+      "md5": "f0453821182faf09ef295e9ecc3f395d"
+    }
+  }
+}

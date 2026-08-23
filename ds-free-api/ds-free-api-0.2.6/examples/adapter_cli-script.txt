@@ -1,0 +1,50 @@
+# adapter_cli 测试脚本
+# 所有请求均使用 OpenAI JSON body
+
+# 查看 ds_core 账号池状态
+status
+
+# 基础非流式（基线）
+chat examples/adapter_cli/basic_chat.json
+
+# 流式 + usage
+chat examples/adapter_cli/stream.json
+
+# 深度思考（expert 模型）
+chat examples/adapter_cli/reasoning.json
+
+# 智能搜索
+chat examples/adapter_cli/web_search.json
+
+# 深度思考 + 智能搜索
+chat examples/adapter_cli/reasoning_search.json
+
+# stop 序列
+chat examples/adapter_cli/stop.json
+
+# 工具调用（auto）
+chat examples/adapter_cli/tool_call.json
+
+# 工具调用（required）
+chat examples/adapter_cli/tool_call_required.json
+
+# 工具调用（并行）
+chat examples/adapter_cli/tool_call_parallel.json
+
+# 工具调用（多轮历史）
+chat examples/adapter_cli/tool_call_multi_turn.json
+
+# 原始 DeepSeek SSE（不经转换）
+raw examples/adapter_cli/basic_chat.json
+
+# 上下对照原始流和转换后流
+compare examples/adapter_cli/stream.json
+
+# 并发基础请求
+concurrent 3 examples/adapter_cli/basic_chat.json
+
+# 模型接口
+models
+model deepseek-default
+
+quit

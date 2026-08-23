@@ -1,0 +1,19 @@
+{
+  "name": "图片HTTP链接",
+  "endpoint": "openai",
+  "category": "basic",
+  "models": ["deepseek-default", "deepseek-expert"],
+  "request": {
+    "messages": [
+      {"role": "user", "content": [
+        {"type": "text", "text": "请访问这个网页，告诉我它包含什么内容。"},
+        {"type": "image_url", "image_url": {"url": "https://example.com"}}
+      ]}
+    ],
+    "stream": false
+  },
+  "checks": {
+    "content_not_empty": true,
+    "finish_reason": "stop"
+  }
+}
