@@ -32,102 +32,125 @@
                     </div>
                 </div>
                 <text :class="form.dsConfigured ? dc('field-hint') : dc('field-hint-warn')">{{ form.dsConfigured ? '已配置账号，可直接对话' : '未配置账号，请填写后保存' }}</text>
+                <text v-if="trouble.length" :class="dc('field-hint-warn')">⚠️ 最近账号异常 {{ trouble.length }} 次，最早检出 {{ fmtTime(trouble[0].t) }}（{{ trouble[0].kind }}）：{{ trouble[0].message }}</text>
             </template>
 
             <!-- OpenAI 兼容端点：baseUrl + apiKey -->
             <template v-else>
-                <div class="field">
-                    <text class="label">服务地址</text>
-                    <div class="input" @click="editField('baseUrl')">
-                        <text :class="form.baseUrl ? 'input-text' : 'input-text-ph'">{{ form.baseUrl || 'https://api.deepseek.com/v1' }}</text>
+                <div :class="dc('field')">
+                    <text :class="dc('label')">服务地址</text>
+                    <div :class="dc('input')" @click="editField('baseUrl')">
+                        <text :class="form.baseUrl ? dc('input-text') : dc('input-text-ph')">{{ form.baseUrl || 'https://api.deepseek.com/v1' }}</text>
                     </div>
                 </div>
-                <div class="field">
-                    <text class="label">API Key（必填）</text>
-                    <div class="input" @click="editField('apiKey')">
-                        <text :class="form.apiKey ? 'input-text' : 'input-text-ph'">{{ form.apiKey ? maskKey(form.apiKey) : '请输入 API Key' }}</text>
+                <div :class="dc('field')">
+                    <text :class="dc('label')">API Key（必填）</text>
+                    <div :class="dc('input')" @click="editField('apiKey')">
+                        <text :class="form.apiKey ? dc('input-text') : dc('input-text-ph')">{{ form.apiKey ? maskKey(form.apiKey) : '请输入 API Key' }}</text>
                     </div>
                 </div>
-                <div class="field">
-                    <text class="label">模型 ID</text>
-                    <div class="input" @click="editField('openaiModelId')">
-                        <text :class="form.openaiModelId ? 'input-text' : 'input-text-ph'">{{ form.openaiModelId || 'deepseek-v4-flash' }}</text>
+                <div :class="dc('field')">
+                    <text :class="dc('label')">模型 ID</text>
+                    <div :class="dc('input')" @click="editField('openaiModelId')">
+                        <text :class="form.openaiModelId ? dc('input-text') : dc('input-text-ph')">{{ form.openaiModelId || 'deepseek-v4-flash' }}</text>
                     </div>
                 </div>
             </template>
 
-            <text class="group-title">默认选项</text>
-            <div class="field">
-                <text class="label">默认模型</text>
+            <text :class="dc('group-title')">默认选项</text>
+            <!-- 官方已把快速/专家/识图合并为单一模型，只有多个模式时才显示选择器 -->
+            <div :class="dc('field')" v-if="visibleModes.length > 1">
+                <text :class="dc('label')">默认模型</text>
                 <div class="modes">
                     <text
                         v-for="m in visibleModes"
                         :key="m.key"
-                        :class="form.defaultMode === m.key ? 'chip-active' : 'chip'"
+                        :class="form.defaultMode === m.key ? dc('chip-active') : dc('chip')"
                         @click="setDefaultMode(m.key)">{{ m.label }}</text>
                 </div>
             </div>
-            <div class="field">
-                <text class="label">默认深度思考</text>
-                <text :class="form.defaultThinking ? 'chip-active' : 'chip'" @click="form.defaultThinking = !form.defaultThinking">{{ form.defaultThinking ? '开启' : '关闭' }}</text>
+            <div :class="dc('field')">
+                <text :class="dc('label')">默认深度思考</text>
+                <text :class="form.defaultThinking ? dc('chip-active') : dc('chip')" @click="form.defaultThinking = !form.defaultThinking">{{ form.defaultThinking ? '开启' : '关闭' }}</text>
             </div>
-            <div class="field">
-                <text class="label">默认联网搜索</text>
-                <text :class="form.defaultSearch ? 'chip-active' : 'chip'" @click="form.defaultSearch = !form.defaultSearch">{{ form.defaultSearch ? '开启' : '关闭' }}</text>
+            <div :class="dc('field')">
+                <text :class="dc('label')">默认联网搜索</text>
+                <text :class="form.defaultSearch ? dc('chip-active') : dc('chip')" @click="form.defaultSearch = !form.defaultSearch">{{ form.defaultSearch ? '开启' : '关闭' }}</text>
             </div>
-            <div class="field">
-                <text class="label">默认展开思考过程</text>
-                <text :class="form.defaultExpandThinking ? 'chip-active' : 'chip'" @click="form.defaultExpandThinking = !form.defaultExpandThinking">{{ form.defaultExpandThinking ? '展开' : '收起' }}</text>
+            <div :class="dc('field')">
+                <text :class="dc('label')">默认展开思考过程</text>
+                <text :class="form.defaultExpandThinking ? dc('chip-active') : dc('chip')" @click="form.defaultExpandThinking = !form.defaultExpandThinking">{{ form.defaultExpandThinking ? '展开' : '收起' }}</text>
             </div>
-            <div class="field">
-                <text class="label">流式输出（SSE）</text>
-                <text :class="form.sse ? 'chip-active' : 'chip'" @click="form.sse = !form.sse">{{ form.sse ? '开启' : '关闭' }}</text>
+            <div :class="dc('field')">
+                <text :class="dc('label')">流式输出（SSE）</text>
+                <text :class="form.sse ? dc('chip-active') : dc('chip')" @click="form.sse = !form.sse">{{ form.sse ? '开启' : '关闭' }}</text>
             </div>
 
-            <text class="group-title">外观</text>
-            <div class="field">
-                <text class="label">深色模式</text>
+            <text :class="dc('group-title')">外观</text>
+            <div :class="dc('field')">
+                <text :class="dc('label')">深色模式</text>
                 <div class="modes">
                     <text :class="themeChipClass('light')" @click="setTheme('light')">浅色</text>
                     <text :class="themeChipClass('dark')" @click="setTheme('dark')">深色</text>
                 </div>
             </div>
 
-            <text class="group-title">提示词</text>
-            <div class="field">
-                <text class="label">系统提示词（可选）</text>
-                <div class="input" @click="editField('systemPrompt')">
-                    <text :class="form.systemPrompt ? 'input-text' : 'input-text-ph'">{{ form.systemPrompt || '例如：你是一个乐于助人的助手' }}</text>
+            <text :class="dc('group-title')">提示词</text>
+            <div :class="dc('field')">
+                <text :class="dc('label')">系统提示词（可选）</text>
+                <div :class="dc('input')" @click="editField('systemPrompt')">
+                    <text :class="form.systemPrompt ? dc('input-text') : dc('input-text-ph')">{{ form.systemPrompt || '例如：你是一个乐于助人的助手' }}</text>
                 </div>
             </div>
 
-            <text class="group-title">实验性（调试模式）</text>
-            <div class="field" v-if="form.debugMode">
-                <text class="label">竖屏交互（旋转 90°）</text>
-                <text :class="form.portrait ? 'chip-active' : 'chip'" @click="form.portrait = !form.portrait">{{ form.portrait ? '开启' : '关闭' }}</text>
+            <text :class="dc('group-title')">实验性（调试模式）</text>
+            <div :class="dc('field')" v-if="form.debugMode">
+                <text :class="dc('label')">竖屏交互（旋转 90°）</text>
+                <text :class="form.portrait ? dc('chip-active') : dc('chip')" @click="form.portrait = !form.portrait">{{ form.portrait ? '开启' : '关闭' }}</text>
             </div>
-            <div class="field">
-                <text class="label">启用调试日志</text>
-                <text :class="form.debugLog ? 'chip-active' : 'chip'" @click="form.debugLog = !form.debugLog">{{ form.debugLog ? '开启' : '关闭' }}</text>
+            <div :class="dc('field')">
+                <text :class="dc('label')">启用调试日志</text>
+                <text :class="form.debugLog ? dc('chip-active') : dc('chip')" @click="form.debugLog = !form.debugLog">{{ form.debugLog ? '开启' : '关闭' }}</text>
+            </div>
+            <div :class="dc('field')">
+                <text :class="dc('label')">Emoji 字体（实验，联网下载约 10MB）</text>
+                <text :class="form.emojiFont ? dc('chip-active') : dc('chip')" @click="toggleEmojiFont">{{ form.emojiFont ? '开启' : '关闭' }}</text>
+                <text v-if="emojiFontMsg" :class="dc('field-hint')">{{ emojiFontMsg }}</text>
             </div>
 
-            <text class="danger" @click="resetData">清空全部对话数据</text>
-            <text class="about" @click="onVersionTap">Deepseek · 词典笔版 {{ appVersion }}</text>
-            <text v-if="form.debugMode" class="debug-badge" @click="disableDebug">调试模式已开启（点击关闭）</text>
-            <text class="about-sub">后端：ds-free-api（OpenAI 兼容）</text>
+            <text :class="dc('danger')" @click="resetData">清空全部对话数据</text>
+            <text :class="dc('about')" @click="onVersionTap">Deepseek · 词典笔版 {{ appVersion }}</text>
+            <text v-if="form.debugMode" :class="dc('debug-badge')" @click="disableDebug">调试模式已开启（点击关闭）</text>
+            <text :class="dc('about-sub')">后端：ds-free-api（OpenAI 兼容）</text>
             <text :class="dc('log-link')" @click="showLogModal = true">查看诊断日志</text>
-            <text v-if="saveMsg && !showSaveModal" :class="saved ? 'save-msg-ok' : 'save-msg'">{{ saveMsg }}</text>
+            <text v-if="saveMsg && !showSaveModal" :class="saved ? dc('save-msg-ok') : dc('save-msg')">{{ saveMsg }}</text>
         </scroller>
 
-        <!-- 诊断日志弹窗 -->
-        <div v-if="showLogModal" :class="dc('save-mask')">
-            <div :class="dc('save-modal-box')" style="max-width: 90%;">
-                <text :class="dc('save-modal-title')">诊断日志</text>
-                <scroller style="max-height: 400px; margin-bottom: 12px;">
-                    <text style="font-size: 14px; color: #666666; line-height: 20px;">{{ logContent || '暂无日志' }}</text>
+        <!-- 诊断日志弹窗（#6/#11 重构）：
+             旧版用 max-height:400px 的内联样式（Weex 不支持 max-height），面板比
+             横屏屏幕（280px 高）还高，导致内容溢出屏幕无法观看。
+             新版固定适配横屏的面板高度：应用/后端双日志源 + 行数切换 + 刷新/清空。 -->
+        <div v-if="showLogModal" class="log-mask">
+            <div :class="dc('log-panel')">
+                <div :class="dc('log-head')">
+                    <text :class="dc('log-title')">诊断日志</text>
+                    <text :class="dc('icon-btn')" @click="showLogModal = false">关闭</text>
+                </div>
+                <div class="log-tabs">
+                    <text :class="logSource === 'app' ? dc('log-tab-active') : dc('log-tab')" @click="switchLogSource('app')">应用日志</text>
+                    <text :class="logSource === 'backend' ? dc('log-tab-active') : dc('log-tab')" @click="switchLogSource('backend')">后端日志</text>
+                    <text :class="logLines === 80 ? dc('log-tab-active') : dc('log-tab')" @click="setLogLines(80)">80行</text>
+                    <text :class="logLines === 200 ? dc('log-tab-active') : dc('log-tab')" @click="setLogLines(200)">200行</text>
+                    <text :class="logLines === 500 ? dc('log-tab-active') : dc('log-tab')" @click="setLogLines(500)">500行</text>
+                    <text :class="logGen === 1 ? dc('log-tab-active') : dc('log-tab')" @click="setLogGen(1)">上一份</text>
+                    <text :class="logGen === 0 ? dc('log-tab-active') : dc('log-tab')" @click="setLogGen(0)">当前</text>
+                </div>
+                <scroller :class="dc('log-body')" scroll-direction="vertical">
+                    <text :class="dc('log-text')">{{ logContent || '暂无日志' }}</text>
                 </scroller>
-                <div style="flex-direction: row; justify-content: center;">
-                    <text :class="dc('save-modal-btn')" @click="showLogModal = false">关闭</text>
+                <div class="log-foot">
+                    <text :class="dc('log-btn')" @click="refreshLog">刷新</text>
+                    <text :class="dc('log-btn-danger')" @click="clearLog">清空当前日志</text>
                 </div>
             </div>
         </div>
@@ -145,9 +168,19 @@
 
 <script>
 import { MODES } from '../../services/ds.js'
-import { DEFAULT_SETTINGS, APP_VERSION, loadSettings, saveSettings, loadConversations, saveConversations, deleteMessages, saveActiveId, readLocalDsPass } from '../../services/store.js'
+import { DEFAULT_SETTINGS, APP_VERSION, loadSettings, saveSettings, loadConversations, saveConversations, deleteMessages, saveActiveId, readLocalDsPass, loadAccountTrouble } from '../../services/store.js'
 import { openTextEditor, updateDsFreeApiAccount, INPUT_TYPES, deployBackend } from '../../services/native.js'
-import { appLog, appLogTail } from '../../services/app-log.js'
+import { appLog, appLogTail, appLogClear, backendLogTail, backendLogClear } from '../../services/app-log.js'
+import { ensureEmojiFont } from '../../services/emoji-font.js'
+
+// 首帧主题预读：与 index.vue 一致，从 $falcon.__dsTheme 同步读取，避免深色用户闪浅色（#7）
+function peekBootTheme() {
+  try {
+    return ($falcon && $falcon.__dsTheme) || 'light'
+  } catch (e) {
+    return 'light'
+  }
+}
 
 export default {
     name: 'settings',
@@ -155,7 +188,7 @@ export default {
         return {
             MODES,
             appVersion: APP_VERSION,
-            form: Object.assign({}, DEFAULT_SETTINGS),
+            form: Object.assign({}, DEFAULT_SETTINGS, { theme: peekBootTheme() }),
             saved: false,
             saving: false,
             saveMsg: '',
@@ -163,7 +196,12 @@ export default {
             backendError: '',
             backendDeploying: false,
             showLogModal: false,
-            logContent: ''
+            logContent: '',
+            logSource: 'app', // app | backend
+            logLines: 80,
+            logGen: 0, // 0=当前 1=上一份（轮转保留）
+            emojiFontMsg: '',
+            trouble: []
         }
     },
     created() {
@@ -175,7 +213,7 @@ export default {
         },
         showLogModal(v) {
             if (v) {
-                this.logContent = appLogTail(40)
+                this.loadLogContent()
                 appLog('[settings] 查看诊断日志 theme=' + (this.form && this.form.theme))
             }
         }
@@ -186,14 +224,20 @@ export default {
             return (this.form && this.form.theme) === 'dark'
         },
         visibleModes() {
-            // 识图模式属于实验性能力，只在调试模式下显示
-            if (this.form && this.form.debugMode) return MODES
-            return MODES.filter((m) => m.key !== 'vision')
+            // 模型已合并，MODES 只剩一项；保留该 computed 以兼容多模式重新上线的情况
+            return MODES
         }
     },
     methods: {
+        // 把当前主题缓存到 $falcon 全局（与 index.vue 约定一致，#7）
+        cacheTheme() {
+            try { $falcon.__dsTheme = (this.form && this.form.theme) || 'light' } catch (e) { /* 忽略 */ }
+        },
         async init() {
             this.form = await loadSettings()
+            this.cacheTheme()
+            // 账号异常取证（首次检出时间）
+            this.trouble = await loadAccountTrouble()
             // 读取本机已配置密码的掩码预览，避免“已配置”时密码栏空白
             const pass = await readLocalDsPass()
             this.form.dsPassPreview = pass ? this.maskKey(pass) : ''
@@ -229,19 +273,80 @@ export default {
             if (this.form.dsConfigured) return '已配置（点击修改）'
             return '点击输入'
         },
+        fmtTime(t) {
+            const d = new Date(t)
+            const p = (n) => (n < 10 ? '0' + n : '' + n)
+            return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes())
+        },
         async editField(field) {
             // Bug 4：把当前值作为预填充文本带回 IME，编辑已有设置项时能看到原文。
             // 敏感字段（API Key / 密码）不回显真实值，避免在输入法中暴露秘密。
+            // #2：系统提示词需要中文输入；其余字段（地址/Key/账号）保持英文键盘。
             const SENSITIVE = { apiKey: true, dsPass: true, dsPassPreview: true }
+            const CHINESE = { systemPrompt: true }
             const current = SENSITIVE[field] ? '' : (this.form[field] || '')
-            const text = await openTextEditor(INPUT_TYPES.EN_US_ONLY, current)
+            const inputType = CHINESE[field] ? INPUT_TYPES.ZH_CN_PREFERRED : INPUT_TYPES.EN_US_ONLY
+            const text = await openTextEditor(inputType, current)
             if (text === null) return
             this.form[field] = String(text).trim()
             this.$forceUpdate()
         },
         setTheme(key) {
             this.form.theme = key
+            this.cacheTheme()
             appLog('[settings] 切换主题 theme=' + key + ' isDark将变=' + (key === 'dark'))
+            this.$forceUpdate()
+        },
+
+        // ---------- 诊断日志（#6/#11） ----------
+        async loadLogContent() {
+            if (this.logSource === 'app') {
+                this.logContent = await appLogTail(this.logLines, this.logGen)
+            } else {
+                this.logContent = await backendLogTail(this.logLines, this.logGen)
+            }
+            this.$forceUpdate()
+        },
+        switchLogSource(source) {
+            this.logSource = source
+            this.loadLogContent()
+        },
+        setLogLines(n) {
+            this.logLines = n
+            this.loadLogContent()
+        },
+        setLogGen(g) {
+            this.logGen = g
+            this.loadLogContent()
+        },
+        refreshLog() {
+            this.loadLogContent()
+        },
+        async clearLog() {
+            if (this.logSource === 'app') {
+                await appLogClear()
+            } else {
+                await backendLogClear()
+            }
+            appLog('[settings] 已清空' + (this.logSource === 'app' ? '应用' : '后端') + '日志')
+            this.logContent = ''
+            this.$forceUpdate()
+        },
+        // Emoji 字体开关（#2）：开启即下载+注册（成功与否即时反馈）；关闭仅停用
+        async toggleEmojiFont() {
+            this.form.emojiFont = !this.form.emojiFont
+            if (this.form.emojiFont) {
+                this.emojiFontMsg = '正在下载字体（约 10MB），请保持网络畅通…'
+                this.$forceUpdate()
+                try {
+                    const r = await ensureEmojiFont()
+                    this.emojiFontMsg = r.message
+                } catch (e) {
+                    this.emojiFontMsg = '失败：' + (e && e.message ? e.message : String(e))
+                }
+            } else {
+                this.emojiFontMsg = '已关闭（重新打开会复用已下载的字体）'
+            }
             this.$forceUpdate()
         },
         setAuthMode(mode) {
@@ -252,7 +357,7 @@ export default {
             this.form.defaultMode = key
         },
         themeChipClass(key) {
-            return (this.form.theme || 'light') === key ? 'chip-active' : 'chip'
+            return (this.form.theme || 'light') === key ? this.dc('chip-active') : this.dc('chip')
         },
         // 深色模式类名切换：浅色返回原类，深色返回 -dark 变体类（引擎仅支持单类选择器）
         dc(cls) {
@@ -316,6 +421,7 @@ export default {
                 delete persistForm.dsPass
                 delete persistForm.dsPassPreview
                 await saveSettings(persistForm)
+                this.cacheTheme()
 
                 // 2) 内置模式：若填了账号密码，则写入本机 ds-free-api 配置并重启（可选步骤）
                 let accountMsg = ''
@@ -581,11 +687,12 @@ export default {
     background-color: #121212;
 }
 .topbar-dark {
+    height: 56px;
     flex-direction: row;
     align-items: center;
     justify-content: space-between;
     background-color: #1e1e1e;
-    padding: 8px;
+    padding: 0 8px;
 }
 .icon-btn-dark {
     font-size: 22px;
@@ -593,18 +700,21 @@ export default {
     padding: 6px 10px;
 }
 .title-dark {
-    font-size: 22px;
+    flex: 1;
+    font-size: 24px;
+    font-weight: bold;
     color: #ffffff;
+    text-align: center;
 }
 .group-title-dark {
-    font-size: 18px;
-    color: #ffffff;
-    margin: 16px 12px 6px 12px;
+    font-size: 16px;
+    color: #999999;
+    padding: 16px 16px 6px 16px;
 }
 .label-dark {
-    font-size: 18px;
-    color: #ffffff;
-    margin-bottom: 6px;
+    font-size: 16px;
+    color: #aaaaaa;
+    margin-bottom: 8px;
 }
 .chip-dark {
     font-size: 18px;
@@ -623,9 +733,11 @@ export default {
     margin-right: 8px;
 }
 .input-dark {
+    height: 40px;
+    justify-content: center;
     background-color: #2a2a2a;
-    border-radius: 10px;
-    padding: 10px 14px;
+    border-radius: 8px;
+    padding: 0 12px;
 }
 .input-text-dark {
     font-size: 18px;
@@ -636,49 +748,61 @@ export default {
     color: #ffffff;
 }
 .field-hint-dark {
-    font-size: 16px;
-    color: #ffffff;
+    font-size: 14px;
+    color: #999999;
+    padding: 8px 16px 12px 16px;
 }
 .field-hint-warn-dark {
-    font-size: 16px;
-    color: #ffffff;
+    font-size: 14px;
+    color: #ff8a80;
+    padding: 8px 16px 12px 16px;
 }
 .backend-error-dark {
     font-size: 16px;
-    color: #ffffff;
+    color: #ff8a80;
+    text-align: center;
+    padding: 10px 16px;
+    background-color: #3d1f1f;
+    border-radius: 8px;
+    margin: 0 16px 12px;
 }
 .danger-dark {
     font-size: 20px;
-    color: #ffffff;
+    color: #ff8a80;
     text-align: center;
-    margin-top: 24px;
+    padding: 24px 16px;
 }
 .about-dark {
-    font-size: 18px;
-    color: #ffffff;
+    font-size: 16px;
+    color: #aaaaaa;
     text-align: center;
-    margin-top: 16px;
+    margin-top: 20px;
+    padding: 6px 0;
 }
 .about-sub-dark {
-    font-size: 16px;
-    color: #ffffff;
+    font-size: 14px;
+    color: #777777;
     text-align: center;
+    margin-top: 4px;
+    margin-bottom: 30px;
 }
 .log-link-dark {
     font-size: 16px;
-    color: #ffffff;
+    color: #82b1ff;
     text-align: center;
     padding: 6px 0;
 }
 .save-msg-ok-dark {
     font-size: 16px;
-    color: #ffffff;
+    color: #81c995;
     text-align: center;
+    padding: 8px 16px;
 }
 .save-msg-dark {
     font-size: 16px;
-    color: #ffffff;
+    color: #ff8a80;
     text-align: center;
+    padding: 8px 16px;
 }
 .save-mask-dark {
     position: absolute;
@@ -733,5 +857,142 @@ export default {
     padding: 10px 16px;
     border-bottom-width: 1px;
     border-bottom-color: #2a2a2a;
+}
+
+/* ========== 诊断日志面板（#6/#11）：固定适配横屏 936×280 ========== */
+.log-mask {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background-color: rgba(0, 0, 0, 0.65);
+    justify-content: center;
+    align-items: center;
+}
+.log-panel {
+    width: 92%;
+    height: 248px;
+    background-color: #ffffff;
+    border-radius: 12px;
+    padding: 10px;
+    flex-direction: column;
+}
+.log-head {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 6px;
+}
+.log-title {
+    font-size: 20px;
+    font-weight: bold;
+    color: #222222;
+}
+.log-tabs {
+    flex-direction: row;
+    align-items: center;
+    margin-bottom: 6px;
+}
+.log-tab {
+    font-size: 14px;
+    color: #555555;
+    background-color: #eef0f3;
+    border-radius: 10px;
+    padding: 3px 10px;
+    margin-right: 6px;
+}
+.log-tab-active {
+    font-size: 14px;
+    color: #ffffff;
+    background-color: #1a73e8;
+    border-radius: 10px;
+    padding: 3px 10px;
+    margin-right: 6px;
+}
+.log-body {
+    flex: 1;
+    background-color: #f6f7f9;
+    border-radius: 8px;
+    padding: 8px;
+}
+.log-text {
+    font-size: 12px;
+    line-height: 16px;
+    color: #444444;
+}
+.log-foot {
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 8px;
+}
+.log-btn {
+    font-size: 16px;
+    color: #1a73e8;
+    padding: 4px 12px;
+}
+.log-btn-danger {
+    font-size: 16px;
+    color: #d93025;
+    padding: 4px 12px;
+}
+
+/* 日志面板深色 */
+.log-panel-dark {
+    width: 92%;
+    height: 248px;
+    background-color: #1e1e1e;
+    border-radius: 12px;
+    padding: 10px;
+    flex-direction: column;
+}
+.log-head-dark {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 6px;
+}
+.log-title-dark {
+    font-size: 20px;
+    font-weight: bold;
+    color: #ffffff;
+}
+.log-tab-dark {
+    font-size: 14px;
+    color: #aaaaaa;
+    background-color: #2a2a2a;
+    border-radius: 10px;
+    padding: 3px 10px;
+    margin-right: 6px;
+}
+.log-tab-active-dark {
+    font-size: 14px;
+    color: #000000;
+    background-color: #82b1ff;
+    border-radius: 10px;
+    padding: 3px 10px;
+    margin-right: 6px;
+}
+.log-body-dark {
+    flex: 1;
+    background-color: #141414;
+    border-radius: 8px;
+    padding: 8px;
+}
+.log-text-dark {
+    font-size: 12px;
+    line-height: 16px;
+    color: #cccccc;
+}
+.log-btn-dark {
+    font-size: 16px;
+    color: #82b1ff;
+    padding: 4px 12px;
+}
+.log-btn-danger-dark {
+    font-size: 16px;
+    color: #ff8a80;
+    padding: 4px 12px;
 }
 </style>

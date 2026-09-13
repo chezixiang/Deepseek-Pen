@@ -2,7 +2,7 @@
 // 发送前用 ffmpeg 压缩到合理尺寸，再 base64 转 data URL（避免大图在 QuickJS 里内存爆掉导致设备卡死/重启）。
 // 不再依赖 langningchen（本设备不存在该模块）。
 
-import { readdir, execShell, waitForFile, sleep, mkdir } from './native.js'
+import { readdir, execShell, waitForFile, sleep, mkdir, joinPath, dataDirBase } from './native.js'
 
 const ALBUM = '/userdisk/Pictures'
 const IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp']
@@ -40,9 +40,9 @@ function shq(s) {
  * 用 ffmpeg scale 到最长边 MAX_DIM 内，并转成 JPEG。
  */
 export async function compressImage(srcPath) {
-  await mkdir($dataDir)
+  await mkdir(dataDirBase())
   const id = Date.now().toString(36) + '_' + Math.floor(Math.random() * 1e6).toString(36)
-  const dst = `${$dataDir}img_${id}.jpg`
+  const dst = joinPath(dataDirBase(), 'img_' + id + '.jpg')
   const cmd = 'ffmpeg -y -i ' + shq(srcPath) +
     ' -vf ' + shq('scale=512:512:force_original_aspect_ratio=decrease') +
     ' -q:v 3 ' + shq(dst) +
@@ -61,7 +61,7 @@ export async function compressImage(srcPath) {
 export async function readImageDataUrl(path) {
   const compressed = await compressImage(path)
   const id = Date.now().toString(36) + '_' + Math.floor(Math.random() * 1e6).toString(36)
-  const out = `${$dataDir}b64_${id}.txt`
+  const out = joinPath(dataDirBase(), 'b64_' + id + '.txt')
 
   // busybox base64 默认每 76 字符换行，JS 侧统一去空白即可。
   execShell('base64 ' + shq(compressed) + ' > ' + shq(out))

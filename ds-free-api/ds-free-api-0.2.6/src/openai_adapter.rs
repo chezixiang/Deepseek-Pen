@@ -121,7 +121,6 @@ impl OpenAIAdapter {
 
         let norm = request::normalize::apply(&req).map_err(OpenAIAdapterError::BadRequest)?;
         let tool_ctx = request::tools::extract(&req).map_err(OpenAIAdapterError::BadRequest)?;
-        let prompt = request::prompt::build(&req, &tool_ctx);
         let registry = self.model_registry.read().await;
         let model_res = request::resolver::resolve(
             &registry,
@@ -130,6 +129,47 @@ impl OpenAIAdapter {
             req.web_search_options.as_ref(),
         )
         .map_err(OpenAIAdapterError::BadRequest)?;
+        drop(registry);
+
+        // ── 会话复用判定（Web 端形态：持久会话，历史由服务端持有）──
+        // 上下文哈希命中缓存 → 续聊/编辑重答；未命中 → 冷启动（必要时走历史文件）。
+        // 工具/格式约束与原始流调试端点不参与复用（走传统路径）。
+        let reuse_ctx: Option<(String, String)> = if tool_ctx.format_block.is_none()
+            && tool_ctx.defs_text.is_none()
+            && tool_ctx.instruction_text.is_none()
+            && req.response_format.is_none()
+        {
+            // (本轮查找键, 下一轮预期键)
+            conversation_context_key(&req, &model_res.model_type)
+                .and_then(|k| conversation_next_key(&req, &model_res.model_type).map(|n| (k, n)))
+        } else {
+            None
+        };
+
+        let (prompt, files, has_http_urls, conversation) = if let Some((ctx, next_key)) = reuse_ctx
+        {
+            match self.plan_conversation(&req, &ctx, &next_key).await {
+                Some(out) => {
+                    let has_http = req
+                        .messages
+                        .last()
+                        .and_then(|m| m.content.as_ref())
+                        .map(content_has_http_url)
+                        .unwrap_or(false);
+                    (out.prompt, out.files, has_http, Some(out.plan))
+                }
+                None => {
+                    let prompt = request::prompt::build(&req, &tool_ctx);
+                    let file_result = request::files::extract(&req);
+                    let plan = last_user_plan(&req, &ctx, &next_key);
+                    (prompt, file_result.files, file_result.has_http_urls, plan)
+                }
+            }
+        } else {
+            let prompt = request::prompt::build(&req, &tool_ctx);
+            let file_result = request::files::extract(&req);
+            (prompt, file_result.files, file_result.has_http_urls, None)
+        };
 
         let prompt_tokens = self
             .bpe
@@ -137,13 +177,13 @@ impl OpenAIAdapter {
             .map(|bpe| bpe.encode_with_special_tokens(&prompt).len() as u32)
             .unwrap_or(0);
 
-        let file_result = request::files::extract(&req);
         let chat_req = crate::ds_core::ChatRequest {
             prompt,
             thinking_enabled: model_res.thinking_enabled,
-            search_enabled: model_res.search_enabled || file_result.has_http_urls,
+            search_enabled: model_res.search_enabled || has_http_urls,
             model_type: model_res.model_type,
-            files: file_result.files,
+            files,
+            conversation,
         };
 
         let chat_resp = self.try_chat(chat_req, request_id).await?;
@@ -283,6 +323,7 @@ impl OpenAIAdapter {
             search_enabled: model_res.search_enabled,
             model_type: model_res.model_type,
             files: vec![],
+            conversation: None,
         };
         let chat_resp = self.try_chat(ds_req, request_id).await?;
         let data = Box::pin(
@@ -446,6 +487,7 @@ impl OpenAIAdapter {
                     search_enabled: false,
                     model_type: "default".to_string(),
                     files: vec![],
+                    conversation: None,
                 };
                 log::debug!(
                     target: "adapter",
@@ -464,6 +506,200 @@ impl OpenAIAdapter {
     pub async fn get_account_pool_status(&self) -> AccountPoolStatus {
         self.ds_core.get_account_pool_status().await
     }
+
+    /// 拉取云端会话列表（#10 同步已有对话）
+    pub async fn list_cloud_sessions(
+        &self,
+    ) -> Result<Vec<crate::ds_core::CloudSession>, CoreError> {
+        self.ds_core.list_cloud_sessions().await
+    }
+
+    /// 拉取云端会话的消息内容（#10 完整同步）
+    pub async fn list_cloud_session_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::ds_core::CloudMessage>, CoreError> {
+        self.ds_core.list_cloud_session_messages(session_id).await
+    }
+
+    /// 会话复用：根据缓存判定续聊/编辑重答计划。
+    /// None = 缓存未命中或不可复用（调用方退回冷启动路径并按 key 回写缓存）。
+    async fn plan_conversation(
+        &self,
+        req: &ChatCompletionsRequest,
+        key: &str,
+        next_key: &str,
+    ) -> Option<ReusePlanOut> {
+        let cached = self.ds_core.lookup_conversation(key)?;
+        let last = req.messages.last()?;
+        if last.role != "user" {
+            return None;
+        }
+        let text = message_plain_text(last);
+        // 归一化与缓存写入口径一致（纯图片消息记为占位符），否则会误判为编辑
+        let text_norm = if text.is_empty() { "[图片]".to_string() } else { text };
+        // 编辑重答（edit_message）不能携带新文件；带文件时退回冷路径
+        let files = request::files::extract_last_message(req);
+        let regenerate = cached.last_user_text != text_norm;
+        if regenerate && !files.files.is_empty() {
+            return None;
+        }
+
+        let plan = crate::ds_core::ConversationPlan {
+            cache_key: key.to_string(),
+            next_key: next_key.to_string(),
+            user_text: text_norm.clone(),
+            reuse: Some(crate::ds_core::ReuseTarget {
+                account_id: cached.account_id,
+                session_id: cached.session_id,
+                last_request_msg_id: cached.last_request_msg_id,
+                last_response_msg_id: cached.last_response_msg_id,
+            }),
+            regenerate,
+        };
+        log::info!(
+            target: "adapter",
+            "会话复用命中: regenerate={} files={} prompt_len={}",
+            regenerate,
+            files.files.len(),
+            text_norm.len()
+        );
+        Some(ReusePlanOut {
+            prompt: text_norm,
+            files: files.files,
+            plan,
+        })
+    }
+}
+
+/// 会话复用计划结果
+struct ReusePlanOut {
+    prompt: String,
+    files: Vec<crate::ds_core::FilePayload>,
+    plan: crate::ds_core::ConversationPlan,
+}
+
+/// 消息纯文本：Text 原样；Parts 取 text 部分换行拼接（空返回空串）
+fn message_plain_text(msg: &crate::openai_adapter::types::Message) -> String {
+    match &msg.content {
+        Some(crate::openai_adapter::types::MessageContent::Text(t)) => t.clone(),
+        Some(crate::openai_adapter::types::MessageContent::Parts(parts)) => parts
+            .iter()
+            .filter_map(|p| p.text.as_deref())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// 消息携带的图片/文件数量（键成分：区分"纯文本重复"与"带图消息"）
+fn message_file_count(msg: &crate::openai_adapter::types::Message) -> usize {
+    match &msg.content {
+        Some(crate::openai_adapter::types::MessageContent::Parts(parts)) => parts
+            .iter()
+            .filter(|p| p.ty == "image_url" || p.ty == "file")
+            .count(),
+        _ => 0,
+    }
+}
+
+/// content parts 是否含需要搜索访问的 http(s) 图片链接
+fn content_has_http_url(content: &crate::openai_adapter::types::MessageContent) -> bool {
+    if let crate::openai_adapter::types::MessageContent::Parts(parts) = content {
+        parts.iter().any(|p| {
+            p.ty == "image_url"
+                && p.image_url
+                    .as_ref()
+                    .is_some_and(|img| {
+                        img.url.starts_with("http://") || img.url.starts_with("https://")
+                    })
+        })
+    } else {
+        false
+    }
+}
+
+/// 会话上下文键成分收集：sha256 的输入序列。
+/// - `user` 字段（应用侧传会话 ID）是必要成分：不同新会话互不撞键；
+///   未传 user 的客户端不做复用（一律冷启动，保持旧行为）。
+/// - system/user 参与（user 带文件数），assistant 不参与（重试/重生成时
+///   内容可能有采样差异），tool 出现即放弃复用。
+/// 返回 None = 不可复用（最后一条不是 user / 含 tool / 缺 user 标识）。
+fn conversation_user_parts(req: &ChatCompletionsRequest) -> Option<Vec<(u8, String)>> {
+    if req.messages.is_empty() {
+        return None;
+    }
+    let scope = req.user.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
+    if req.messages.last()?.role != "user" {
+        return None;
+    }
+    let mut parts: Vec<(u8, String)> = Vec::new();
+    parts.push((0u8, scope.to_string()));
+    for msg in &req.messages {
+        match msg.role.as_str() {
+            "system" | "user" => {
+                let mut s = message_plain_text(msg);
+                if msg.role == "user" {
+                    s.push_str(&format!("#f{}", message_file_count(msg)));
+                }
+                parts.push((1u8, format!("{}\x1f{}", msg.role, s)));
+            }
+            "assistant" => {}
+            _ => return None,
+        }
+    }
+    Some(parts)
+}
+
+fn hash_user_parts(model_type: &str, parts: &[(u8, String)]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"v1\x1e");
+    hasher.update(model_type.as_bytes());
+    for (kind, s) in parts {
+        hasher.update(b"\x1e");
+        hasher.update([*kind]);
+        hasher.update(b"\x1f");
+        hasher.update(s.as_bytes());
+    }
+    let digest = hasher.finalize();
+    digest.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// 本轮请求的查找键：上下文（除最后一条 user 外）的哈希。
+fn conversation_context_key(req: &ChatCompletionsRequest, model_type: &str) -> Option<String> {
+    let parts = conversation_user_parts(req)?;
+    // 最后一个元素是最后一条 user 消息本身，不属于本轮上下文
+    let ctx = &parts[..parts.len() - 1];
+    Some(hash_user_parts(model_type, ctx))
+}
+
+/// 下一轮请求的预期查找键：上下文 + 本轮 user 消息。
+/// 请求成功后缓存同时写入本键与查找键，下一轮（应用回放本轮+回复）即可命中。
+fn conversation_next_key(req: &ChatCompletionsRequest, model_type: &str) -> Option<String> {
+    let parts = conversation_user_parts(req)?;
+    Some(hash_user_parts(model_type, &parts))
+}
+
+/// 冷启动路径的缓存计划：首条消息发出后把新会话写入缓存，后续请求即可复用
+fn last_user_plan(
+    req: &ChatCompletionsRequest,
+    key: &str,
+    next_key: &str,
+) -> Option<crate::ds_core::ConversationPlan> {
+    let last = req.messages.last()?;
+    if last.role != "user" {
+        return None;
+    }
+    let text = message_plain_text(last);
+    Some(crate::ds_core::ConversationPlan {
+        cache_key: key.to_string(),
+        next_key: next_key.to_string(),
+        user_text: if text.is_empty() { "[图片]".to_string() } else { text },
+        reuse: None,
+        regenerate: false,
+    })
 }
 
 /// 账号池状态信息
@@ -534,5 +770,130 @@ impl OpenAIAdapterError {
             Self::Internal(_) => 500,
             Self::ToolCallRepairNeeded(_) => 500,
         }
+    }
+}
+
+#[cfg(test)]
+mod reuse_tests {
+    use super::{conversation_context_key, message_plain_text};
+    use crate::openai_adapter::types::{ChatCompletionsRequest, MessageContent, Message};
+
+    fn parse(v: serde_json::Value) -> ChatCompletionsRequest {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn key_requires_user_scope() {
+        let req = parse(serde_json::json!({
+            "model": "deepseek-default",
+            "messages": [{ "role": "user", "content": "hi" }]
+        }));
+        // 未传 user（会话标识）的客户端不做复用，保持旧行为
+        assert!(conversation_context_key(&req, "default").is_none());
+    }
+
+    #[test]
+    fn key_stable_across_assistant_replays_and_scoped() {
+        let base = |user: &str, a1: &str| serde_json::json!({
+            "model": "deepseek-default",
+            "user": user,
+            "messages": [
+                { "role": "system", "content": "sys" },
+                { "role": "user", "content": "u1" },
+                { "role": "assistant", "content": a1 },
+                { "role": "user", "content": "u2" }
+            ]
+        });
+        let k1 = conversation_context_key(&parse(base("conv-a", "a1")), "default").unwrap();
+        let k2 = conversation_context_key(&parse(base("conv-a", "a1")), "default").unwrap();
+        let k3 = conversation_context_key(&parse(base("conv-b", "a1")), "default").unwrap();
+        // assistant 回放文本差异不影响键（同一对话上下文）
+        let k4 = conversation_context_key(&parse(base("conv-a", "a1 另一种采样")), "default").unwrap();
+        assert_eq!(k1, k2);
+        assert_ne!(k1, k3, "不同会话标识不得撞键");
+        assert_eq!(k1, k4);
+    }
+
+    #[test]
+    fn first_message_key_independent_of_text() {
+        // 首条消息的键只由 scope+model 决定（上下文为空）：
+        // 编辑首条消息命中同键，由 last_user_text 差异走 edit_message 重答
+        let mk = |text: &str| {
+            conversation_context_key(
+                &parse(serde_json::json!({
+                    "model": "deepseek-default",
+                    "user": "conv-a",
+                    "messages": [{ "role": "user", "content": text }]
+                })),
+                "default",
+            )
+            .unwrap()
+        };
+        assert_eq!(mk("原始问题"), mk("修改后的问题"));
+    }
+
+    #[test]
+    fn mid_history_edit_maps_to_earlier_key() {
+        let mk = |msgs: serde_json::Value| {
+            conversation_context_key(
+                &parse(serde_json::json!({
+                    "model": "deepseek-default",
+                    "user": "conv-a",
+                    "messages": msgs
+                })),
+                "default",
+            )
+            .unwrap()
+        };
+        // 原始第二轮（上下文 u1）与编辑第一轮（上下文空）应得到不同键；
+        // 编辑第一轮的键 == 首轮消息的键（上例），从而命中首轮缓存条目
+        let k_u2 = mk(serde_json::json!([
+            { "role": "user", "content": "u1" },
+            { "role": "assistant", "content": "a1" },
+            { "role": "user", "content": "u2" }
+        ]));
+        let k_edit_u1 = mk(serde_json::json!([
+            { "role": "user", "content": "u1 改" }
+        ]));
+        assert_ne!(k_u2, k_edit_u1);
+    }
+
+    #[test]
+    fn tool_messages_block_reuse() {
+        let req = parse(serde_json::json!({
+            "model": "deepseek-default",
+            "user": "conv-a",
+            "messages": [
+                { "role": "user", "content": "q" },
+                { "role": "tool", "tool_call_id": "t", "content": "r" },
+                { "role": "user", "content": "q2" }
+            ]
+        }));
+        assert!(conversation_context_key(&req, "default").is_none());
+    }
+
+    #[test]
+    fn plain_text_and_image_count() {
+        let msg = Message {
+            role: "user".into(),
+            content: Some(MessageContent::Parts(vec![
+                serde_json::from_value(serde_json::json!({
+                    "type": "text", "text": "解释一下这个梗"
+                }))
+                .unwrap(),
+                serde_json::from_value(serde_json::json!({
+                    "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" }
+                }))
+                .unwrap(),
+            ])),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            function_call: None,
+            refusal: None,
+            audio: None,
+        };
+        assert_eq!(message_plain_text(&msg), "解释一下这个梗");
+        assert_eq!(super::message_file_count(&msg), 1);
     }
 }

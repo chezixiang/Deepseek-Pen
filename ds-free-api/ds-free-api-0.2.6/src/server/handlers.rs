@@ -297,6 +297,109 @@ pub(crate) async fn list_models(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
+/// GET /v1/cloud-sessions —— 云端会话列表（#10 同步已有对话）
+pub(crate) async fn cloud_sessions(State(state): State<AppState>) -> Response {
+    log::debug!(target: "http::request", "GET /v1/cloud-sessions");
+    match state.adapter.list_cloud_sessions().await {
+        Ok(sessions) => {
+            let body = serde_json::json!({
+                "object": "list",
+                "data": sessions,
+            });
+            let bytes = serde_json::to_vec(&body).unwrap();
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                Body::from(bytes),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let (status, code, msg) = match &e {
+                crate::ds_core::CoreError::NoAccounts => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "no_accounts_configured",
+                    "未配置 DeepSeek 账号，无法同步云端会话".to_string(),
+                ),
+                crate::ds_core::CoreError::Overloaded => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limit_error",
+                    "当前没有空闲账号，请稍后再试".to_string(),
+                ),
+                other => (
+                    StatusCode::BAD_GATEWAY,
+                    "provider_error",
+                    format!("同步云端会话失败: {other}"),
+                ),
+            };
+            log::warn!(target: "http::response", "GET /v1/cloud-sessions 失败: {e}");
+            let body = serde_json::json!({
+                "error": { "code": code, "message": msg }
+            });
+            let bytes = serde_json::to_vec(&body).unwrap();
+            (
+                status,
+                [(header::CONTENT_TYPE, "application/json")],
+                Body::from(bytes),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// GET /v1/cloud-sessions/{id}/messages —— 云端会话消息内容（#10 完整同步）
+pub(crate) async fn cloud_session_messages(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    log::debug!(target: "http::request", "GET /v1/cloud-sessions/{}/messages", id);
+    match state.adapter.list_cloud_session_messages(&id).await {
+        Ok(messages) => {
+            let body = serde_json::json!({
+                "object": "list",
+                "data": messages,
+            });
+            let bytes = serde_json::to_vec(&body).unwrap();
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                Body::from(bytes),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let (status, code, msg) = match &e {
+                crate::ds_core::CoreError::NoAccounts => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "no_accounts_configured",
+                    "未配置 DeepSeek 账号，无法同步云端会话".to_string(),
+                ),
+                crate::ds_core::CoreError::Overloaded => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limit_error",
+                    "当前没有空闲账号，请稍后再试".to_string(),
+                ),
+                other => (
+                    StatusCode::BAD_GATEWAY,
+                    "provider_error",
+                    format!("拉取云端会话内容失败: {other}"),
+                ),
+            };
+            log::warn!(target: "http::response", "GET /v1/cloud-sessions/{}/messages 失败: {e}", id);
+            let body = serde_json::json!({
+                "error": { "code": code, "message": msg }
+            });
+            let bytes = serde_json::to_vec(&body).unwrap();
+            (
+                status,
+                [(header::CONTENT_TYPE, "application/json")],
+                Body::from(bytes),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// GET /v1/models/{id}
 pub(crate) async fn get_model(
     Path(id): Path<String>,

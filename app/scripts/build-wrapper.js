@@ -17,6 +17,25 @@ async function main() {
   // 必须先初始化 appInfo，否则 getFalconBuildDir 会抛异常
   await appInfo.init('.');
 
+  // #17 版本号随编译自动递增：src/services/build-info.js 的 BUILD_NUM +1
+  try {
+    const infoPath = path.resolve(__dirname, '..', 'src', 'services', 'build-info.js');
+    const infoSrc = fs.readFileSync(infoPath, 'utf8');
+    const m = infoSrc.match(/BUILD_NUM\s*=\s*(\d+)/);
+    const next = (m ? parseInt(m[1], 10) : 0) + 1;
+    const stamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
+    fs.writeFileSync(
+      infoPath,
+      '// 构建信息：BUILD_NUM 由 scripts/build-wrapper.js 在每次构建时自动 +1（#17）。\n' +
+      '// 手动编辑本文件即可校准版本号。提交到 git，保证不同克隆的构建序号连续。\n' +
+      'export const BUILD_NUM = ' + next + '\n' +
+      'export const BUILD_AT = \'' + stamp + '\'\n'
+    );
+    console.log('[build-wrapper] 版本号递增 => build ' + next + '（' + stamp + '）');
+  } catch (e) {
+    console.error('[build-wrapper] 版本号递增失败（不影响构建继续）: ' + e.message);
+  }
+
   // 自动生成 backend-blob.js，避免打包进旧的 musl 二进制
   console.log('[build-wrapper] 自动生成 backend-blob.js...');
   try {

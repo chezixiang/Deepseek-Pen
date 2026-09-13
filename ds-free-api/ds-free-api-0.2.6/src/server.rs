@@ -153,6 +153,12 @@ fn build_router(state: AppState, cors_origins: Vec<String>) -> Router {
         .route("/v1/chat/completions", post(handlers::chat_completions))
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/models/{id}", get(handlers::get_model))
+        // 云端会话列表（#10 同步已有对话）
+        .route("/v1/cloud-sessions", get(handlers::cloud_sessions))
+        .route(
+            "/v1/cloud-sessions/{id}/messages",
+            get(handlers::cloud_session_messages),
+        )
         // Anthropic
         .route("/anthropic/v1/messages", post(handlers::anthropic_messages))
         .route("/anthropic/v1/models", get(handlers::anthropic_list_models))

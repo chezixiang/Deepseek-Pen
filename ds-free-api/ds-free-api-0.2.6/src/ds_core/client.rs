@@ -19,7 +19,8 @@ use thiserror::Error;
 const ENDPOINT_USERS_LOGIN: &str = "/users/login";
 const ENDPOINT_CHAT_SESSION_CREATE: &str = "/chat_session/create";
 const ENDPOINT_CHAT_SESSION_DELETE: &str = "/chat_session/delete";
-#[allow(dead_code)]
+const ENDPOINT_CHAT_SESSION_FETCH_PAGE: &str = "/chat_session/fetch_page";
+const ENDPOINT_CHAT_HISTORY_MESSAGES: &str = "/chat/history_messages";#[allow(dead_code)]
 const ENDPOINT_CHAT_SESSION_UPDATE_TITLE: &str = "/chat_session/update_title";
 const ENDPOINT_CHAT_CREATE_POW_CHALLENGE: &str = "/chat/create_pow_challenge";
 const ENDPOINT_CHAT_COMPLETION: &str = "/chat/completion";
@@ -134,6 +135,18 @@ pub struct UserInfo {
     pub email: Option<String>,
     #[serde(default)]
     pub mobile_number: Option<String>,
+    /// 禁言状态（登录响应实测：chat.is_muted=1, chat.mute_until=Unix 秒）
+    #[serde(default)]
+    pub chat: Option<ChatMute>,
+}
+
+/// 禁言状态（users/current 与登录响应的 biz_data.chat）
+#[derive(Debug, Deserialize)]
+pub struct ChatMute {
+    #[serde(default)]
+    pub is_muted: i64,
+    #[serde(default)]
+    pub mute_until: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,6 +186,127 @@ pub struct FileInfo {
     pub file_size: i64,
     #[serde(default)]
     pub token_usage: Option<i64>,
+}
+
+/// 云端会话列表分页结果
+#[derive(Debug, Clone, Serialize)]
+pub struct CloudSessionPage {
+    pub sessions: Vec<CloudSession>,
+    pub has_more: bool,
+}
+
+/// 云端会话条目（fetch_page 解析结果；仅保留应用侧需要的字段）
+#[derive(Debug, Clone, Serialize)]
+pub struct CloudSession {
+    pub id: String,
+    pub title: String,
+    /// 秒级 Unix 时间戳（解析不出为 0）
+    pub updated_at: f64,
+    pub pinned: bool,
+    /// 该会话使用的模型类型（default/expert/vision），应用侧映射回模式
+    #[serde(rename = "modelType")]
+    pub model_type: String,
+}
+
+/// 云端消息条目（history_messages 解析结果，fragments 已拼接）
+#[derive(Debug, Clone, Serialize)]
+pub struct CloudMessage {
+    /// "user" | "assistant"
+    pub role: String,
+    pub content: String,
+    /// THINK fragment 内容（assistant 消息可能有）
+    pub reasoning: String,
+}
+
+/// 从 fetch_page 响应中宽容提取会话数组。
+///
+/// 已知信封为 `{code, data: {biz_data: ...}}`，但 biz_data 内部字段名未留痕
+/// （HAR 未导出响应体）。策略：优先尝试常见路径（chat_sessions / sessions /
+/// chat_session_list），失败则递归搜索"元素为含 id+title(或 title 字段等价物)
+/// 的对象数组"，最大化兼容服务端字段演进。
+fn extract_cloud_sessions(envelope: &serde_json::Value) -> Vec<CloudSession> {
+    fn parse_session(v: &serde_json::Value) -> Option<CloudSession> {
+        let id = v
+            .get("id")
+            .or_else(|| v.get("chat_session_id"))
+            .or_else(|| v.get("session_id"))
+            .and_then(|x| x.as_str())?
+            .to_string();
+        if id.is_empty() {
+            return None;
+        }
+        let title = v
+            .get("title")
+            .or_else(|| v.get("name"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let updated_at = v
+            .get("updated_at")
+            .or_else(|| v.get("update_time"))
+            .or_else(|| v.get("last_message_at"))
+            .and_then(|x| x.as_f64())
+            .unwrap_or(0.0);
+        let pinned = v.get("pinned").and_then(|x| x.as_bool()).unwrap_or(false);
+        let model_type = v
+            .get("model_type")
+            .and_then(|x| x.as_str())
+            .unwrap_or("default")
+            .to_string();
+        Some(CloudSession {
+            id,
+            title,
+            updated_at,
+            pinned,
+            model_type,
+        })
+    }
+
+    fn try_array(v: &serde_json::Value) -> Option<Vec<CloudSession>> {
+        let arr = v.as_array()?;
+        let mut out = Vec::new();
+        for item in arr {
+            // 数组元素必须是"长得像会话"的对象：有 id 且有 title 类字段
+            let has_title = item.get("title").is_some() || item.get("name").is_some();
+            if !has_title {
+                return None;
+            }
+            out.push(parse_session(item)?);
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    // 1) 常见字段路径优先
+    let biz = envelope
+        .get("data")
+        .and_then(|d| d.get("biz_data"))
+        .unwrap_or(&serde_json::Value::Null);
+    for key in ["chat_sessions", "sessions", "chat_session_list", "list"] {
+        if let Some(v) = biz.get(key) {
+            if let Some(list) = try_array(v) {
+                return list;
+            }
+        }
+    }
+    // 2) 兜底：全树递归搜索第一个"会话形态"的数组
+    fn walk(v: &serde_json::Value) -> Option<Vec<CloudSession>> {
+        if let Some(list) = try_array(v) {
+            return Some(list);
+        }
+        if let Some(obj) = v.as_object() {
+            for (_k, child) in obj {
+                if let Some(found) = walk(child) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    walk(envelope).unwrap_or_default()
 }
 
 #[derive(Debug, Deserialize)]
@@ -215,7 +349,11 @@ pub struct EditMessagePayload {
     pub prompt: String,
     pub search_enabled: bool,
     pub thinking_enabled: bool,
-    pub model_type: String,
+    /// 协议文档：model_type 不在 edit_message payload 中（首次 completion 传入后由
+    /// session 级别记忆）。保留字段但永不序列化，避免服务端拒收未知字段。
+    #[serde(skip_serializing)]
+    #[allow(dead_code)]
+    pub model_type: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -275,9 +413,27 @@ pub struct DsClient {
     client_version: String,
     client_platform: String,
     client_locale: String,
+    client_bundle_id: String,
+    client_timezone_offset: i32,
+    /// Origin/Referer 用的站点根（由 api_base 去掉 `/api/v0` 推导）
+    web_origin: String,
+}
+
+/// 从 api_base（如 `https://chat.deepseek.com/api/v0`）推导站点 Origin。
+fn origin_of(api_base: &str) -> String {
+    let s = api_base.trim_end_matches('/');
+    // 找到 scheme://host 之后的第一个 '/'
+    if let Some(scheme_end) = s.find("://") {
+        let rest = &s[scheme_end + 3..];
+        if let Some(slash) = rest.find('/') {
+            return s[..scheme_end + 3 + slash].to_string();
+        }
+    }
+    s.to_string()
 }
 
 impl DsClient {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         api_base: String,
         wasm_url: String,
@@ -285,6 +441,8 @@ impl DsClient {
         client_version: String,
         client_platform: String,
         client_locale: String,
+        client_bundle_id: String,
+        client_timezone_offset: i32,
         proxy_url: Option<&str>,
     ) -> Self {
         let mut builder = rquest::Client::builder()
@@ -293,6 +451,7 @@ impl DsClient {
         if let Some(url) = proxy_url.and_then(|u| rquest::Proxy::all(u).ok()) {
             builder = builder.proxy(url);
         }
+        let web_origin = origin_of(&api_base);
         Self {
             http: builder.build().expect("构建 HTTP 客户端失败"),
             api_base,
@@ -301,35 +460,77 @@ impl DsClient {
             client_version,
             client_platform,
             client_locale,
+            client_bundle_id,
+            client_timezone_offset,
+            web_origin,
         }
     }
 
-    fn auth_headers(&self, token: &str) -> Result<rquest::header::HeaderMap, ClientError> {
+    /// Web 端 XHR 请求头基线。
+    ///
+    /// `rquest_util::Emulation` 的默认头是**页面导航**语义
+    /// （`sec-fetch-site: none` / `mode: navigate` / `dest: document` /
+    /// `upgrade-insecure-requests: 1` / `accept: text/html…` / `accept-language: en-US`），
+    /// 用它发 JSON API POST 在服务端是不存在的组合——浏览器 fetch 永远发
+    /// `same-origin` + `cors` + `empty` + `accept: */*`，且带 `origin`/`referer`。
+    /// 必须逐个覆盖，否则整条请求链都能被一眼识别为自动化客户端（封号主因）。
+    fn web_base_headers(&self) -> Result<rquest::header::HeaderMap, ClientError> {
+        use rquest::header::{HeaderValue, ACCEPT, ACCEPT_LANGUAGE, ORIGIN, REFERER, USER_AGENT};
+
         let mut h = rquest::header::HeaderMap::new();
+        let hv = |name: &str, s: &str| -> Result<HeaderValue, ClientError> {
+            HeaderValue::from_str(s)
+                .map_err(|e| ClientError::InvalidHeader(format!("{name}: {e}")))
+        };
+
+        h.insert(USER_AGENT, hv("User-Agent", &self.user_agent)?);
+        h.insert(ACCEPT, HeaderValue::from_static("*/*"));
+        // 站点语言与 x-client-locale 保持一致（zh_CN → zh-CN,zh;q=0.9,en;q=0.8）
         h.insert(
-            rquest::header::USER_AGENT,
-            rquest::header::HeaderValue::from_str(&self.user_agent)
-                .map_err(|e| ClientError::InvalidHeader(format!("User-Agent: {e}")))?,
+            ACCEPT_LANGUAGE,
+            HeaderValue::from_static("zh-CN,zh;q=0.9,en;q=0.8"),
         );
+        h.insert(ORIGIN, hv("Origin", &self.web_origin)?);
+        h.insert(REFERER, hv("Referer", &format!("{}/", self.web_origin))?);
+        h.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        h.insert("sec-fetch-mode", HeaderValue::from_static("cors"));
+        h.insert("sec-fetch-dest", HeaderValue::from_static("empty"));
+        // 导航专用头必须显式清除，emulation 默认会带上
+        h.remove(rquest::header::UPGRADE_INSECURE_REQUESTS);
+        h.insert("priority", HeaderValue::from_static("u=1, i"));
+
+        h.insert(
+            "X-Client-Version",
+            hv("X-Client-Version", &self.client_version)?,
+        );
+        h.insert(
+            "X-Client-Platform",
+            hv("X-Client-Platform", &self.client_platform)?,
+        );
+        h.insert(
+            "X-Client-Locale",
+            hv("X-Client-Locale", &self.client_locale)?,
+        );
+        h.insert(
+            "X-Client-Bundle-Id",
+            hv("X-Client-Bundle-Id", &self.client_bundle_id)?,
+        );
+        h.insert(
+            "X-Client-Timezone-Offset",
+            hv(
+                "X-Client-Timezone-Offset",
+                &self.client_timezone_offset.to_string(),
+            )?,
+        );
+        Ok(h)
+    }
+
+    fn auth_headers(&self, token: &str) -> Result<rquest::header::HeaderMap, ClientError> {
+        let mut h = self.web_base_headers()?;
         h.insert(
             rquest::header::AUTHORIZATION,
             rquest::header::HeaderValue::from_str(&format!("Bearer {token}"))
                 .map_err(|e| ClientError::InvalidHeader(format!("Authorization: {e}")))?,
-        );
-        h.insert(
-            "X-Client-Version",
-            rquest::header::HeaderValue::from_str(&self.client_version)
-                .map_err(|e| ClientError::InvalidHeader(format!("X-Client-Version: {e}")))?,
-        );
-        h.insert(
-            "X-Client-Platform",
-            rquest::header::HeaderValue::from_str(&self.client_platform)
-                .map_err(|e| ClientError::InvalidHeader(format!("X-Client-Platform: {e}")))?,
-        );
-        h.insert(
-            "X-Client-Locale",
-            rquest::header::HeaderValue::from_str(&self.client_locale)
-                .map_err(|e| ClientError::InvalidHeader(format!("X-Client-Locale: {e}")))?,
         );
         Ok(h)
     }
@@ -364,11 +565,12 @@ impl DsClient {
     }
 
     pub async fn login(&self, payload: &LoginPayload) -> Result<LoginData, ClientError> {
-        let mut h = rquest::header::HeaderMap::new();
+        // 登录前无 token，但其余 web 头必须齐全；referer 指向登录页（实抓一致）
+        let mut h = self.web_base_headers()?;
         h.insert(
-            rquest::header::USER_AGENT,
-            rquest::header::HeaderValue::from_str(&self.user_agent)
-                .map_err(|e| ClientError::InvalidHeader(format!("User-Agent: {e}")))?,
+            rquest::header::REFERER,
+            rquest::header::HeaderValue::from_str(&format!("{}/sign_in", self.web_origin))
+                .map_err(|e| ClientError::InvalidHeader(format!("Referer: {e}")))?,
         );
         let resp = self
             .http
@@ -417,6 +619,110 @@ impl DsClient {
             .await?;
         Self::parse_envelope::<Option<()>>(resp).await?;
         Ok(())
+    }
+
+    /// 拉取云端会话列表（Web 端"历史会话"侧栏数据源，full.har entry#53 实证）。
+    ///
+    /// GET /chat_session/fetch_page?lte_cursor.pinned=false —— 无需 PoW，仅需鉴权。
+    /// `before_updated_at`：游标翻页（响应含 has_more，按最后一条 updated_at 续拉）。
+    /// 响应结构已在 net-export jsonl 中实证（data.biz_data.chat_sessions），保留宽容兜底。
+    pub async fn fetch_session_page(
+        &self,
+        token: &str,
+        before_updated_at: Option<f64>,
+    ) -> Result<CloudSessionPage, ClientError> {
+        let url = format!(
+            "{}{}",
+            self.api_base, ENDPOINT_CHAT_SESSION_FETCH_PAGE
+        );
+        let mut req = self
+            .http
+            .get(url)
+            .headers(self.auth_headers(token)?)
+            .query(&[("lte_cursor.pinned", "false")]);
+        if let Some(ts) = before_updated_at {
+            req = req.query(&[("lte_cursor.updated_at", format!("{:.3}", ts))]);
+        }
+        let resp = req.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Status {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let envelope: serde_json::Value = resp.json().await?;
+        let sessions = extract_cloud_sessions(&envelope);
+        let has_more = envelope
+            .pointer("/data/biz_data/has_more")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        Ok(CloudSessionPage { sessions, has_more })
+    }
+
+    /// 拉取云端会话的消息内容（full.har + net-export jsonl 实证协议）。
+    /// GET /chat/history_messages?chat_session_id=<id> —— 无需 PoW，仅需鉴权。
+    /// 响应：data.biz_data.chat_messages[]，每条消息的 fragments 中
+    /// REQUEST→用户文本、RESPONSE→回复、THINK→思考。
+    pub async fn fetch_session_messages(
+        &self,
+        token: &str,
+        session_id: &str,
+    ) -> Result<Vec<CloudMessage>, ClientError> {
+        let resp = self
+            .http
+            .get(format!(
+                "{}{}",
+                self.api_base, ENDPOINT_CHAT_HISTORY_MESSAGES
+            ))
+            .headers(self.auth_headers(token)?)
+            .query(&[("chat_session_id", session_id)])
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Status {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let envelope: serde_json::Value = resp.json().await?;
+        let mut out = Vec::new();
+        if let Some(arr) = envelope.pointer("/data/biz_data/chat_messages").and_then(|v| v.as_array()) {
+            for m in arr {
+                let role_raw = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                let is_user = role_raw.eq_ignore_ascii_case("user");
+                let mut content = String::new();
+                let mut reasoning = String::new();
+                if let Some(frags) = m.get("fragments").and_then(|f| f.as_array()) {
+                    for f in frags {
+                        let ty = f.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        let c = f.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                        match ty {
+                            "REQUEST" => {
+                                if is_user {
+                                    content.push_str(c);
+                                }
+                            }
+                            "RESPONSE" => content.push_str(c),
+                            "THINK" => reasoning.push_str(c),
+                            _ => {}
+                        }
+                    }
+                }
+                if content.is_empty() && reasoning.is_empty() {
+                    continue;
+                }
+                out.push(CloudMessage {
+                    role: if is_user { "user".into() } else { "assistant".into() },
+                    content,
+                    reasoning,
+                });
+            }
+        }
+        Ok(out)
     }
 
     pub async fn create_pow_challenge(
@@ -530,6 +836,8 @@ impl DsClient {
     }
 
     /// 上传文件，返回文件元数据（id, status 等）
+    /// 上传文件。web 端实抓（new.jsonl entry#0117）除鉴权/PoW 外还带
+    /// `x-file-size`、`x-model-type`、`x-thinking-enabled` 三个业务头，缺失即为指纹差异。
     pub async fn upload_file(
         &self,
         token: &str,
@@ -537,16 +845,35 @@ impl DsClient {
         filename: &str,
         content_type: &str,
         bytes: Vec<u8>,
+        model_type: &str,
+        thinking_enabled: bool,
     ) -> Result<UploadFileData, ClientError> {
+        let file_size = bytes.len();
         let part = Part::bytes(bytes)
             .file_name(filename.to_string())
             .mime_str(content_type)?;
         let form = Form::new().part("file", part);
 
+        let mut h = self.auth_headers_with_pow(token, pow_response)?;
+        h.insert(
+            "X-File-Size",
+            rquest::header::HeaderValue::from_str(&file_size.to_string())
+                .map_err(|e| ClientError::InvalidHeader(format!("X-File-Size: {e}")))?,
+        );
+        h.insert(
+            "X-Model-Type",
+            rquest::header::HeaderValue::from_str(model_type)
+                .map_err(|e| ClientError::InvalidHeader(format!("X-Model-Type: {e}")))?,
+        );
+        h.insert(
+            "X-Thinking-Enabled",
+            rquest::header::HeaderValue::from_static(if thinking_enabled { "1" } else { "0" }),
+        );
+
         let resp = self
             .http
             .post(format!("{}{}", self.api_base, ENDPOINT_FILE_UPLOAD))
-            .headers(self.auth_headers_with_pow(token, pow_response)?)
+            .headers(h)
             .multipart(form)
             .send()
             .await?;
@@ -586,7 +913,25 @@ impl DsClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{CreateSessionWrapper, Envelope};
+    use super::{origin_of, CreateSessionWrapper, Envelope};
+
+    #[test]
+    fn derives_web_origin_from_api_base() {
+        assert_eq!(
+            origin_of("https://chat.deepseek.com/api/v0"),
+            "https://chat.deepseek.com"
+        );
+        // 尾斜杠、自定义端口、无路径都要能正确取到 scheme://host[:port]
+        assert_eq!(
+            origin_of("https://chat.deepseek.com/api/v0/"),
+            "https://chat.deepseek.com"
+        );
+        assert_eq!(
+            origin_of("http://127.0.0.1:8080/api/v0"),
+            "http://127.0.0.1:8080"
+        );
+        assert_eq!(origin_of("https://example.com"), "https://example.com");
+    }
 
     #[test]
     fn parses_nested_chat_session_id() {

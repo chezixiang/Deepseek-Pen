@@ -6,11 +6,13 @@
 //   ds:settings      -> 见 DEFAULT_SETTINGS
 //   ds:active        -> 当前会话 id（字符串）
 
-import { storageSet, storageGet, storageRemove, readFile, writeFile } from './native.js'
+import { storageSet, storageGet, storageRemove, readFile, writeFile, dsConfigPath, joinPath, dataDirBase } from './native.js'
 import { appLog } from './app-log.js'
+import { BUILD_NUM } from './build-info.js'
 
-// 应用版本号：格式 "主.次.修订 build N"。每次重新推送部署时 build +1，便于用户确认是否更新。
-export const APP_VERSION = '0.1.0 build 21'
+// 应用版本号：格式 "主.次.修订 build N"。build N 由 scripts/build-wrapper.js
+// 在每次构建时对 build-info.js 的 BUILD_NUM 自动 +1（#17），便于用户确认是否更新。
+export const APP_VERSION = '0.1.1 build ' + BUILD_NUM
 
 const KEY_CONVERSATIONS = 'ds:conversations'
 const KEY_SETTINGS = 'ds:settings'
@@ -38,12 +40,14 @@ export const DEFAULT_SETTINGS = {
   portrait: false,
   debugMode: false,
   debugLog: false,
+  // Emoji 字体（实验）：联网下载 NotoColorEmoji 并注册，解决 emoji 白块
+  emojiFont: false,
   // 深色模式：'light' | 'dark'（词典笔无系统深色，去掉 auto）
   theme: 'light'
 }
 
 // 本机 ds-free-api 的配置文件（用户在设备上自行配置的凭据，读取而非硬编码）。
-const LOCAL_DS_CONFIG = '/userdisk/ds-free-api/config.toml'
+// 已迁移到应用 data 目录（build 22），fs 可直接读取——旧 /userdisk 路径在部分设备读不到。
 
 // 去掉 TOML 中以 # 开头的注释行，避免把示例/注释误判为真实配置。
 function stripTomlComments(raw) {
@@ -55,7 +59,7 @@ function stripTomlComments(raw) {
 
 async function readLocalApiKey() {
   try {
-    const raw = stripTomlComments(await readFile(LOCAL_DS_CONFIG))
+    const raw = stripTomlComments(await readFile(dsConfigPath()))
     if (!raw) return ''
     const m = raw.match(/\[\[api_keys\]\]\s*key\s*=\s*"([^"]+)"/)
     if (m) return m[1]
@@ -70,7 +74,7 @@ async function readLocalApiKey() {
 // 从本机 ds-free-api config.toml 读取已配置的登录账号（邮箱或手机号），用于设置页回填。
 async function readLocalDsUser() {
   try {
-    const raw = stripTomlComments(await readFile(LOCAL_DS_CONFIG))
+    const raw = stripTomlComments(await readFile(dsConfigPath()))
     if (!raw) return ''
     // 优先邮箱，其次手机号
     const em = raw.match(/\[\[accounts\]\][\s\S]*?email\s*=\s*"([^"]*)"/)
@@ -86,7 +90,7 @@ async function readLocalDsUser() {
 // 判断本机 ds-free-api config.toml 是否已配置账号密码（用于设置页显示"已配置"状态）。
 async function readLocalDsConfigured() {
   try {
-    const raw = stripTomlComments(await readFile(LOCAL_DS_CONFIG))
+    const raw = stripTomlComments(await readFile(dsConfigPath()))
     if (!raw) return false
     const acc = readLocalDsPassRaw(raw)
     return !!acc
@@ -98,7 +102,7 @@ async function readLocalDsConfigured() {
 // 读取本机已配置的 DeepSeek 密码（仅用于设置页显示掩码，不写入应用设置存储）。
 export async function readLocalDsPass() {
   try {
-    const raw = stripTomlComments(await readFile(LOCAL_DS_CONFIG))
+    const raw = stripTomlComments(await readFile(dsConfigPath()))
     return readLocalDsPassRaw(raw)
   } catch (e) {
     return ''
@@ -121,8 +125,10 @@ export function uid(prefix = 'id') {
 
 function filePathFor(key) {
   // ds:conversations -> ds_conversations.json；ds:msgs:xxx -> ds_msgs_xxx.json
+  // 必须走 joinPath：$dataDir 的尾斜杠在不同机型上不一致，直接相加会得到
+  // `/data/…ds_conversations.json`（缺分隔符）或 `//`（重复分隔符）。
   const safe = String(key).replace(/[^a-zA-Z0-9_]/g, '_')
-  return $dataDir + safe + '.json'
+  return joinPath(dataDirBase(), safe + '.json')
 }
 
 async function getJSON(key, fallback) {
@@ -248,10 +254,10 @@ export async function loadSettings() {
   // 若设置存储缓存了旧 key，会与 config 失配导致 401 未认证——所以内置模式总是从 config 读。
   if (merged.authMode === 'builtin') {
     merged.apiKey = await readLocalApiKey()
-  } else if (!merged.apiKey) {
-    // OpenAI 兼容端点：设置里没填 key 才读本机（兜底）
-    merged.apiKey = await readLocalApiKey()
   }
+  // OpenAI 兼容端点下**不再**回填本机 key：本机 ds-free-api 的 key 对外部端点毫无意义，
+  // 却会被当成 Bearer 发给第三方服务（既泄露本机凭据，又让"401 未授权"看起来像端点故障，
+  // 用户报告"自定义 api 端点模式无法正常使用"的一部分）。留空就让报错说清缺 key。
   // 内置模式下，若设置页未填过 DS 账号，回填本机 ds-free-api 已配置的账号（避免显示空白误导）
   if (merged.authMode === 'builtin' && !merged.dsUser) {
     merged.dsUser = await readLocalDsUser()
@@ -271,4 +277,27 @@ export async function loadActiveId() {
 
 export async function saveActiveId(id) {
   return setJSON(KEY_ACTIVE, id)
+}
+
+// ---------- 账号异常取证 ----------
+// 记录疑似封号/禁言/鉴权失败事件（首次检出时间回答"什么时候封的"）。
+// 持久化在 ds:trouble，最多保留 20 条。
+const KEY_TROUBLE = 'ds:trouble'
+
+export async function recordAccountTrouble(kind, message) {
+  try {
+    const list = await getJSON(KEY_TROUBLE, [])
+    const arr = Array.isArray(list) ? list : []
+    arr.push({ t: Date.now(), kind: String(kind || ''), message: String(message || '').slice(0, 200) })
+    await setJSON(KEY_TROUBLE, arr.slice(-20))
+  } catch (e) { /* 忽略 */ }
+}
+
+export async function loadAccountTrouble() {
+  try {
+    const list = await getJSON(KEY_TROUBLE, [])
+    return Array.isArray(list) ? list : []
+  } catch (e) {
+    return []
+  }
 }

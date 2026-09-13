@@ -1,13 +1,16 @@
 <template>
     <div :class="pageClass">
-        <div :class="portrait ? 'pwrap portrait' : 'pwrap'">
+        <div :class="portrait ? 'pwrap' : 'pwrap'">
+        <!-- 竖屏（实验）：旋转画布为独立内层元素，不再把 transform 挂在
+             flex:1 + position:relative 的布局根上（此前结构白屏的可能原因） -->
+        <div :class="portrait ? dc('rotate-canvas') : 'fill-canvas'" :style="portraitStyle">
         <!-- 顶栏：会话 | 联网/深度思考 | 模式/标题 | 设置 -->
         <div :class="dc('topbar')">
             <text :class="dc('icon-btn')" @click="toggleDrawer">会话</text>
             <text :class="toggleClass(search)" @click="toggleSearch">联网</text>
             <text :class="toggleClass(thinking)" @click="toggleThinking">深度</text>
             <div class="topbar-center">
-                <template v-if="!modeLocked()">
+                <template v-if="!modeLocked() && visibleModes.length">
                     <text
                         v-for="m in visibleModes"
                         :key="m.key"
@@ -33,8 +36,11 @@
         <!-- 消息区 -->
         <scroller class="msgs" scroll-direction="vertical">
             <div class="empty" v-if="messages.length === 0">
-                <text :class="dc('empty-title')">Deepseek</text>
-                <text :class="dc('empty-tip')">你好，我是 DeepSeek，有什么可以帮你？</text>
+                <text v-if="cloudLoadingId === activeId" :class="dc('empty-tip')">正在加载云端对话…</text>
+                <template v-else>
+                    <text :class="dc('empty-title')">Deepseek</text>
+                    <text :class="dc('empty-tip')">你好，我是 DeepSeek，有什么可以帮你？</text>
+                </template>
             </div>
 
             <div v-for="m in messages" :key="m.id" class="msg">
@@ -45,17 +51,16 @@
                             <image
                                 v-for="img in m.images"
                                 :key="img.path"
-                                class="thumb"
+                                :class="dc('thumb')"
                                 resize="cover"
                                 :src="fileUrl(img.path)" />
-                        </div>
-                        <text :class="dc('bubble-text-user')" v-if="m.content">{{ m.content }}</text>
+                        </div>                        <text :class="dc('bubble-text-user')" v-if="m.content">{{ m.content }}</text>
                     </div>
                     <div class="msg-actions">
                         <text :class="dc('action')" @click="editMessage(m)">修改</text>
-                        <text v-if="userVersionCount(m) > 1" class="attempt-nav" @click="prevUserVersion(m)">‹</text>
-                        <text v-if="userVersionCount(m) > 1" class="attempt-indicator">{{ userActiveVersion(m) + 1 }}/{{ userVersionCount(m) }}</text>
-                        <text v-if="userVersionCount(m) > 1" class="attempt-nav" @click="nextUserVersion(m)">›</text>
+                        <text v-if="userVersionCount(m) > 1" :class="dc('attempt-nav')" @click="prevUserVersion(m)">‹</text>
+                        <text v-if="userVersionCount(m) > 1" :class="dc('attempt-indicator')">{{ userActiveVersion(m) + 1 }}/{{ userVersionCount(m) }}</text>
+                        <text v-if="userVersionCount(m) > 1" :class="dc('attempt-nav')" @click="nextUserVersion(m)">›</text>
                     </div>
                 </div>
 
@@ -63,39 +68,39 @@
                 <div v-else class="msg-row-assistant">
                     <div :class="dc('bubble-assistant')">
                         <template>
-                            <text v-if="m.pending && !m.content && !m.reasoning" class="pending">正在思考…</text>
+                            <text v-if="m.pending && !m.content && !m.reasoning" :class="dc('pending')">正在思考…</text>
                             <template v-else>
                                 <div v-if="m.reasoning" :class="dc('reasoning')" @click="toggleReasoning(m.id)">
                                     <text :class="dc('reasoning-head')">{{ isReasoningCollapsed(m.id) ? '展开思考过程' : '收起思考过程' }}</text>
                                     <text v-if="!isReasoningCollapsed(m.id)" :class="dc('reasoning-body')">{{ m.reasoning }}</text>
                                 </div>
-                                <text v-if="m.error" class="bubble-text-error">{{ m.error }}</text>
-                                <div v-else class="md">
+                                <text v-if="m.error" :class="dc('bubble-text-error')">{{ m.error }}</text>
+                                <div v-else :class="dc('md')">
                                     <div v-for="(block, bi) in markdownBlocks(m.content)" :key="bi" class="md-block">
-                                        <div v-if="block.type === 'p'" class="md-p">
-                                            <text v-for="(s, si) in spans(block.text)" :key="si" :class="spanClass(s)">{{ s.text }}</text>
+                                        <div v-if="block.type === 'p'" :class="dc('md-p')">
+                                            <text v-for="(s, si) in spans(block.text)" :key="si" :class="spanClass(s)"><text v-for="(r, ri) in emojiRuns(s.text)" :key="ri" :class="emojiRunClass(s, r)">{{ r.t }}</text></text>
                                         </div>
                                         <text v-else-if="block.type === 'code'" :class="dc('md-code')">{{ block.text }}</text>
-                                        <text v-else-if="block.type === 'quote'" class="md-quote">{{ block.text }}</text>
-                                        <text v-else-if="block.type === 'hr'" class="md-hr">————————</text>
-                                        <div v-else-if="block.type === 'list'" class="md-list">
+                                        <text v-else-if="block.type === 'quote'" :class="dc('md-quote')">{{ block.text }}</text>
+                                        <text v-else-if="block.type === 'hr'" :class="dc('md-hr')">————————</text>
+                                        <div v-else-if="block.type === 'list'" :class="dc('md-list')">
                                             <div v-for="(item, ii) in block.items" :key="ii" class="md-li-row">
-                                                <text class="md-li-marker">{{ block.ordered ? (ii + 1) + '. ' : '• ' }}</text>
-                                                <text v-for="(s, si) in spans(item)" :key="si" :class="spanClass(s)">{{ s.text }}</text>
+                                                <text :class="dc('md-li-marker')">{{ block.ordered ? (ii + 1) + '. ' : '• ' }}</text>
+                                                <text v-for="(s, si) in spans(item)" :key="si" :class="spanClass(s)"><text v-for="(r, ri) in emojiRuns(s.text)" :key="ri" :class="emojiRunClass(s, r)">{{ r.t }}</text></text>
                                             </div>
                                         </div>
-                                        <text v-else class="md-heading" :class="'md-' + block.type">{{ block.text }}</text>
+                                        <text v-else :class="dc('md-heading') + ' md-' + block.type">{{ block.text }}</text>
                                     </div>
                                 </div>
-                                <text v-if="m.pending" class="streaming-hint">正在生成…</text>
+                                <text v-if="m.pending" :class="dc('streaming-hint')">正在生成…</text>
                             </template>
                         </template>
                     </div>
                     <div class="msg-actions">
                         <text v-if="isLastAssistant(m) && !m.pending" :class="dc('action')" @click="retryMessage(m)">重试</text>
-                        <text v-if="assistantAttemptCount(m) > 1" class="attempt-nav" @click="prevAssistantAttempt(m)">‹</text>
-                        <text v-if="assistantAttemptCount(m) > 1" class="attempt-indicator">{{ assistantActiveAttempt(m) + 1 }}/{{ assistantAttemptCount(m) }}</text>
-                        <text v-if="assistantAttemptCount(m) > 1" class="attempt-nav" @click="nextAssistantAttempt(m)">›</text>
+                        <text v-if="assistantAttemptCount(m) > 1" :class="dc('attempt-nav')" @click="prevAssistantAttempt(m)">‹</text>
+                        <text v-if="assistantAttemptCount(m) > 1" :class="dc('attempt-indicator')">{{ assistantActiveAttempt(m) + 1 }}/{{ assistantAttemptCount(m) }}</text>
+                        <text v-if="assistantAttemptCount(m) > 1" :class="dc('attempt-nav')" @click="nextAssistantAttempt(m)">›</text>
                     </div>
                 </div>
             </div>
@@ -105,44 +110,57 @@
         <!-- 待发图片 -->
         <div :class="dc('draft-imgs')" v-if="draftImages.length">
             <div v-for="(img, i) in draftImages" :key="img.path" class="draft-img">
-                <image class="draft-thumb" resize="cover" :src="fileUrl(img.path)" />
+                <image :class="dc('draft-thumb')" resize="cover" :src="fileUrl(img.path)" />
                 <text class="draft-remove" @click="removeDraftImage(i)">×</text>
             </div>
         </div>
 
         <!-- 输入栏 -->
         <div :class="dc('inputbar')">
-            <text v-if="modeKey === 'vision'" class="upload" @click="openPicker">图片</text>
+            <text v-if="canUploadImage" class="upload" @click="openPicker">图片</text>
             <div :class="dc('input-display')" @click="openInput">
                 <text :class="draft ? dc('input-display-text') : dc('input-display-text-ph')">{{ draft || '点击输入消息…' }}</text>
             </div>
             <text :class="sendClass()" @click="send">{{ sending ? '停止' : '发送' }}</text>
         </div>
 
-        <!-- 会话抽屉 -->
-        <div :class="dc('drawer')" v-if="showDrawer">
-            <div class="drawer-head">
+        <!-- 竖屏旋转画布到此为止：遮罩/抽屉/选择器保持不旋转，绝对定位于 pwrap -->
+        </div>
+
+        <!-- 会话抽屉：全屏遮罩挡住穿透点击（#8），点遮罩关闭。
+             bug 修复：Weex 中未绑定点击的容器不拦截触摸，事件会穿透到遮罩导致
+             点击列表内空白处也关闭抽屉——根节点/头部/列表绑定空消费点击。 -->
+        <div class="drawer-mask" v-if="showDrawer" @click="closeDrawer"></div>
+        <div :class="dc('drawer')" v-if="showDrawer" @click="noopDrawer">
+            <div :class="dc('drawer-head')" @click="noopDrawer">
                 <text :class="dc('drawer-title')">会话列表</text>
-                <text class="icon-btn" @click="newConversation">＋ 新对话</text>
+                <text :class="dc('icon-btn')" @click="searchConversations">{{ convFilter ? '重搜' : '搜索' }}</text>
+                <text :class="dc('icon-btn')" @click="syncCloudSessions">{{ syncing ? '同步中…' : '同步' }}</text>
+                <text :class="dc('icon-btn')" @click="newConversation(true)">＋ 新对话</text>
             </div>
-            <scroller class="drawer-list" scroll-direction="vertical">
-                <div v-for="c in conversations" :key="c.id" :class="c.id === activeId ? dc('conv-active') : dc('conv')">
+            <text v-if="syncMsg" :class="dc('sync-msg')">{{ syncMsg }}</text>
+            <div class="filter-row" v-if="convFilter">
+                <text :class="dc('filter-text')">筛选：{{ convFilter }}</text>
+                <text :class="dc('filter-clear')" @click="clearConvFilter">清除</text>
+            </div>
+            <scroller class="drawer-list" scroll-direction="vertical" @click="noopDrawer">
+                <div v-for="c in drawerConversations" :key="c.id" :class="c.id === activeId ? dc('conv-active') : dc('conv')" @click="noopDrawer">
                     <div class="conv-main" @click="switchConversation(c.id)">
-                        <text :class="dc('conv-title')">{{ c.title }}</text>
-                        <text :class="dc('conv-mode')">{{ modeLabel(c.mode) }}</text>
+                        <text :class="dc('conv-title')" @click="switchConversation(c.id)">{{ c.title }}</text>
+                        <text :class="dc('conv-mode')" @click="switchConversation(c.id)">{{ modeLabel(c.mode) }}{{ c.cloudId ? ' · 云' : '' }}</text>
                     </div>
-                    <text class="conv-del" @click="deleteConversation(c)">删</text>
+                    <text :class="dc('conv-del')" @click="deleteConversation(c)">删</text>
                 </div>
-                <text class="drawer-empty" v-if="conversations.length === 0">暂无会话</text>
+                <text :class="dc('drawer-empty')" v-if="drawerConversations.length === 0">{{ convFilter ? '没有匹配的会话' : '暂无会话' }}</text>
             </scroller>
-            <text class="drawer-close" @click="showDrawer = false">关闭</text>
+            <text :class="dc('drawer-close')" @click="closeDrawer">关闭</text>
         </div>
 
         <!-- 图片选择器 -->
         <div class="picker" v-if="showPicker">
             <div :class="dc('picker-head')">
                 <text :class="dc('picker-title')">选择图片（/userdisk/Pictures）</text>
-                <text class="icon-btn" @click="closePicker">关闭</text>
+                <text :class="dc('icon-btn')" @click="closePicker">关闭</text>
             </div>
             <text v-if="albumLoading" class="picker-hint">加载中…</text>
             <text v-else-if="albumError" class="picker-hint-error">{{ albumError }}</text>
@@ -162,16 +180,28 @@
 </template>
 
 <script>
-import { MODES, getMode, buildMessages, chat, chatStream, stripInternalTags } from '../../services/ds.js'
+import { MODES, getMode, buildMessages, chat, chatStream, stripInternalTags, listCloudSessions, listCloudSessionMessages } from '../../services/ds.js'
 import {
     loadConversations, saveConversations, loadMessages, saveMessages,
-    deleteMessages, loadSettings, loadActiveId, saveActiveId, uid, DEFAULT_SETTINGS
+    deleteMessages, loadSettings, loadActiveId, saveActiveId, uid, DEFAULT_SETTINGS,
+    recordAccountTrouble
 } from '../../services/store.js'
 import { listAlbum, readImageDataUrl } from '../../services/images.js'
 import { openTextEditor, setDebugLogEnabled, stopStream, INPUT_TYPES, ensureBackendRunning } from '../../services/native.js'
-import { markdownToBlocks, inlineSpans } from '../../services/markdown.js'
+import { markdownToBlocks, inlineSpans, splitEmojiRuns } from '../../services/markdown.js'
+import { ensureEmojiFont } from '../../services/emoji-font.js'
 import { createBackendMonitor } from '../../services/backend-health.js'
 import { appLog } from '../../services/app-log.js'
+
+// 首帧主题预读：startup 页在跳转前把主题写到 $falcon.__dsTheme（跨页共享），
+// 这里同步读取，避免深色用户进入主页时先闪一帧浅色（#7）。
+function peekBootTheme() {
+  try {
+    return ($falcon && $falcon.__dsTheme) || 'light'
+  } catch (e) {
+    return 'light'
+  }
+}
 
 export default {
     name: 'index',
@@ -186,8 +216,8 @@ export default {
             modeKey: 'fast',
             thinking: true,
             search: false,
-            // 设置
-            settings: Object.assign({}, DEFAULT_SETTINGS),
+            // 设置（theme 用首帧预读值初始化，避免闪浅色）
+            settings: Object.assign({}, DEFAULT_SETTINGS, { theme: peekBootTheme() }),
             // 输入
             draft: '',
             draftImages: [],
@@ -203,6 +233,12 @@ export default {
             albumLoading: false,
             // 请求序号（用于丢弃过期响应 / 停止）
             reqSeq: 0,
+            // 云端会话同步（#10）
+            syncing: false,
+            syncMsg: '',
+            cloudLoadingId: '',
+            // 会话搜索（#7）：抽屉内按标题过滤
+            convFilter: '',
             // 当前流式请求的 curl 任务 token（用于停止）
             streamToken: null,
             // 后端监控
@@ -223,10 +259,35 @@ export default {
             // 仅调试模式下才允许竖屏（实验性功能，避免普通用户误触白屏）
             return !!(this.settings && this.settings.debugMode && this.settings.portrait)
         },
+        // 竖屏动态样式（#5）：按框架环境宽高计算，适配非 936×280 的设备；
+        // 取不到环境值时回退 X7 Pro 实测硬编码。非竖屏返回空对象（避免 null 样式）。
+        portraitStyle() {
+            if (!this.portrait) return {}
+            let w = 936
+            let h = 280
+            try {
+                const env = (typeof weex !== 'undefined') && weex.config && weex.config.env
+                if (env && env.deviceWidth && env.deviceHeight) {
+                    w = Math.max(env.deviceWidth, env.deviceHeight)
+                    h = Math.min(env.deviceWidth, env.deviceHeight)
+                }
+            } catch (e) { /* 回退默认值 */ }
+            return {
+                width: h + 'px',
+                height: w + 'px',
+                transform: 'translateX(' + w + 'px) rotate(90deg)',
+                transformOrigin: '0 0'
+            }
+        },
         visibleModes() {
-            // 识图模式属于实验性能力，只在调试模式下显示
-            if (this.settings && this.settings.debugMode) return MODES
-            return MODES.filter((m) => m.key !== 'vision')
+            // 官方已合并快速/专家/识图为单一模型，MODES 只剩一项。
+            // 只有一个模式时不必渲染切换条（省掉顶部一行空间）。
+            return MODES.length > 1 ? MODES : []
+        },
+        // 图片上传是否可用：合并后的模型自带图片理解（file_feature.vision=true），
+        // 不再依赖"识图模式"，所以任何时候都能传图。
+        canUploadImage() {
+            return true
         }
     },
     created() {
@@ -249,16 +310,196 @@ export default {
         dc(cls) {
             return this.isDark ? (cls + '-dark') : cls
         },
+        // 把当前主题缓存到 $falcon 全局，供 settings/index 页首帧同步预读（#7）
+        cacheTheme() {
+            try { $falcon.__dsTheme = (this.settings && this.settings.theme) || 'light' } catch (e) { /* 忽略 */ }
+        },
+        closeDrawer() {
+            this.showDrawer = false
+            this.syncMsg = ''
+            this.$forceUpdate()
+        },
+        // 空消费点击：挡住抽屉内部空白区域的事件穿透到遮罩（bug 修复）
+        noopDrawer() {},
+        // 抽屉渲染列表：按搜索词过滤（#7）
+        drawerConversations() {
+            const q = (this.convFilter || '').trim().toLowerCase()
+            if (!q) return this.conversations
+            return this.conversations.filter((c) => (c.title || '').toLowerCase().indexOf(q) >= 0)
+        },
+        async searchConversations() {
+            const text = await openTextEditor(INPUT_TYPES.ZH_CN_PREFERRED, this.convFilter || '')
+            if (text === null) return
+            this.convFilter = String(text).trim()
+            this.$forceUpdate()
+        },
+        clearConvFilter() {
+            this.convFilter = ''
+            this.$forceUpdate()
+        },
+
+        // ---------- 云端会话同步（#10） ----------
+        // 拉取 DeepSeek 账号的会话列表，按标题去重后导入：
+        // 恢复原会话模式（model_type→mode），记录 cloudId 供进入时按需拉取消息内容
+        async syncCloudSessions() {
+            if (this.syncing) return
+            this.syncing = true
+            this.syncMsg = ''
+            this.$forceUpdate()
+            try {
+                const list = await listCloudSessions({
+                    baseUrl: this.settings.baseUrl,
+                    apiKey: this.settings.apiKey,
+                    authMode: this.settings.authMode
+                })
+                let added = 0
+                for (const s of list) {
+                    const title = String(s.title || '').trim()
+                    if (!title) continue
+                    // 仅按 cloudId 去重（标题同名不再挤掉云端条目，本地/云端可并存）
+                    if (this.conversations.some((c) => c.cloudId === s.id)) continue
+                    const ts = s.updated_at ? Math.round(s.updated_at * 1000) : Date.now()
+                    // 模型已合并：云端 model_type 无论是 default/expert/vision 都映射到唯一模式
+                    const mode = MODES[0].key
+                    this.conversations.push({
+                        id: uid('c'),
+                        title: title.slice(0, 30),
+                        mode,
+                        thinking: true,
+                        search: false,
+                        createdAt: ts,
+                        updatedAt: ts,
+                        cloudId: s.id,
+                        cloudLoaded: false
+                    })
+                    added += 1
+                }
+                this.conversations.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
+                if (added > 0) {
+                    await saveConversations(this.conversations)
+                }
+                this.syncMsg = added > 0 ? ('已导入 ' + added + ' 个云端会话（进入时加载内容）') : '云端会话均已存在'
+                appLog('[sync] 云端会话 ' + list.length + ' 个，新增 ' + added)
+            } catch (e) {
+                this.syncMsg = '同步失败：' + (e && e.message ? e.message : '未知错误')
+                const msg = e && e.message ? e.message : String(e)
+                if (/封禁|限制|HTTP_401|HTTP_403|未认证|没有可用账号|空闲账号/.test(msg)) {
+                    recordAccountTrouble('同步', msg)
+                }
+                appLog('[sync] 失败 ' + msg)
+            }
+            this.syncing = false
+            this.$forceUpdate()
+        },
+
+        // 进入带 cloudId 的空会话时，按需拉取云端消息内容（一次性）
+        async ensureCloudMessages(conv) {
+            if (!conv || !conv.cloudId || conv.cloudLoaded) return
+            this._cloudLoading = this._cloudLoading || {}
+            if (this._cloudLoading[conv.id]) return
+            this._cloudLoading[conv.id] = true
+            this.cloudLoadingId = conv.id
+            this.$forceUpdate()
+            try {
+                const list = await listCloudSessionMessages({
+                    baseUrl: this.settings.baseUrl,
+                    apiKey: this.settings.apiKey,
+                    authMode: this.settings.authMode,
+                    sessionId: conv.cloudId
+                })
+                const convNow = this.conversations.find((c) => c.id === conv.id)
+                if (!convNow) return
+                const now = Date.now()
+                const msgs = []
+                let seq = 0
+                for (const m of list) {
+                    if (m.role === 'user') {
+                        const id = uid('u')
+                        msgs.push({
+                            id, role: 'user', content: m.content, images: [], createdAt: now + seq++,
+                            revisions: [{ content: m.content, images: [], createdAt: now + seq }], activeRevision: 0
+                        })
+                    } else {
+                        const id = uid('a')
+                        msgs.push({
+                            id, role: 'assistant', content: m.content, reasoning: m.reasoning || '', pending: false,
+                            createdAt: now + seq++,
+                            attempts: [{ id, content: m.content, reasoning: m.reasoning || '', pending: false, createdAt: now + seq }],
+                            activeAttempt: 0
+                        })
+                    }
+                }
+                convNow.cloudLoaded = true
+                await saveConversations(this.conversations)
+                if (msgs.length && this.activeId === conv.id) {
+                    this.messages = msgs
+                    await saveMessages(conv.id, this.messages)
+                    this.$forceUpdate()
+                    this.scrollToBottom()
+                }
+                appLog('[cloud] 已加载云端会话内容 ' + msgs.length + ' 条: ' + conv.title)
+            } catch (e) {
+                // 静默失败：保留占位会话，下次进入重试
+                const msg = e && e.message ? e.message : String(e)
+                if (/封禁|限制|HTTP_401|HTTP_403|未认证|没有可用账号|空闲账号/.test(msg)) {
+                    recordAccountTrouble('云端内容', msg)
+                }
+                appLog('[cloud] 拉取云端会话内容失败 ' + msg)
+            } finally {
+                this._cloudLoading[conv.id] = false
+                if (this.cloudLoadingId === conv.id) {
+                    this.cloudLoadingId = ''
+                }
+                this.$forceUpdate()
+            }
+        },
+        // 首条消息派生会话标题（#9 本地兜底；后端 dsTitle 可用时会被覆盖）
+        deriveTitle(text, imgCount) {
+            const t = (text || '').replace(/\s+/g, ' ').trim()
+            if (t) {
+                const cut = t.slice(0, 20)
+                const m = cut.match(/^(.+?[，。？！、；：,.!?;:])/)
+                return (m ? m[1] : cut) + (t.length > 20 ? '…' : '')
+            }
+            return imgCount > 0 ? '图片对话' : '新对话'
+        },
         fileUrl(path) {
             return 'file://' + path
         },
 
         // ---------- Markdown ----------
+        // 解析结果缓存（bug 修复：$forceUpdate 触发全列表重渲染时，未变化的消息
+        // 不再重复跑 markdown/行内解析——这是展开思考/流式输出卡顿的主因）
         markdownBlocks(content) {
-            return markdownToBlocks(content)
+            if (!content) return []
+            const cache = this._mdCache || (this._mdCache = new Map())
+            if (cache.has(content)) return cache.get(content)
+            const blocks = markdownToBlocks(content)
+            if (cache.size > 400) cache.clear()
+            cache.set(content, blocks)
+            return blocks
         },
         spans(text) {
-            return inlineSpans(text)
+            const key = String(text === undefined || text === null ? '' : text)
+            const cache = this._spanCache || (this._spanCache = new Map())
+            if (cache.has(key)) return cache.get(key)
+            const result = inlineSpans(key)
+            if (cache.size > 600) cache.clear()
+            cache.set(key, result)
+            return result
+        },
+        // emoji 片段拆分（带缓存）：emoji run 单独套 NotoColorEmoji 字体（#2）
+        emojiRuns(text) {
+            const key = String(text === undefined || text === null ? '' : text)
+            const cache = this._emojiCache || (this._emojiCache = new Map())
+            if (cache.has(key)) return cache.get(key)
+            const result = splitEmojiRuns(key)
+            if (cache.size > 600) cache.clear()
+            cache.set(key, result)
+            return result
+        },
+        emojiRunClass(s, r) {
+            return this.spanClass(s) + (r.e ? ' md-emoji' : '')
         },
         spanStyle(s) {
             let st = ''
@@ -267,11 +508,13 @@ export default {
             if (s.code) st += 'font-family:monospace;'
             return st
         },
+        // bug 修复（深色黑字）：Weex 的 <div> 颜色不会可靠继承到 <text>，
+        // 裸 span/加粗/斜体必须带显式颜色类，否则深色模式下渲染为默认黑色
         spanClass(s) {
-            if (s.bold) return 'md-bold'
-            if (s.italic) return 'md-italic'
+            if (s.bold) return this.dc('md-bold')
+            if (s.italic) return this.dc('md-italic')
             if (s.code) return this.dc('md-inline-code')
-            return ''
+            return this.dc('md-span')
         },
 
         // ---------- 重试/修改版本切换 ----------
@@ -339,6 +582,23 @@ export default {
         },
 
         // ---------- 初始化 / 生命周期 ----------
+        // Emoji 字体开关打开时：下载（如需）并注册，成功后重渲染生效（#2）
+        ensureEmojiFontIfEnabled() {
+            if (!(this.settings && this.settings.emojiFont)) return
+            ensureEmojiFont()
+                .then((r) => {
+                    if (r.ok) {
+                        this.$forceUpdate()
+                        return
+                    }
+                    // 失败原因写日志：开关显示"已开启"但只渲染出白块时，
+                    // 用户能在"查看日志"里看到到底是设备不支持还是下载失败。
+                    appLog('[index] emoji 字体不可用：' + (r.message || '未知原因'))
+                })
+                .catch((e) => {
+                    appLog('[index] emoji 字体异常：' + (e && e.message ? e.message : String(e)))
+                })
+        },
         setDebugLog() {
             try {
                 setDebugLogEnabled(!!(this.settings && this.settings.debugLog))
@@ -346,6 +606,8 @@ export default {
         },
         // 兜底拉起后端（startup 页若未执行 ensureBackendRunning 时启用）
         async ensureBackend() {
+            // 自定义端点模式不依赖本机后端，别去部署/重启它
+            if (this.settings && this.settings.authMode && this.settings.authMode !== 'builtin') return
             if (this._backendEnsuring) return
             this._backendEnsuring = true
             try {
@@ -369,8 +631,10 @@ export default {
         },
         async init() {
             this.settings = await loadSettings()
+            this.cacheTheme()
             appLog('[index] init theme=' + (this.settings && this.settings.theme) + ' isDark=' + this.isDark + ' authMode=' + (this.settings && this.settings.authMode))
             this.setDebugLog()
+            this.ensureEmojiFontIfEnabled()
             // 兜底拉起后端：startup 页可能因生命周期问题从未执行 ensureBackendRunning，
             // 这里确保后端一定被部署并启动（不阻塞 UI 渲染）
             this.ensureBackend()
@@ -398,7 +662,9 @@ export default {
         async onPageShow() {
             // 从设置页返回时刷新设置与会话列表（可能被清空）
             this.settings = await loadSettings()
+            this.cacheTheme()
             this.setDebugLog()
+            this.ensureEmojiFontIfEnabled()
             if (this.sending) {
                 // 发送中：不重载消息数组，避免 pending 消息被覆盖导致"正在思考"卡住
                 return
@@ -446,7 +712,7 @@ export default {
         sendClass() {
             // 深色模式：发送键用 send-dark 变体（浅色保持原样）
             if (this.sending) return this.dc('send')
-            return this.canSend() ? this.dc('send') : 'send-disabled'
+            return this.canSend() ? this.dc('send') : this.dc('send-disabled')
         },
         isLastAssistant(m) {
             const last = this.messages[this.messages.length - 1]
@@ -456,11 +722,17 @@ export default {
         // ---------- 会话管理 ----------
         toggleDrawer() {
             this.showDrawer = !this.showDrawer
+            if (!this.showDrawer) this.syncMsg = ''
             this.$forceUpdate()
         },
-        async newConversation() {
+        // applyDefaults=true（"＋新对话"按钮）：设置里的默认深度思考/默认联网搜索
+        // 在此刻生效一次；false（空态直接发送）：沿用当前开关（尊重用户已拨状态）
+        async newConversation(applyDefaults = false) {
             this.reqSeq += 1
-            const s = this.settings
+            if (applyDefaults) {
+                this.thinking = this.settings.defaultThinking
+                this.search = this.settings.defaultSearch
+            }
             const conv = {
                 id: uid('c'),
                 title: '新对话',
@@ -482,6 +754,8 @@ export default {
             this.draft = ''
             this.draftImages = []
             this.showDrawer = false
+            this.syncMsg = ''
+            this.convFilter = ''
             this.$forceUpdate()
         },
         async switchConversation(id) {
@@ -498,11 +772,14 @@ export default {
                 this.modeKey = conv.mode
                 this.thinking = conv.thinking
                 this.search = conv.search
+                // #10：云端同步的占位会话，进入时按需拉取消息内容
+                this.ensureCloudMessages(conv)
             }
             this.editingMsgId = null
             this.draft = ''
             this.draftImages = []
             this.showDrawer = false
+            this.syncMsg = ''
             this.$forceUpdate()
             this.scrollToBottom()
         },
@@ -546,6 +823,7 @@ export default {
         selectMode(key) {
             if (this.modeLocked()) return
             this.modeKey = key
+            // 模型已合并，单一模式即支持图片，切换模式不再需要清空待发图片。
             const conv = this.activeConversation()
             if (conv) {
                 conv.mode = key
@@ -559,6 +837,7 @@ export default {
         toggleThinking() {
             if (this.sending) return
             this.thinking = !this.thinking
+            // 会话创建后开关只属于该会话（持久化），不再受设置默认值影响
             const conv = this.activeConversation()
             if (conv) {
                 conv.thinking = this.thinking
@@ -597,6 +876,7 @@ export default {
                 return
             }
             const text = (this.draft || '').trim()
+            // 合并后的模型自带图片理解，图片随任意消息发送即可
             const images = this.draftImages || []
             if (!text && images.length === 0) return
 
@@ -656,7 +936,7 @@ export default {
                 }
                 this.messages.push(userMsg)
                 if (!conv.title || conv.title === '新对话') {
-                    conv.title = text.slice(0, 20)
+                    conv.title = this.deriveTitle(text, images.length)
                 }
             }
 
@@ -686,7 +966,7 @@ export default {
             await this.generate(conv, convId, seq, pending.id)
         },
 
-        async generate(conv, convId, seq, pendingId) {
+        async generate(conv, convId, seq, pendingId, forceThinking = false) {
             this.sending = true
             this.streamToken = null
             try {
@@ -698,10 +978,11 @@ export default {
                     apiKey: this.settings.apiKey,
                     modeKey: conv.mode,
                     messages: apiMessages,
-                    thinking: conv.thinking,
+                    thinking: forceThinking ? true : conv.thinking,
                     search: conv.search,
                     authMode: this.settings.authMode,
-                    modelId: this.settings.openaiModelId || ''
+                    modelId: this.settings.openaiModelId || '',
+                    conversationId: convId
                 }
 
                 const isStream = !!(this.settings && this.settings.sse === true)
@@ -757,6 +1038,28 @@ export default {
                     console.error('GEN | seq mismatch, return (seq=' + seq + ' reqSeq=' + this.reqSeq + ' convId=' + convId + ' activeId=' + this.activeId + ')')
                     return
                 }
+
+                // #12：非思考模式返回空内容时，自动按"深度思考开启"重试一次。
+                // thinking=OFF 是唯一返回空内容的场景（疑似 DeepSeek 服务端兼容问题），
+                // 自动回退保证用户总能拿到回复；根因以诊断日志持续观察。
+                if (res && !res.content && !res.reasoning && conv.thinking === false && !forceThinking) {
+                    appLog('[generate] 非思考模式返回空内容（mode=' + conv.mode + ' search=' + conv.search + ' sse=' + isStream + '），自动以思考模式重试 #12')
+                    return await this.generate(conv, convId, seq, pendingId, true)
+                }
+
+                // #9：会话自动命名——DeepSeek 在会话首条消息时下发自动生成的标题
+                // （dsTitle，与 thinking/search 开关无关），用它替换本地截断的标题
+                const convNow = this.conversations.find((c) => c.id === convId)
+                if (res && res.dsTitle && convNow) {
+                    const isFirstRound = this.messages.filter((x) => x.role === 'user').length <= 1
+                    const t = String(res.dsTitle).trim()
+                    if (t && isFirstRound && convNow.title !== t) {
+                        convNow.title = t.slice(0, 30)
+                        await this.persistConversation(convNow)
+                        appLog('[generate] 会话自动命名 => ' + convNow.title)
+                    }
+                }
+
                 const m = this.messages.find((x) => x.id === pendingId)
                 console.error('GEN | find pending=' + (m ? 'FOUND' : 'MISSING') + ' messages count=' + this.messages.length)
                 if (m) {
@@ -785,6 +1088,11 @@ export default {
             } catch (e) {
                 console.error('GEN | catch err=' + (e && e.message ? e.message : String(e)))
                 if (seq !== this.reqSeq || convId !== this.activeId) return
+                const msg = e && e.message ? e.message : '发生未知错误，请重试'
+                // 账号异常取证：疑似封号/禁言/鉴权失败时记录首次检出时间（#封号取证）
+                if (/被限制|禁言|封|空 SSE|HTTP_401|HTTP_403|未认证/.test(msg)) {
+                    recordAccountTrouble('对话', msg)
+                }
                 const m = this.messages.find((x) => x.id === pendingId)
                 if (m) {
                     const att = m.attempts && m.attempts[m.activeAttempt]
@@ -1008,15 +1316,60 @@ export default {
     position: relative;
 }
 
-/* 竖屏模式（实验性）：旋转内部包装层，根元素保持不动。
-   真机探针验证：translateX(936px) rotate(90deg) + transform-origin:0 0 对内部 div 正确填满 936×280。
-   之前把 transform 加在根元素上导致白屏（引擎对根元素 transform 支持异常）。 */
-.portrait {
+/* 竖屏模式（实验性）：transform 挂在专用的内层画布上（不占用布局职责的元素），
+   避免与 flex:1 + position:relative 的布局根冲突。尺寸/位移由 portraitStyle 内联提供。
+   之前把 transform 挂在 pwrap（flex:1+relative）上在真机白屏。 */
+.rotate-canvas {
     flex: 0;
-    width: 280px;
-    height: 936px;
-    transform: translateX(936px) rotate(90deg);
-    transform-origin: 0 0;
+    flex-direction: column;
+    background-color: #f2f3f5;
+}
+.rotate-canvas-dark {
+    flex: 0;
+    flex-direction: column;
+    background-color: #121212;
+}
+.fill-canvas {
+    flex: 1;
+    flex-direction: column;
+}
+
+/* 会话搜索过滤条（#7） */
+.filter-row {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 12px;
+    border-bottom-width: 1px;
+    border-bottom-color: #eeeeee;
+}
+.filter-text {
+    font-size: 16px;
+    color: #1a73e8;
+    flex: 1;
+}
+.filter-clear {
+    font-size: 16px;
+    color: #d93025;
+    padding: 2px 8px;
+}
+.filter-row-dark {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 12px;
+    border-bottom-width: 1px;
+    border-bottom-color: #333333;
+}
+.filter-text-dark {
+    font-size: 16px;
+    color: #82b1ff;
+    flex: 1;
+}
+.filter-clear-dark {
+    font-size: 16px;
+    color: #ff8a80;
+    padding: 2px 8px;
 }
 
 .topbar {
@@ -1243,9 +1596,23 @@ export default {
 }
 .md-bold {
     font-weight: bold;
+    color: #222222;
+    font-size: 20px;
+    line-height: 28px;
 }
 .md-italic {
     font-style: italic;
+    color: #222222;
+    font-size: 20px;
+    line-height: 28px;
+}
+.md-span {
+    color: #222222;
+    font-size: 20px;
+    line-height: 28px;
+}
+.md-emoji {
+    font-family: NotoColorEmoji;
 }
 .md-inline-code {
     font-family: monospace;
@@ -1798,5 +2165,165 @@ export default {
     flex-wrap: wrap;
     background-color: #1e1e1e;
     padding: 6px 12px 0 12px;
+}
+
+/* ========== build 22 深色补全（#1/#7）：以下为模板中经 dc() 切换的类 ========== */
+.drawer-mask {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background-color: rgba(0, 0, 0, 0.4);
+}
+.md-dark {
+    flex-direction: column;
+}
+.md-p-dark {
+    flex-direction: row;
+    flex-wrap: wrap;
+    font-size: 20px;
+    line-height: 28px;
+    color: #e8e8e8;
+}
+.md-span-dark {
+    color: #e8e8e8;
+    font-size: 20px;
+    line-height: 28px;
+}
+.md-bold-dark {
+    font-weight: bold;
+    color: #e8e8e8;
+    font-size: 20px;
+    line-height: 28px;
+}
+.md-italic-dark {
+    font-style: italic;
+    color: #e8e8e8;
+    font-size: 20px;
+    line-height: 28px;
+}
+.md-quote-dark {
+    font-size: 20px;
+    line-height: 28px;
+    color: #aaaaaa;
+    border-left-width: 3px;
+    border-left-color: #555555;
+    padding-left: 10px;
+    margin: 4px 0;
+}
+.md-hr-dark {
+    font-size: 16px;
+    color: #666666;
+    text-align: center;
+}
+.md-list-dark {
+    flex-direction: column;
+}
+.md-li-marker-dark {
+    font-size: 20px;
+    line-height: 28px;
+    color: #e8e8e8;
+    margin-right: 4px;
+}
+.md-heading-dark {
+    font-weight: bold;
+    color: #e8e8e8;
+}
+.md-h1-dark {
+    font-size: 30px;
+    line-height: 36px;
+    margin-top: 4px;
+}
+.md-h2-dark {
+    font-size: 28px;
+    line-height: 34px;
+    margin-top: 4px;
+}
+.md-h3-dark {
+    font-size: 26px;
+    line-height: 32px;
+    margin-top: 4px;
+}
+.md-h4-dark, .md-h5-dark, .md-h6-dark {
+    font-size: 24px;
+    line-height: 30px;
+    margin-top: 4px;
+}
+.pending-dark {
+    font-size: 18px;
+    color: #aaaaaa;
+}
+.streaming-hint-dark {
+    font-size: 16px;
+    color: #82b1ff;
+    margin-top: 4px;
+}
+.bubble-text-error-dark {
+    font-size: 20px;
+    line-height: 28px;
+    color: #ff8a80;
+}
+.thumb-dark {
+    width: 120px;
+    height: 90px;
+    border-radius: 8px;
+    margin-right: 6px;
+    background-color: #2a2a2a;
+}
+.attempt-nav-dark {
+    font-size: 22px;
+    color: #82b1ff;
+    padding: 0 6px;
+}
+.attempt-indicator-dark {
+    font-size: 16px;
+    color: #aaaaaa;
+    padding: 0 4px;
+}
+.drawer-head-dark {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px;
+    border-bottom-width: 1px;
+    border-bottom-color: #333333;
+}
+.conv-del-dark {
+    font-size: 18px;
+    color: #ff8a80;
+    padding: 4px 10px;
+}
+.drawer-empty-dark {
+    font-size: 18px;
+    color: #aaaaaa;
+    text-align: center;
+    padding: 30px 0;
+}
+.drawer-close-dark {
+    font-size: 20px;
+    color: #82b1ff;
+    text-align: center;
+    padding: 12px;
+    border-top-width: 1px;
+    border-top-color: #333333;
+}
+.sync-msg {
+    font-size: 14px;
+    color: #1a73e8;
+    padding: 4px 12px;
+}
+.sync-msg-dark {
+    font-size: 14px;
+    color: #82b1ff;
+    padding: 4px 12px;
+}
+.send-disabled-dark {
+    font-size: 20px;
+    color: #666666;
+    background-color: #2a2a2a;
+    border-radius: 18px;
+    padding: 8px 20px;
+    margin-left: 8px;
 }
 </style>

@@ -454,6 +454,7 @@ fn make_end_chunk(
         usage: None,
         service_tier: None,
         system_fingerprint: None,
+        ds_title: None,
     }
 }
 
@@ -541,6 +542,7 @@ where
                     usage: None,
                     service_tier: None,
                     system_fingerprint: None,
+                    ds_title: None,
                 })));
             }
 

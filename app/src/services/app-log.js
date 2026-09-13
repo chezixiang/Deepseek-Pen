@@ -29,17 +29,62 @@ async function doAppend(line) {
     } catch (e) { /* 首次写入，无旧文件 */ }
     const next = (prev ? prev.replace(/^\[object Promise\]\n?/, '') + '\n' : '') + line
     const lines = next.split('\n')
-    const trimmed = lines.length > MAX_LOG_LINES ? lines.slice(-MAX_LOG_LINES).join('\n') : next
+    let trimmed = next
+    if (lines.length > MAX_LOG_LINES) {
+      // 轮转保留（bug 修复）：被挤出的较旧内容转入 .old（尾部 1000 行），
+      // 不再直接丢弃——否则封号等事故发生前的日志无从查证
+      const overflow = lines.slice(0, lines.length - MAX_LOG_LINES).join('\n')
+      try {
+        let prevOld = ''
+        try {
+          const oldRaw = await fs.readFile(LOG_FILE() + '.old')
+          if (oldRaw) prevOld = String(oldRaw)
+        } catch (e) { /* 无上一份 */ }
+        const merged = (prevOld ? prevOld + '\n' : '') + overflow
+        const oldLines = merged.split('\n')
+        await fs.writeFile(LOG_FILE() + '.old', oldLines.slice(-1000).join('\n'))
+      } catch (e) { /* 忽略 */ }
+      trimmed = lines.slice(-MAX_LOG_LINES).join('\n')
+    }
     await fs.writeFile(LOG_FILE(), trimmed)
   } catch (e) { /* 忽略 */ }
 }
 
-// 读取最近 N 行日志（供设置页"查看诊断日志"展示）
-export async function appLogTail(n = 10) {
+// 读取日志：gen=0 当前文件，gen=1 上一份（轮转保留的 .old）
+export async function appLogTail(n = 10, gen = 0) {
   try {
-    const raw = String(await fs.readFile(LOG_FILE()) || '')
+    const path = LOG_FILE() + (gen === 1 ? '.old' : '')
+    const raw = String(await fs.readFile(path) || '')
     return raw.split('\n').filter(Boolean).slice(-n).join('\n')
   } catch (e) {
     return ''
   }
+}
+
+// 清空应用日志（含上一份）
+export async function appLogClear() {
+  try { await fs.writeFile(LOG_FILE(), '') } catch (e) { /* 忽略 */ }
+  try { await fs.writeFile(LOG_FILE() + '.old', '') } catch (e) { /* 忽略 */ }
+}
+
+// ---------- 后端日志（ds-free-api runtime.log） ----------
+// build 22 起 ds-free-api 部署在 $dataDir/ds-free-api，fs 可直接读。
+// 直接用 fs 而不经 native.js，避免与 native.js → appLog 的循环依赖。
+// gen=1 读 runtime.log.1（native.js 截断时保留的上一份，尾部 800 行）。
+const BACKEND_LOG_FILE = (gen = 0) =>
+  String($dataDir || '/tmp/').replace(/\/+$/, '') +
+  '/ds-free-api/logs/runtime.log' + (gen === 1 ? '.1' : '')
+
+export async function backendLogTail(n = 100, gen = 0) {
+  try {
+    const raw = String(await fs.readFile(BACKEND_LOG_FILE(gen)) || '')
+    return raw.split('\n').filter(Boolean).slice(-n).join('\n')
+  } catch (e) {
+    return ''
+  }
+}
+
+export async function backendLogClear() {
+  try { await fs.writeFile(BACKEND_LOG_FILE(0), '') } catch (e) { /* 忽略 */ }
+  try { await fs.writeFile(BACKEND_LOG_FILE(1), '') } catch (e) { /* 忽略 */ }
 }

@@ -130,6 +130,7 @@ mod tests {
             usage,
             service_tier: None,
             system_fingerprint: None,
+            ds_title: None,
         }
     }
 
@@ -324,6 +325,7 @@ mod tests {
             }),
             service_tier: None,
             system_fingerprint: None,
+            ds_title: None,
         };
         let msg = from_chat_completions(&r);
         assert!(msg.content.is_empty());

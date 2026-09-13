@@ -24,6 +24,7 @@ fn make_usage_chunk(usage: Usage, model: &str) -> ChatCompletionsResponseChunk {
         usage: Some(usage),
         service_tier: None,
         system_fingerprint: None,
+        ds_title: None,
     }
 }
 
@@ -56,6 +57,22 @@ pub(crate) fn make_chunk(
         usage: None,
         service_tier: None,
         system_fingerprint: None,
+        ds_title: None,
+    }
+}
+
+/// 标题尾随 chunk：finish 之后到达的 ds_title 以空 choices chunk 透传给客户端
+fn make_title_chunk(model: &str, title: String) -> ChatCompletionsResponseChunk {
+    ChatCompletionsResponseChunk {
+        id: next_chatcmpl_id(),
+        object: "chat.completion.chunk",
+        created: now_secs(),
+        model: model.to_string(),
+        choices: vec![],
+        usage: None,
+        service_tier: None,
+        system_fingerprint: None,
+        ds_title: Some(title),
     }
 }
 
@@ -70,6 +87,8 @@ pin_project! {
         prompt_tokens: u32,
         finished: bool,
         usage_value: Option<u32>,
+        // DeepSeek 自动生成的会话标题，随 finish chunk 透传
+        title_value: Option<String>,
     }
 }
 
@@ -90,6 +109,7 @@ impl<S> ConverterStream<S> {
             prompt_tokens,
             finished: false,
             usage_value: None,
+            title_value: None,
         }
     }
 }
@@ -167,6 +187,10 @@ where
                         return Poll::Ready(Some(Ok(chunk)));
                     }
                     DsFrame::Status(_) => {}
+                    DsFrame::Title(t) => {
+                        trace!(target: "adapter", ">>> conv: ds_title={}", t);
+                        *this.title_value = Some(t);
+                    }
                     DsFrame::Usage(u) => {
                         trace!(target: "adapter", ">>> conv: usage={}", u);
                         *this.usage_value = Some(u);
@@ -199,10 +223,14 @@ where
                         && *this.include_usage
                         && let Some(u) = this.usage_value.take()
                     {
+                        // 下一次 poll 仍会走 Ready(None) 分支，继续发出标题尾随 chunk
                         return Poll::Ready(Some(Ok(make_usage_chunk(
                             make_usage(*this.prompt_tokens, u),
                             this.model,
                         ))));
+                    }
+                    if let Some(t) = this.title_value.take() {
+                        return Poll::Ready(Some(Ok(make_title_chunk(&this.model, t))));
                     }
                     return Poll::Ready(None);
                 }

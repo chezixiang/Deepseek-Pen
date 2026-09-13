@@ -110,6 +110,48 @@ mod tests {
         assert!(!req.prompt.is_empty());
     }
 
+    /// full.har 实证：全新会话首条消息 prompt 是纯文本（无原生标签）
+    #[test]
+    fn single_turn_plain_prompt() {
+        let body = serde_json::json!({
+            "model": "deepseek-default",
+            "messages": [{ "role": "user", "content": "NAT2和NAT4能否打通TCP P2P" }]
+        });
+        let req = parse_json(body).unwrap();
+        assert_eq!(req.prompt, "NAT2和NAT4能否打通TCP P2P");
+    }
+
+    /// full.har entry#260 实证：带图首条消息 prompt 仍是纯文本（图走 ref_file_ids）。
+    /// 模型合并后（new.jsonl，2026-09-12）图片理解归入 deepseek-default，
+    /// 原 deepseek-vision 已下线（settings 里 enabled:false）。
+    #[test]
+    fn single_turn_with_image_plain_text_prompt() {
+        let body = serde_json::json!({
+            "model": "deepseek-default",
+            "messages": [{ "role": "user", "content": [
+                { "type": "text", "text": "解释一下这个梗" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } }
+            ]}]
+        });
+        let req = parse_json(body).unwrap();
+        assert_eq!(req.prompt, "解释一下这个梗");
+    }
+
+    /// 多轮对话仍走原生标签格式（历史文件拆分依赖标签）
+    #[test]
+    fn multi_turn_keeps_native_tags() {
+        let body = serde_json::json!({
+            "model": "deepseek-default",
+            "messages": [
+                { "role": "user", "content": "第一问" },
+                { "role": "assistant", "content": "第一答" },
+                { "role": "user", "content": "第二问" }
+            ]
+        });
+        let req = parse_json(body).unwrap();
+        assert!(req.prompt.contains("<｜User｜>"), "多轮应保留原生标签");
+    }
+
     #[test]
     fn tool_conversation() {
         let body = serde_json::json!({
@@ -139,10 +181,12 @@ mod tests {
         assert!(req.prompt.contains("get_weather"));
     }
 
+    /// 深度思考与联网搜索是 model_type=default 上的正交开关
+    /// （模型合并后 deepseek-expert 已下线，专家能力由 thinking_enabled 表达）。
     #[test]
     fn reasoning_and_search_flags() {
         let body = serde_json::json!({
-            "model": "deepseek-expert",
+            "model": "deepseek-default",
             "messages": [
                 { "role": "user", "content": "分析一下量子计算" }
             ],
@@ -152,6 +196,21 @@ mod tests {
         let req = parse_json(body).unwrap();
         assert!(req.thinking_enabled);
         assert!(req.search_enabled);
+    }
+
+    /// 已下线的模型名必须明确报错，而不是静默降级
+    #[test]
+    fn retired_models_rejected() {
+        for name in ["deepseek-expert", "deepseek-vision", "deepseek-vl"] {
+            let body = serde_json::json!({
+                "model": name,
+                "messages": [{ "role": "user", "content": "hi" }]
+            });
+            assert!(
+                parse_json(body).is_err(),
+                "已下线模型 {name} 应被拒绝"
+            );
+        }
     }
 
     // normalize 错误场景

@@ -358,6 +358,7 @@ mod tests {
             usage: None,
             service_tier: None,
             system_fingerprint: None,
+            ds_title: None,
         }
     }
 
@@ -379,6 +380,7 @@ mod tests {
             usage: None,
             service_tier: None,
             system_fingerprint: None,
+            ds_title: None,
         }
     }
 
@@ -400,6 +402,7 @@ mod tests {
             usage: None,
             service_tier: None,
             system_fingerprint: None,
+            ds_title: None,
         }
     }
 
@@ -421,6 +424,7 @@ mod tests {
             usage: None,
             service_tier: None,
             system_fingerprint: None,
+            ds_title: None,
         }
     }
 
@@ -439,6 +443,7 @@ mod tests {
             usage: None,
             service_tier: None,
             system_fingerprint: None,
+            ds_title: None,
         }
     }
 
@@ -458,6 +463,7 @@ mod tests {
             }),
             service_tier: None,
             system_fingerprint: None,
+            ds_title: None,
         }
     }
 
@@ -476,6 +482,7 @@ mod tests {
             usage: None,
             service_tier: None,
             system_fingerprint: None,
+            ds_title: None,
         }
     }
 

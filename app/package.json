@@ -1,6 +1,6 @@
 {
   "name": "Deepseek",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Deepseek 聊天客户端（有道词典笔版，对接 ds-free-api）",
   "appid": "8000000000182376",
   "icon": "app_icon.png",

@@ -67,6 +67,8 @@ pub struct Account {
     last_released: AtomicI64,
     /// 连续登录失败次数
     error_count: AtomicU8,
+    /// 禁言到期 Unix 秒（0=未知）；登录响应 chat.mute_until 实测值
+    mute_until: AtomicI64,
     /// 原始凭据（用于重新登录）
     creds: AccountConfig,
 }
@@ -98,6 +100,24 @@ impl Account {
 
     pub fn is_available(&self) -> bool {
         self.state() == AccountState::Idle
+    }
+
+    /// 禁言到期 Unix 秒（0=未知）
+    pub fn mute_until(&self) -> i64 {
+        self.mute_until.load(Ordering::Relaxed)
+    }
+
+    pub fn set_mute_until(&self, secs: i64) {
+        self.mute_until.store(secs, Ordering::Relaxed);
+    }
+}
+
+/// 禁言到期时间格式化（本地时区）
+pub(crate) fn format_mute_time(secs: i64) -> String {
+    use chrono::TimeZone;
+    match chrono::Local.timestamp_opt(secs, 0).single() {
+        Some(t) => t.format("%Y-%m-%d %H:%M").to_string(),
+        None => secs.to_string(),
     }
 }
 
@@ -345,6 +365,33 @@ impl AccountPool {
         Some(AccountGuard { account })
     }
 
+    /// 获取指定账号（会话复用：续聊/重答必须用创建会话的同一账号），空闲时立即返回
+    pub fn get_account_by_id(&self, email_or_mobile: &str) -> Option<AccountGuard> {
+        let entry = self.accounts.get(email_or_mobile)?;
+        let account = entry.value();
+        if !account.is_available() {
+            return None;
+        }
+        account
+            .state
+            .compare_exchange(
+                AccountState::Idle as u8,
+                AccountState::Busy as u8,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .ok()?;
+        Some(AccountGuard {
+            account: Arc::clone(account),
+        })
+    }
+
+    /// 只读获取账号当前 token（不改变可用状态）；用于会话缓存淘汰时清理持久会话
+    pub fn token_of(&self, email_or_mobile: &str) -> Option<String> {
+        let entry = self.accounts.get(email_or_mobile)?;
+        Some(entry.value().token().to_string())
+    }
+
     /// 获取所有账号的详细状态
     pub fn account_statuses(&self) -> Vec<AccountStatus> {
         self.accounts
@@ -433,8 +480,9 @@ impl AccountPool {
         // 避免恢复流程每次发真实 completion 加重风控压力
         match try_init_account(&account.creds, client, solver, false).await {
             Ok(new_account) => {
-                // 更新 token
+                // 更新 token 与禁言状态
                 *account.token.write().unwrap() = new_account.token.read().unwrap().clone();
+                account.set_mute_until(new_account.mute_until());
                 account
                     .state
                     .store(AccountState::Idle as u8, Ordering::Relaxed);
@@ -555,7 +603,7 @@ async fn try_init_account(
         } else {
             Some(creds.area_code.clone())
         },
-        device_id: String::new(),
+        device_id: creds.device_id.clone(),
         os: "web".to_string(),
     };
 
@@ -594,6 +642,22 @@ async fn try_init_account(
         &creds.mobile
     };
 
+    // 禁言状态（登录响应实测字段）：登录不受禁言影响，但 completion 会被拒
+    let mute_until = login_data
+        .user
+        .chat
+        .as_ref()
+        .map(|c| c.mute_until as i64)
+        .unwrap_or(0);
+    if login_data.user.chat.as_ref().is_some_and(|c| c.is_muted != 0) {
+        warn!(
+            target: "ds_core::accounts",
+            "账号 {} 已被禁言至 {}（登录正常，completion 将被拒绝，user_is_muted）",
+            display_id,
+            format_mute_time(mute_until)
+        );
+    }
+
     // 健康检查：创建临时 session → 发送 test completion → 删除 session。
     // 仅首次登录执行完整 health_check；重登/恢复只验证 create_session 成功即返回，
     // 避免每次重登都发一次真实 completion，加重风控压力（禁言根因之一）。
@@ -614,6 +678,7 @@ async fn try_init_account(
         state: AtomicU8::new(AccountState::Idle as u8),
         last_released: AtomicI64::new(0),
         error_count: AtomicU8::new(0),
+        mute_until: AtomicI64::new(mute_until),
         creds: creds.clone(),
     })
 }

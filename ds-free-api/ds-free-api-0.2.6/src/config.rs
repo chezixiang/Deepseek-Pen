@@ -73,6 +73,25 @@ pub struct Account {
     pub area_code: String,
     /// 密码
     pub password: String,
+    /// 设备 ID（UUID 格式，首次自动生成后持久化；用于风控识别）
+    #[serde(default = "generate_device_id")]
+    pub device_id: String,
+}
+
+/// 生成随机设备 ID（UUID v4 格式）
+fn generate_device_id() -> String {
+    use std::fmt::Write;
+    let mut rng = std::collections::hash_map::RandomState::new();
+    let hash1 = std::hash::BuildHasher::hash_one(&rng, std::time::SystemTime::now());
+    let hash2 = std::hash::BuildHasher::hash_one(&rng, std::process::id());
+    format!(
+        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+        (hash1 >> 32) as u32,
+        (hash1 >> 16) as u16 & 0xffff,
+        (hash1 as u16) & 0x0fff,
+        (hash2 >> 48) as u16 & 0x3fff | 0x8000,
+        hash2 & 0xffffffffffff
+    )
 }
 
 /// DeepSeek 客户端配置
@@ -96,6 +115,12 @@ pub struct DeepSeekConfig {
     /// X-Client-Locale 请求头
     #[serde(default = "default_client_locale")]
     pub client_locale: String,
+    /// X-Client-Bundle-Id 请求头（web 端固定 com.deepseek.chat）
+    #[serde(default = "default_client_bundle_id")]
+    pub client_bundle_id: String,
+    /// X-Client-Timezone-Offset 请求头（秒；东八区 = 28800）
+    #[serde(default = "default_client_timezone_offset")]
+    pub client_timezone_offset: i32,
     /// 定义支持的模型类型列表，每种类型会自动映射为 OpenAI 的 model_id：deepseek-<type>
     #[serde(default = "default_model_types")]
     pub model_types: Vec<String>,
@@ -113,6 +138,9 @@ pub struct DeepSeekConfig {
     /// 则仅 deepseek-v4-pro → expert（index 1），空字符串被跳过
     #[serde(default)]
     pub model_aliases: Vec<String>,
+    /// 设备指纹配置（可选，用于风控绕过；留空使用默认模板）
+    #[serde(default)]
+    pub fingerprint: Option<serde_json::Value>,
 }
 
 /// 工具调用标签配置
@@ -164,6 +192,8 @@ impl Default for DeepSeekConfig {
             client_version: default_client_version(),
             client_platform: default_client_platform(),
             client_locale: default_client_locale(),
+            client_bundle_id: default_client_bundle_id(),
+            client_timezone_offset: default_client_timezone_offset(),
             model_types: default_model_types(),
             max_input_tokens: default_max_input_tokens(),
             max_output_tokens: default_max_output_tokens(),
@@ -173,16 +203,35 @@ impl Default for DeepSeekConfig {
     }
 }
 
+/// 支持的 model_type 列表。
+///
+/// 2026-09-12 官方合并模型：new.jsonl 的 `client/settings?scope=model` 显示
+/// `expert`（专家模式）与 `vision`（识图模式）均已 `enabled:false, switchable:false`，
+/// 只剩 `default` 一种（`is_default:true`），且它的 `file_feature.vision=true`
+/// —— 图片理解、深度思考、联网搜索全部降级为 default 上的正交开关
+/// （`thinking_enabled` / `search_enabled` / `ref_file_ids`）。
+/// 继续发送 expert/vision 既拿不到能力，又是明显的过期客户端特征。
 fn default_model_types() -> Vec<String> {
-    vec!["default".to_string(), "expert".to_string(), "vl".to_string()]
+    vec!["default".to_string()]
 }
 
 fn default_max_input_tokens() -> Vec<u32> {
-    vec![1_048_576, 1_048_576, 1_048_576]
+    // settings 实测 input_character_limit=2621440，file token_limit=890880
+    vec![1_048_576]
 }
 
 fn default_max_output_tokens() -> Vec<u32> {
-    vec![384_000, 384_000, 384_000]
+    vec![384_000]
+}
+
+/// 默认 X-Client-Bundle-Id —— new.jsonl 实抓 web 端固定值
+fn default_client_bundle_id() -> String {
+    "com.deepseek.chat".to_string()
+}
+
+/// 默认 X-Client-Timezone-Offset —— 东八区 28800 秒
+fn default_client_timezone_offset() -> i32 {
+    28800
 }
 
 impl DeepSeekConfig {
@@ -239,9 +288,11 @@ fn default_user_agent() -> String {
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36".to_string()
 }
 
-/// 默认 X-Client-Version —— 对应 DeepSeek web 端
+/// 默认 X-Client-Version —— 对应 DeepSeek web 端。
+/// new.jsonl（2026-09-12 实抓）显示线上 web 为 2.5.0；该值反映站点部署版本，
+/// 与浏览器版本无关，可与 Chrome/136 UA 安全组合。
 fn default_client_version() -> String {
-    "2.3.0".to_string()
+    "2.5.0".to_string()
 }
 
 /// 默认 X-Client-Platform —— 与桌面 Chrome UA 匹配
@@ -249,9 +300,9 @@ fn default_client_platform() -> String {
     "web".to_string()
 }
 
-/// 默认 X-Client-Locale
+/// 默认 X-Client-Locale —— full.har 实证 web 端为 zh_CN（下划线格式）
 fn default_client_locale() -> String {
-    "zh-CN".to_string()
+    "zh_CN".to_string()
 }
 
 impl Config {

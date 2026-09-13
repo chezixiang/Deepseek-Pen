@@ -44,10 +44,25 @@ export const ERR = Object.freeze({
   NET_HEALTH_FAILED: 10503,
 })
 
-// $dataDir 无尾斜杠时补上，统一拼接路径，避免文件名拼进目录名
+// $dataDir 的尾斜杠在不同机型上不一致（X7 带、部分机型不带），且各处拼接
+// 又会自带前导 '/'，两者相遇就产生 `/data//ds-free-api` 这种非法路径。
+// 统一规则：dataDirBase() 永远返回**不带**尾斜杠的目录，joinPath() 负责补一个。
+export function dataDirBase() {
+  return String($dataDir || '/tmp').replace(/\/+$/, '')
+}
+
+// 任意段数拼接：去掉每段首尾多余斜杠后用单个 '/' 连接，保留 base 的前导 '/'
+export function joinPath(base, ...parts) {
+  let out = String(base == null ? '' : base).replace(/\/+$/, '')
+  for (const part of parts) {
+    const seg = String(part == null ? '' : part).replace(/^\/+/, '').replace(/\/+$/, '')
+    if (seg) out += '/' + seg
+  }
+  return out
+}
+
 function joinDataDir(name) {
-  const base = String($dataDir || '/tmp/')
-  return (base.endsWith('/') ? base : base + '/') + name
+  return joinPath(dataDirBase(), name)
 }
 
 function makeErr(code, msg) {
@@ -149,10 +164,44 @@ export async function waitForFile(path, timeoutMs) {
 
 // ---------- ds-free-api 账号配置 ----------
 // 内置模式下，把 DeepSeek 官方账号写入本机 ds-free-api 的 config.toml（[[accounts]] 段），
-// 并重启 ds-free-api 让账号生效。execShell 为 root，可写 /userdisk 下配置文件。
-const DS_FREE_API_DIR = '/userdisk/ds-free-api'
-const DS_CONFIG = DS_FREE_API_DIR + '/config.toml'
+// 并重启 ds-free-api 让账号生效。execShell 为 root，可写应用 data 目录下的配置文件。
+//
+// 目录策略（build 22）：ds-free-api 统一放在应用 data 目录（$dataDir/ds-free-api）。
+// 旧版放在 /userdisk/ds-free-api，部分设备的应用 fs 模块无法读该路径，导致
+// "无法读取 ds-free-api 配置文件"（错误码 10201）；迁移后 fs 可直接读写全部文件。
+// 副作用是卸载重装会清空 data 目录 → 自动触发全量重新部署（二进制/配置随版本更新）。
+const DS_LEGACY_DIR = '/userdisk/ds-free-api'
 const DS_PORTS = [22217, 22218, 22219, 22220, 22221, 22222]
+
+export function dsHomeDir() {
+  return joinDataDir('ds-free-api')
+}
+
+export function dsConfigPath() {
+  return joinPath(dsHomeDir(), 'config.toml')
+}
+
+// ds-free-api 运行日志路径（后端用 DS_DATA_DIR + "/logs/runtime.log"）
+export function dsRuntimeLogPath() {
+  return joinPath(dsHomeDir(), 'logs', 'runtime.log')
+}
+
+// 一次性迁移：老版本 /userdisk/ds-free-api 下的 config.toml 拷到新目录（幂等）。
+// 二进制不拷贝——走 deployBackend 的 base64 全量部署，保证写入的是当前内嵌版本。
+async function migrateLegacyDir() {
+  const home = dsHomeDir()
+  const cfg = dsConfigPath()
+  const resultFile = joinDataDir('ds-migrate-result.txt')
+  await writeFile(resultFile, '')
+  const cmd =
+    'mkdir -p ' + shq(joinPath(home, 'logs')) + '; ' +
+    'if [ ! -f ' + shq(cfg) + ' ] && [ -f ' + shq(joinPath(DS_LEGACY_DIR, 'config.toml')) + ' ]; then ' +
+    'cp ' + shq(joinPath(DS_LEGACY_DIR, 'config.toml')) + ' ' + shq(cfg) + '; fi; ' +
+    'printf ok > ' + shq(resultFile)
+  execShell(cmd)
+  await waitForFile(resultFile, 15000)
+  execShell('rm -f ' + shq(resultFile) + ' 2>/dev/null || true')
+}
 
 export function shq(s) {
   return "'" + String(s).replace(/'/g, "'\\''") + "'"
@@ -165,9 +214,19 @@ export function stopStream(token) {
   } catch (e) { /* 忽略 */ }
 }
 
-// 清洗账号/密码输入：去除引号、反斜杠、控制字符，避免破坏 TOML 或进入任何 shell 环节。
+// 清洗账号/密码输入：只去掉会破坏 TOML 行结构的控制字符（换行/回车/制表/NUL），
+// 并去掉首尾空白。**不再删除引号和反斜杠** —— 旧实现把 `"` 和 `\` 直接丢弃，
+// 用户密码里含这两个字符时写进配置的就是错的密码，登录必然失败（部分设备/部分
+// 用户"无法账密登录"的一个确定成因）。引号/反斜杠改由 tomlEscape 正确转义。
 function sanitizeCred(s) {
-  return String(s || '').replace(/["\\\r\n\t\0]/g, '').trim()
+  return String(s || '').replace(/[\r\n\t\0]/g, '').trim()
+}
+
+// TOML 基本字符串转义：反斜杠必须先转，否则会把后面转义出的反斜杠再转一次。
+function tomlEscape(s) {
+  return String(s == null ? '' : s)
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
 }
 
 function uuidV4() {
@@ -181,29 +240,49 @@ function uuidV4() {
 // 在 JS 里改写 config.toml 的 [[accounts]] 段（纯字符串操作，不拼 shell），返回新内容；失败返回 null。
 // 采用按行处理（split/map/join），避免 QuickJS 对 `^...$` 多行正则/RegExp.lastIndex 的兼容性问题。
 function replaceAccount(raw, user, pass) {
-  if (raw.indexOf('[[accounts]]') < 0) return null
+  const accStart = raw.indexOf('[[accounts]]')
+  if (accStart < 0) return null
   const isEmail = /@/.test(user || '')
   const lines = raw.split('\n')
-  let changed = false
+  // 需要写入的四个键；未在原文件出现的键必须补写，
+  // 旧实现只改"已存在的行"，缺 mobile/area_code 的配置会保留旧值或空值导致登录失败。
+  const want = {
+    email: isEmail ? '"' + tomlEscape(user) + '"' : '""',
+    mobile: isEmail ? '""' : '"' + tomlEscape(user) + '"',
+    area_code: isEmail ? '""' : '"+86"',
+    password: '"' + tomlEscape(pass) + '"'
+  }
+  const seen = { email: false, mobile: false, area_code: false, password: false }
+
+  // 只在 [[accounts]] 段内改写：段边界 = 下一个以 '[' 开头的行
+  let inAccounts = false
+  let lastAccountLine = -1
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i]
-    const kv = line.match(/^\s*([a-zA-Z_]+)\s*=/)
+    const trimmed = lines[i].trim()
+    if (trimmed.startsWith('[')) {
+      inAccounts = trimmed === '[[accounts]]'
+      if (inAccounts) lastAccountLine = i
+      continue
+    }
+    if (!inAccounts) continue
+    const kv = lines[i].match(/^\s*([a-zA-Z_]+)\s*=/)
     if (!kv) continue
     const key = kv[1]
-    if (key === 'email') {
-      lines[i] = 'email = ' + (isEmail ? '"' + user + '"' : '""')
-      changed = true
-    } else if (key === 'mobile') {
-      lines[i] = 'mobile = ' + (isEmail ? '""' : '"' + user + '"')
-      changed = true
-    } else if (key === 'area_code') {
-      if (!isEmail) { lines[i] = 'area_code = "+86"'; changed = true }
-    } else if (key === 'password') {
-      lines[i] = 'password = "' + pass + '"'
-      changed = true
+    if (Object.prototype.hasOwnProperty.call(want, key)) {
+      lines[i] = key + ' = ' + want[key]
+      seen[key] = true
+      lastAccountLine = i
     }
   }
-  if (!changed) return null
+  if (lastAccountLine < 0) return null
+
+  // 补齐缺失的键，插到 [[accounts]] 段最后一行之后
+  const missing = Object.keys(want)
+    .filter((k) => !seen[k])
+    .map((k) => k + ' = ' + want[k])
+  if (missing.length) {
+    lines.splice(lastAccountLine + 1, 0, ...missing)
+  }
   return lines.join('\n')
 }
 
@@ -228,30 +307,113 @@ function fixFingerprint(raw) {
   const lines = String(raw || '').split('\n')
   let inDeepseek = false
   let changed = false
+  let lastDeepseekLine = -1
+  const seen = {}
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
     const trimmed = line.trim()
     if (trimmed.startsWith('[')) {
       inDeepseek = trimmed === '[deepseek]'
+      if (inDeepseek) lastDeepseekLine = i
       continue
     }
     if (!inDeepseek) continue
-    const kv = line.match(/^\s*([a-zA-Z_]+)\s*=\s*"([^"]*)"\s*$/)
+    const kv = line.match(/^\s*([a-zA-Z_]+)\s*=\s*"?([^"]*)"?\s*$/)
     if (!kv) continue
     const key = kv[1]
     const val = kv[2]
+    seen[key] = true
+    lastDeepseekLine = i
     if (key === 'user_agent' && (val.indexOf('Chrome/151') >= 0 || val.indexOf('Edg/151') >= 0 || val.indexOf('Android/35') >= 0)) {
       lines[i] = 'user_agent = "' + NEW_USER_AGENT + '"'
       changed = true
-    } else if (key === 'client_version' && (val === '2.0.4' || val === '2.0.3')) {
-      lines[i] = 'client_version = "2.3.0"'
+    } else if (key === 'client_version' && (val === '2.0.4' || val === '2.0.3' || val === '2.3.0' || val === '2.4.0')) {
+      // new.jsonl（2026-09-12）实证线上 web 为 2.5.0（站点部署版本，与浏览器版本无关）
+      lines[i] = 'client_version = "2.5.0"'
       changed = true
     } else if (key === 'client_platform' && val === 'android') {
       lines[i] = 'client_platform = "web"'
       changed = true
+    } else if (key === 'client_locale' && val === 'zh-CN') {
+      // full.har 实证 web 端 locale 为下划线格式
+      lines[i] = 'client_locale = "zh_CN"'
+      changed = true
+    }
+  }
+  // 补齐新增的 web 请求头字段（老配置没有；缺失会退回后端默认值，但显式写入便于用户核对）
+  if (lastDeepseekLine >= 0) {
+    const additions = []
+    if (!seen.client_bundle_id) additions.push('client_bundle_id = "com.deepseek.chat"')
+    if (!seen.client_timezone_offset) additions.push('client_timezone_offset = 28800')
+    if (additions.length) {
+      lines.splice(lastDeepseekLine + 1, 0, ...additions)
+      changed = true
     }
   }
   return changed ? lines.join('\n') : null
+}
+
+// 行级修复：把 model_types 收敛为官方合并后的唯一模型。
+//
+// 2026-09-12 官方合并"快速/专家/识图"三模式：client/settings?scope=model 实证
+// expert 与 vision 都已 enabled:false，只剩 model_type="default"（自带图片理解）。
+// 老配置里存的 ["default","expert","vision"]（或 build 22 误写的 "vl"）会让应用
+// 继续注册/请求已下线的模型，识图/专家必失败。这里就地改写成 ["default"]。
+// max_input/max_output_tokens 必须与 model_types 等长（后端启动会校验），一并裁到 1 项。
+function fixModelTypes(raw) {
+  const lines = String(raw || '').split('\n')
+  let inDeepseek = false
+  let typesFixed = false
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim()
+    if (trimmed.startsWith('[')) {
+      inDeepseek = trimmed === '[deepseek]'
+      continue
+    }
+    if (!inDeepseek) continue
+    const kv = lines[i].match(/^\s*([a-zA-Z_]+)\s*=\s*\[(.*)\]\s*$/)
+    if (!kv) continue
+    const key = kv[1]
+    const items = kv[2].trim()
+    if (key === 'model_types') {
+      const next = 'model_types = ["default"]'
+      if (next !== lines[i]) {
+        lines[i] = next
+        typesFixed = true
+      }
+    } else if (key === 'max_input_tokens' || key === 'max_output_tokens') {
+      const parts = items ? items.split(',').map((s) => s.trim()).filter(Boolean) : []
+      if (parts.length > 1) {
+        lines[i] = key + ' = [' + parts[0] + ']'
+        typesFixed = true
+      }
+    } else if (key === 'model_aliases') {
+      // 别名按 index 对齐 model_types，多余项会指向已下线模型
+      const parts = items ? items.split(',').map((s) => s.trim()).filter(Boolean) : []
+      if (parts.length > 1) {
+        lines[i] = 'model_aliases = [' + parts[0] + ']'
+        typesFixed = true
+      }
+    }
+  }
+  return typesFixed ? lines.join('\n') : null
+}
+
+// runtime.log 滚动轮转：后端追加写不封顶，超过 256KB 时把旧内容尾部 800 行
+// 留存到 runtime.log.1（bug 修复：不再直接截断丢弃，封号等事故日志可回查），
+// 当前文件只保留最后 200 行。目录已在应用 data 目录下，fs 可直接 stat。
+async function truncateRuntimeLog() {
+  try {
+    const logPath = dsRuntimeLogPath()
+    const st = await statSize(logPath)
+    if (st > 256 * 1024) {
+      appLog('[log] runtime.log ' + st + ' 字节，轮转：旧内容尾部 800 行 → .1，当前保留 200 行')
+      execShell(
+        'tail -n 800 ' + shq(logPath) + ' > ' + shq(logPath + '.1') + '; ' +
+        'tail -n 200 ' + shq(logPath) + ' > ' + shq(logPath + '.t') + ' && mv -f ' + shq(logPath + '.t') + ' ' + shq(logPath)
+      )
+    }
+  } catch (e) { /* 忽略 */ }
 }
 
 /**
@@ -264,9 +426,10 @@ export async function updateDsFreeApiAccount(user, pass) {
   const cleanUser = sanitizeCred(user)
   const cleanPass = sanitizeCred(pass)
   if (!cleanUser || !cleanPass) return makeErr(10001, '账号和密码不能为空')
+  const DS_CONFIG = dsConfigPath()
   try {
     const raw = await readFile(DS_CONFIG)
-    if (raw === null) return makeErr(10201, '无法读取 ds-free-api 配置文件')
+    if (raw === null) return makeErr(10201, '无法读取 ds-free-api 配置文件（路径：' + DS_CONFIG + '）')
     const next = replaceAccount(raw, cleanUser, cleanPass)
     if (next === null) return makeErr(10203, 'config.toml 中未找到 [[accounts]] 段')
 
@@ -296,23 +459,35 @@ export async function updateDsFreeApiAccount(user, pass) {
 
     // 探活并等待账号就绪：healthCheck 只确认端口绑定，新进程登录 DeepSeek 需时间。
     // 若 health ok 但账号池为空（登录失败/未完成），对话仍会"未认证"。
-    const ok = await healthCheckWithAccount(30000)
+    //
+    // 超时从 30s 提到 75s：后端最多重试 3 次登录（每次间隔 2s）并在首次尝试时跑一次
+    // 完整 health_check completion（含 PoW），慢网设备 30s 内经常还没跑完，
+    // 于是"登录成功"被误报成"账号密码错误"（部分设备无法账密登录的另一成因）。
+    const ok = await healthCheckWithAccount(75000)
     appLog('[update] 保存账号后健康+账号 ok=' + ok + ' apiKeyLen=' + apiKey.length)
     if (ok) {
       // 返回新 key 给调用方，由设置页更新 form.apiKey（避免应用继续用旧 key 导致 401）
       return { ok: true, message: '账号已保存，DeepSeek 登录成功', apiKey }
     }
     // 配置已写入，不因探活失败回滚（避免抹掉用户刚填的账号）。
-    // 账号池空通常意味着 DeepSeek 登录失败（账号/密码错误），提示用户检查。
+    // 账号池空可能是密码错误，也可能是验证码/网络/禁言 —— 从 runtime.log 取真实原因，
+    // 不再一律甩"请检查账号密码是否正确"。
     appLog('[update] 保存账号后账号池为空，可能登录失败')
-    return makeErr(10503, '账号已保存，但 DeepSeek 登录未成功（请检查账号密码是否正确）')
+    const detail = await readLoginFailureReason()
+    return makeErr(
+      10503,
+      detail
+        ? '账号已保存，但 DeepSeek 登录未成功：' + detail
+        : '账号已保存，但 DeepSeek 登录未成功（可能是账号密码错误、需要验证码或网络不通；可在"查看日志"里看后端原因）'
+    )
   } catch (e) {
     return makeErr(10002, '更新失败：' + (e && e.message ? e.message : String(e)))
   }
 }
 
 async function restartDsFreeApi() {
-  const binPath = DS_FREE_API_DIR + '/ds-free-api'
+  const DS_FREE_API_DIR = dsHomeDir()
+  const binPath = joinPath(DS_FREE_API_DIR, 'ds-free-api')
   appLog('[restart] start binExists=' + (await exists(binPath)) + ' dirExists=' + (await exists(DS_FREE_API_DIR)))
   if (!(await exists(binPath))) {
     return makeErr(10303, 'ds-free-api 二进制不存在，请先部署后端服务')
@@ -322,7 +497,7 @@ async function restartDsFreeApi() {
   }
 
   const resultFile = joinDataDir('ds-restart-result.txt')
-  const logFile = DS_FREE_API_DIR + '/logs/runtime.log'
+  const logFile = dsRuntimeLogPath()
   const pidFile = joinDataDir('ds-pid.txt')
   await writeFile(resultFile, '')
   // 先读上次记录的 PID（若存在）逐个 kill -9，再 pkill -9 兜底，确保不会残留孤儿进程。
@@ -410,6 +585,37 @@ async function healthCheckWithAccount(timeoutMs) {
   return false
 }
 
+// 从 runtime.log 尾部提取登录失败的真实原因，供"保存账号"失败时展示。
+// 后端把具体原因写进日志（密码错误 / 人机验证 / 禁言 / 网络），但应用侧过去只显示
+// "请检查账号密码是否正确"，用户无法区分。返回一句可读原因，取不到则返回 ''。
+async function readLoginFailureReason() {
+  try {
+    const raw = String((await readFile(dsRuntimeLogPath())) || '')
+    if (!raw) return ''
+    const lines = raw.split('\n').filter((l) => l.trim())
+    // 只看尾部 120 行（本次启动的日志），从后往前找第一条匹配的原因
+    const tail = lines.slice(-120).reverse()
+    const patterns = [
+      { re: /人机验证|captcha/i, msg: '需要完成人机验证（请在设置里打开验证链接）' },
+      { re: /禁言|user_is_muted/i, msg: '该账号已被禁言，到期前请更换账号' },
+      { re: /密码错误|wrong password|invalid.*password|账号或密码/i, msg: '账号或密码错误' },
+      { re: /WAF|Challenge/i, msg: '被上游风控拦截（换网络或稍后再试）' },
+      { re: /dns|timed? ?out|超时|connect|网络/i, msg: '网络不通或连接超时' }
+    ]
+    for (const line of tail) {
+      for (const p of patterns) {
+        if (p.re.test(line)) return p.msg
+      }
+    }
+    // 没命中已知模式时，回传最后一条 ERROR/WARN 原文（截断），至少让用户能反馈
+    const err = tail.find((l) => /ERROR|WARN/i.test(l))
+    if (err) return err.replace(/\s+/g, ' ').slice(0, 160)
+    return ''
+  } catch (e) {
+    return ''
+  }
+}
+
 // ========== 后端部署（base64 内嵌二进制，运行时回写） ==========
 // 后端二进制已打包成 base64 内嵌在 backend-blob.js 中，首次运行时自动写入 /userdisk/ds-free-api
 
@@ -422,10 +628,14 @@ function supportedArch() {
   return m ? m[1] : ''
 }
 
-// 确保 ds-free-api 后端已部署到 /userdisk/ds-free-api
+// 确保 ds-free-api 后端已部署到应用 data 目录（$dataDir/ds-free-api）
 export async function deployBackend() {
-  const targetDir = '/userdisk/ds-free-api'
-  const targetBin = targetDir + '/ds-free-api'
+  const targetDir = dsHomeDir()
+  const targetBin = joinPath(targetDir, 'ds-free-api')
+  const targetLogDir = joinPath(targetDir, 'logs')
+
+  // 一次性迁移旧目录里的 config.toml（幂等，见 migrateLegacyDir 注释）
+  await migrateLegacyDir()
 
   // 优化：目标二进制已存在且非空时，跳过 6MB base64 写盘 + 解码 + 比较（同一安装内
   // 每次启动都做这些很慢）。只需 chmod +x 保执行位，直接视为 unchanged。
@@ -437,7 +647,7 @@ export async function deployBackend() {
       appLog('[deploy] 已存在且非空（size=' + st + '），跳过解码比较')
       const resultFile = joinDataDir('ds-deploy-result.txt')
       await writeFile(resultFile, '')
-      execShell('mkdir -p ' + shq(targetDir + '/logs') + '; chmod +x ' + shq(targetBin) + '; printf unchanged > ' + shq(resultFile))
+      execShell('mkdir -p ' + shq(targetLogDir) + '; chmod +x ' + shq(targetBin) + '; printf unchanged > ' + shq(resultFile))
       const result = String(await waitForFile(resultFile, 5000) || '').trim()
       execShell('rm -f ' + shq(resultFile) + ' 2>/dev/null || true')
       if (result === 'unchanged') {
@@ -453,7 +663,7 @@ export async function deployBackend() {
   // 仅增强：无论 cmp 结果如何都强制 chmod +x，避免权限丢失不自愈。
   const tmpB64 = joinDataDir('ds-free-api.b64')
   const tmpBin = joinDataDir('ds-free-api.tmp')
-  const stagedBin = targetDir + '/ds-free-api.new'
+  const stagedBin = joinPath(targetDir, 'ds-free-api.new')
   const resultFile = joinDataDir('ds-deploy-result.txt')
   appLog('[deploy] 全量部署 start dataDir=' + String($dataDir) + ' target=' + targetDir)
   try {
@@ -464,7 +674,7 @@ export async function deployBackend() {
     }
     await writeFile(resultFile, '')
     const command =
-      'mkdir -p ' + shq(targetDir) + ' ' + shq(targetDir + '/logs') + ' && ' +
+      'mkdir -p ' + shq(targetDir) + ' ' + shq(targetLogDir) + ' && ' +
       'base64 -d ' + shq(tmpB64) + ' > ' + shq(tmpBin) + ' && ' +
       'if [ -f ' + shq(targetBin) + ' ] && cmp -s ' + shq(tmpBin) + ' ' + shq(targetBin) + '; then ' +
       'chmod +x ' + shq(targetBin) + '; printf unchanged > ' + shq(resultFile) + '; else ' +
@@ -495,16 +705,28 @@ export async function deployBackend() {
   }
 
   // 仅首次部署写入最小 config.toml，保留用户已有配置。
-  // 存量配置指纹修复：旧版 config.toml 写的是 Chrome/151 + Edg/151（与 TLS Chrome136 指纹不匹配，
-  // 禁言根因之一）。行级替换 [deepseek] 段的 UA/version/platform 为新指纹，保留用户其余配置。
-  if (await exists(targetDir + '/config.toml')) {
-    const legacy = String(await readFile(DS_CONFIG) || '')
-    if (legacy && (legacy.indexOf('Chrome/151') >= 0 || legacy.indexOf('Edg/151') >= 0 || legacy.indexOf('Android/35') >= 0 || legacy.indexOf('2.0.4') >= 0)) {
-      const fixed = fixFingerprint(legacy)
-      if (fixed && fixed !== legacy) {
-        const ok = await writeFile(DS_CONFIG, fixed)
-        if (ok) debugLog('DS | 已修复 config.toml 旧版指纹（UA/version/platform 对齐 Chrome136）')
-      }
+  // 存量配置修复（均行级替换，保留用户其余配置）：
+  // 1) 指纹修复：旧版 Chrome/151 + Edg/151（与 TLS Chrome136 不匹配）、client_version 落后，
+  //    并补齐新增的 client_bundle_id / client_timezone_offset；
+  // 2) 模型修复：官方已合并模型，把 model_types 收敛为 ["default"]，
+  //    否则应用继续请求已下线的 expert/vision。
+  const DS_CONFIG = dsConfigPath()
+  if (await exists(DS_CONFIG)) {
+    let raw = String(await readFile(DS_CONFIG) || '')
+    // 指纹修复无条件跑：除了替换旧值，还要补齐新增字段（旧的 indexOf 判断会漏掉这类配置）
+    const fixed = fixFingerprint(raw)
+    if (fixed && fixed !== raw) {
+      raw = fixed
+      debugLog('DS | 已修复 config.toml 指纹字段（UA/version/platform/bundle_id/timezone）')
+    }
+    const fixedTypes = fixModelTypes(raw)
+    if (fixedTypes && fixedTypes !== raw) {
+      raw = fixedTypes
+      debugLog('DS | 已把 config.toml model_types 收敛为合并后的 ["default"]')
+    }
+    if (raw !== String(await readFile(DS_CONFIG) || '')) {
+      await writeFile(DS_CONFIG, raw)
+      appLog('[deploy] config.toml 已自动修复')
     }
     return {
       ok: true,
@@ -513,7 +735,9 @@ export async function deployBackend() {
     }
   }
 
-  // 写入最小 config.toml（供后续 updateDsFreeApiAccount 改写 [[accounts]]）
+  // 写入最小 config.toml（供后续 updateDsFreeApiAccount 改写 [[accounts]]）。
+  // model_types 只有 "default"：官方 2026-09-12 合并了快速/专家/识图，
+  // expert 与 vision 已 enabled:false，default 自带图片理解（file_feature.vision=true）。
   const minConfig = [
     '[server]',
     'port = 22217',
@@ -523,12 +747,15 @@ export async function deployBackend() {
     'api_base = "https://chat.deepseek.com/api/v0"',
     'wasm_url = "https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm"',
     'user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"',
-    'client_version = "2.3.0"',
+    'client_version = "2.5.0"',
     'client_platform = "web"',
-    'client_locale = "zh-CN"',
-    'model_types = ["default", "expert"]',
-    'max_input_tokens = [4096, 4096]',
-    'max_output_tokens = [8192, 8192]',
+    'client_locale = "zh_CN"',
+    'client_bundle_id = "com.deepseek.chat"',
+    'client_timezone_offset = 28800',
+    'model_types = ["default"]',
+    // 实测 input_character_limit = 2621440；旧模板写 4096 会把长上下文提前截断
+    'max_input_tokens = [1048576]',
+    'max_output_tokens = [384000]',
     '',
     '[[accounts]]',
     'email = ""',
@@ -557,10 +784,11 @@ async function doEnsureBackend() {
   appLog('[ensure] start')
   const deployResult = await deployBackend()
   appLog('[ensure] deploy ok=' + deployResult.ok + ' msg=' + (deployResult.message || '') + ' code=' + (deployResult.code || ''))
+  truncateRuntimeLog()
   // 部署失败不再直接阻断：若设备上已有旧二进制，仍尝试启动它，避免"后端完全不拉起"。
   // 部署错误信息保留，供启动页展示定位。
   if (!deployResult.ok) {
-    const binExists = await exists(DS_FREE_API_DIR + '/ds-free-api')
+    const binExists = await exists(joinPath(dsHomeDir(), 'ds-free-api'))
     if (!binExists) {
       appLog('[ensure] deploy FAIL 且无旧二进制，放弃')
       return deployResult
@@ -594,7 +822,7 @@ async function doEnsureBackend() {
       }
     }
     // 附带 runtime.log 尾部，便于定位"拉起后很快挂"的根因（如架构/权限/缺库）
-    const logTail = String(await readFile(DS_FREE_API_DIR + '/logs/runtime.log') || '')
+    const logTail = String(await readFile(dsRuntimeLogPath()) || '')
       .split('\n').filter(Boolean).slice(-5).join('；')
     appLog('[ensure] TIMEOUT logTail=' + (logTail || '(空)'))
     return makeErr(10502, 'ds-free-api 启动超时（' + (logTail || '无日志输出') + '）')

@@ -35,6 +35,7 @@
 <script>
 import { checkBackendHealth } from '../../services/backend-health.js'
 import { ensureBackendRunning } from '../../services/native.js'
+import { loadSettings } from '../../services/store.js'
 
 export default {
     name: 'startup',
@@ -78,6 +79,26 @@ export default {
             this.status = 'checking'
             this.statusDetail = '正在更新并启动后端服务...'
             this.startTime = Date.now()
+
+            // #7：进入主页前把主题缓存到 $falcon.__dsTheme，index/settings 页
+            // 首帧同步读取，消除"进软件闪一下浅色界面"。
+            let settings = null
+            try {
+                settings = await loadSettings()
+                $falcon.__dsTheme = (settings && settings.theme) || 'light'
+            } catch (e) { /* 忽略，主页会自行兜底 */ }
+
+            // 自定义端点模式不需要本机后端：跳过部署/拉起，直接进主页。
+            // 旧逻辑无条件部署，外部端点用户既要等 6MB 解码写盘，还会因本机后端
+            // 起不来被卡在启动页（"自定义 api 端点模式无法正常使用"的表现之一）。
+            if (settings && settings.authMode && settings.authMode !== 'builtin') {
+                this.status = 'ready'
+                this.statusDetail = '已使用自定义服务地址'
+                setTimeout(() => {
+                    this.$app.router.replace({ uri: '/index' })
+                }, 300)
+                return
+            }
 
             // ensureBackendRunning 内部已完成 deploy + healthCheck 确认，
             // 成功后直接跳转，不再额外轮询（省 2 秒间隔的重复检查）。

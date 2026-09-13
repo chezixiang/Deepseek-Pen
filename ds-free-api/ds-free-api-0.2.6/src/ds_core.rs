@@ -6,10 +6,15 @@ mod accounts;
 mod client;
 mod completions;
 mod pow;
+mod fingerprint;
 
 pub use accounts::AccountStatus;
 pub use accounts::PoolError;
-pub use completions::{ChatRequest, ChatResponse, FilePayload};
+pub use fingerprint::{DeviceFingerprint, submit_fingerprint};
+pub use client::{CloudMessage, CloudSession};
+pub use completions::{
+    CachedConversation, ChatRequest, ChatResponse, ConversationPlan, FilePayload, ReuseTarget,
+};
 
 use crate::config::Config;
 use accounts::AccountPool;
@@ -59,6 +64,8 @@ impl DeepSeekCore {
             config.deepseek.client_version.clone(),
             config.deepseek.client_platform.clone(),
             config.deepseek.client_locale.clone(),
+            config.deepseek.client_bundle_id.clone(),
+            config.deepseek.client_timezone_offset,
             config.proxy.url.as_deref(),
         );
 
@@ -132,5 +139,28 @@ impl DeepSeekCore {
     /// 获取账号池状态信息
     pub async fn get_account_pool_status(&self) -> crate::openai_adapter::AccountPoolStatus {
         self.completions.get_pool_status().await
+    }
+
+    /// 拉取云端会话列表（#10 同步已有对话）
+    pub async fn list_cloud_sessions(&self) -> Result<Vec<CloudSession>, CoreError> {
+        self.completions.list_cloud_sessions().await
+    }
+
+    /// 拉取云端会话的消息内容（#10 完整同步）
+    pub async fn list_cloud_session_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::ds_core::client::CloudMessage>, CoreError> {
+        self.completions.list_cloud_session_messages(session_id).await
+    }
+
+    /// 查询会话复用缓存（持久 DeepSeek 会话；None = 冷启动）
+    pub fn lookup_conversation(&self, key: &str) -> Option<CachedConversation> {
+        self.completions.lookup_conversation(key)
+    }
+
+    /// 移除失效的会话缓存条目
+    pub fn remove_conversation(&self, key: &str) {
+        self.completions.remove_conversation(key)
     }
 }

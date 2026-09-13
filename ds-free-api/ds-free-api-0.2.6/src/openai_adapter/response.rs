@@ -277,6 +277,7 @@ impl Stream for RepairStream {
                                 usage: None,
                                 service_tier: None,
                                 system_fingerprint: None,
+                                ds_title: None,
                             })));
                         }
                         return Poll::Pending;
@@ -320,7 +321,10 @@ where
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
                 Poll::Ready(Some(Ok(mut chunk))) => {
                     if *this.stopped {
-                        if chunk.choices.is_empty() && chunk.usage.is_some() {
+                        // usage 尾随 chunk 与 ds_title 尾随 chunk（空 choices）继续放行
+                        if chunk.choices.is_empty()
+                            && (chunk.usage.is_some() || chunk.ds_title.is_some())
+                        {
                             return Poll::Ready(Some(Ok(chunk)));
                         }
                         // 允许 finish_reason 从 stop 升级为 tool_calls
@@ -461,6 +465,7 @@ where
     let mut reasoning = String::new();
     let mut tool_calls: Option<Vec<ToolCall>> = None;
     let mut usage = None;
+    let mut ds_title: Option<String> = None;
     let mut finish_reason: Option<&'static str> = None;
 
     while let Some(res) = chunk_stream.next().await {
@@ -469,6 +474,10 @@ where
         if id.is_empty() {
             id = chunk.id;
             created = chunk.created;
+        }
+
+        if let Some(t) = chunk.ds_title {
+            ds_title = Some(t);
         }
 
         if let Some(u) = chunk.usage {
@@ -545,14 +554,16 @@ where
         usage,
         service_tier: None,
         system_fingerprint: None,
+        ds_title,
     };
 
     debug!(
         target: "adapter",
-        "非流式响应聚合完成: finish_reason={:?}, has_tool_calls={}, usage={:?}",
+        "非流式响应聚合完成: finish_reason={:?}, has_tool_calls={}, usage={:?}, ds_title={:?}",
         completion.choices[0].finish_reason,
         completion.choices[0].message.tool_calls.is_some(),
-        completion.usage
+        completion.usage,
+        completion.ds_title
     );
     Ok(completion)
 }
@@ -640,6 +651,65 @@ mod tests {
         frames.push(sse_bytes("event: finish\ndata: {}\n\n"));
 
         frames
+    }
+
+    #[tokio::test]
+    async fn stream_ds_title_trailing_chunk() {
+        // 会话首条消息时 DeepSeek 在 finish 之后发 event: title，
+        // 应以空 choices 的尾随 chunk 透传 ds_title
+        let fixture = "event: ready\ndata: {}\n\n\
+            data: {\"v\":{\"response\":{\"fragments\":[{\"type\":\"RESPONSE\",\"content\":\"\"}]}}}\n\n\
+            data: {\"p\":\"response/fragments/-1/content\",\"o\":\"APPEND\",\"v\":\"hello\"}\n\n\
+            data: {\"p\":\"response/status\",\"v\":\"FINISHED\"}\n\n\
+            event: finish\ndata: {}\n\n\
+            event: title\ndata: {\"content\":\"测试标题\"}\n\n";
+        let bytes_stream = futures::stream::iter(vec![sse_bytes(fixture)]);
+        let chunks = collect_chunks(to_bytes_stream(super::stream(
+            bytes_stream,
+            "m".into(),
+            super::StreamCfg {
+                include_usage: false,
+                include_obfuscation: false,
+                stop: vec![],
+                prompt_tokens: 0,
+                repair_fn: None,
+                tag_config: default_tag_config(),
+            },
+        )))
+        .await;
+        let title_chunk = chunks.iter().find(|c| c["ds_title"].is_string());
+        assert!(
+            title_chunk.is_some(),
+            "应有 ds_title 尾随 chunk, chunks={}",
+            serde_json::to_string(&chunks).unwrap()
+        );
+        assert_eq!(title_chunk.unwrap()["ds_title"], "测试标题");
+    }
+
+    #[tokio::test]
+    async fn aggregate_ds_title() {
+        let fixture = "event: ready\ndata: {}\n\n\
+            data: {\"v\":{\"response\":{\"fragments\":[{\"type\":\"RESPONSE\",\"content\":\"hi\"}]}}}\n\n\
+            data: {\"p\":\"response/status\",\"v\":\"FINISHED\"}\n\n\
+            event: finish\ndata: {}\n\n\
+            event: title\ndata: {\"content\":\"会话名\"}\n\n";
+        let stream = futures::stream::iter(vec![sse_bytes(fixture)]);
+        let resp = aggregate(
+            stream,
+            "deepseek-default".into(),
+            super::StreamCfg {
+                include_usage: false,
+                include_obfuscation: false,
+                stop: vec![],
+                prompt_tokens: 0,
+                repair_fn: None,
+                tag_config: default_tag_config(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.ds_title.as_deref(), Some("会话名"));
+        assert_eq!(resp.choices[0].message.content.as_deref(), Some("hi"));
     }
 
     #[tokio::test]

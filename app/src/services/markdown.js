@@ -3,14 +3,15 @@
 
 // 解析块级 Markdown
 export function markdownToBlocks(text) {
-  // 兜底：清洗可能残留的内部协议标签，防止标签从 Markdown 渲染层泄漏
-  text = String(text || '').replace(/<\|tool_calls_begin\|>/gi, ' ')
-  text = text.replace(/<\|tool_calls_end\|>/gi, ' ')
-  text = text.replace(/<invoke>/gi, ' ')
-  text = text.replace(/<\/invoke>/gi, ' ')
-  text = text.replace(/<parameter>/gi, ' ')
-  text = text.replace(/<\/parameter>/gi, ' ')
-  text = text.replace(/\s{2,}/g, ' ')
+  // 兜底：清洗可能残留的内部协议标签，防止标签从 Markdown 渲染层泄漏。
+  // 只折叠水平空白（[ \t]），保留换行——旧版 /\s{2,}/g 会吞掉空行导致段落黏连（#14）。
+  text = String(text || '').replace(/<\|tool_calls_begin\|>/gi, '')
+  text = text.replace(/<\|tool_calls_end\|>/gi, '')
+  text = text.replace(/<invoke>/gi, '')
+  text = text.replace(/<\/invoke>/gi, '')
+  text = text.replace(/<parameter>/gi, '')
+  text = text.replace(/<\/parameter>/gi, '')
+  text = text.replace(/[ \t]{2,}/g, ' ')
 
   const lines = String(text || '').replace(/\r\n/g, '\n').split('\n')
   const blocks = []
@@ -127,4 +128,60 @@ export function inlineSpans(text) {
     spans.push({ text: src })
   }
   return spans
+}
+
+// ---------- Emoji 区段拆分（配合可选下载的 NotoColorEmoji 字体） ----------
+// 设备缺 emoji 字形时显示白块；把 emoji 字符拆成独立 run 并指定 emoji 字体渲染。
+const EMOJI_RANGES = [
+  [0x2190, 0x21FF], // 箭头
+  [0x2300, 0x23FF], // 杂项技术
+  [0x25A0, 0x27BF], // 几何图形/杂项符号/印刷符号
+  [0x2900, 0x297F], // 补充箭头
+  [0x2B00, 0x2BFF], // 杂项符号和箭头
+  [0x1F000, 0x1FAFF], // emoji 主区
+  [0xFE00, 0xFE0F], // 变体选择符
+  [0x200D, 0x200D] // 零宽连接符
+]
+
+function isEmojiCp(cp) {
+  for (let i = 0; i < EMOJI_RANGES.length; i++) {
+    if (cp >= EMOJI_RANGES[i][0] && cp <= EMOJI_RANGES[i][1]) return true
+  }
+  return false
+}
+
+/**
+ * 把文本切成 [{ t: '片段', e: 是否emoji }]，供模板对 emoji 片段套用字体。
+ * ZWJ/变体选择符在前一个字符是 emoji 时并入 emoji 段。
+ */
+export function splitEmojiRuns(text) {
+  const src = String(text || '')
+  if (!src) return [{ t: '', e: false }]
+  const runs = []
+  let buf = ''
+  let bufEmoji = false
+  let i = 0
+  while (i < src.length) {
+    const code = src.charCodeAt(i)
+    let cp = code
+    let advance = 1
+    if (code >= 0xD800 && code <= 0xDBFF && i + 1 < src.length) {
+      const lo = src.charCodeAt(i + 1)
+      if (lo >= 0xDC00 && lo <= 0xDFFF) {
+        cp = (code - 0xD800) * 0x400 + (lo - 0xDC00) + 0x10000
+        advance = 2
+      }
+    }
+    const emoji = isEmojiCp(cp) || ((cp === 0x200D || cp === 0xFE0F) && bufEmoji)
+    if (emoji === bufEmoji) {
+      buf += src.substr(i, advance)
+    } else {
+      if (buf) runs.push({ t: buf, e: bufEmoji })
+      buf = src.substr(i, advance)
+      bufEmoji = emoji
+    }
+    i += advance
+  }
+  if (buf) runs.push({ t: buf, e: bufEmoji })
+  return runs
 }

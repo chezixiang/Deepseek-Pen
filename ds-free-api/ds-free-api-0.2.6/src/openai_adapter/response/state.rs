@@ -28,6 +28,13 @@ pub enum DsFrame {
     Status(String),
     /// accumulated_token_usage 数值
     Usage(u32),
+    /// event: title —— DeepSeek 自动生成的会话标题。
+    ///
+    /// new.jsonl（2026-09-12）实证：下发条件是**会话的第一条消息**
+    /// （ready 事件的 request_message_id == 1），与 thinking/search 无关
+    /// （thinking+search 全开的首轮同样有 title）；后续轮次不再下发。
+    /// 旧注释"仅 thinking=OFF 且 search=OFF"是早期抓包的误判。
+    Title(String),
     /// event: finish 或最终状态
     Finish,
 }
@@ -55,6 +62,15 @@ impl DsState {
         match evt.event.as_deref() {
             Some("ready") => frames.push(DsFrame::Role),
             Some("finish") => frames.push(DsFrame::Finish),
+            Some("title") => {
+                // data: {"content":"..."} —— 自动生成的会话标题
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&evt.data)
+                    && let Some(t) = val.get("content").and_then(|c| c.as_str())
+                    && !t.is_empty()
+                {
+                    frames.push(DsFrame::Title(t.to_string()));
+                }
+            }
             _ => {}
         }
 
@@ -360,6 +376,23 @@ mod tests {
             })[0],
             DsFrame::Finish
         ));
+    }
+
+    #[test]
+    fn title_event_parsed() {
+        let mut state = DsState::default();
+        let frames = state.apply_event(&SseEvent {
+            event: Some("title".into()),
+            data: r#"{"content":"Greeting Assistance"}"#.into(),
+        });
+        assert!(matches!(&frames[0], DsFrame::Title(t) if t == "Greeting Assistance"));
+        // 无 content / 空 content 不产生帧
+        assert!(state
+            .apply_event(&SseEvent {
+                event: Some("title".into()),
+                data: "{}".into(),
+            })
+            .is_empty());
     }
 
     #[test]

@@ -55,6 +55,38 @@ pub(crate) fn extract(req: &ChatCompletionsRequest) -> ExtractResult {
     }
 }
 
+/// 仅从最后一条消息提取文件（会话复用路径）：
+/// 历史消息的图片已在持久会话中，重复上传会造成冗余与文件泄漏
+pub(crate) fn extract_last_message(req: &ChatCompletionsRequest) -> ExtractResult {
+    let mut files = Vec::new();
+    let mut has_http_urls = false;
+    if let Some(msg) = req.messages.last() {
+        if let Some(MessageContent::Parts(parts)) = &msg.content {
+            for part in parts {
+                match part.ty.as_str() {
+                    "file" => {
+                        if let Some(file) = extract_file(part) {
+                            files.push(file);
+                        }
+                    }
+                    "image_url" => {
+                        if let Some(file) = extract_image(part) {
+                            files.push(file);
+                        } else if is_http_url(part) {
+                            has_http_urls = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    ExtractResult {
+        files,
+        has_http_urls,
+    }
+}
+
 fn is_http_url(part: &ContentPart) -> bool {
     part.image_url
         .as_ref()

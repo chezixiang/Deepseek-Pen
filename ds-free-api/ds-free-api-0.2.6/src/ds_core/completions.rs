@@ -15,7 +15,8 @@ use pin_project_lite::pin_project;
 
 use crate::ds_core::CoreError;
 use crate::ds_core::accounts::{AccountGuard, AccountPool};
-use crate::ds_core::client::{CompletionPayload, DsClient, StopStreamPayload};
+use crate::ds_core::accounts::format_mute_time;
+use crate::ds_core::client::{CompletionPayload, DsClient, EditMessagePayload, StopStreamPayload};
 use crate::ds_core::pow::PowSolver;
 
 pub(crate) struct ActiveSession {
@@ -88,6 +89,34 @@ pub struct FilePayload {
     pub content_type: String,
 }
 
+/// 会话复用：续聊目标（Web 端对话形态——持久会话，历史由服务端持有）
+#[derive(Debug, Clone)]
+pub struct ReuseTarget {
+    /// 必须用创建该会话的同一账号（会话是账号作用域的）
+    pub account_id: String,
+    pub session_id: String,
+    /// 最近一次请求消息 id（edit_message 重答锚点）
+    pub last_request_msg_id: i64,
+    /// 最近一次响应消息 id（Append 的 parent_message_id 锚点）
+    pub last_response_msg_id: i64,
+}
+
+/// 会话复用计划（adapter 依据消息上下文计算，v0_chat 据此选择路径）
+#[derive(Debug, Clone)]
+pub struct ConversationPlan {
+    /// 本轮查找键（上下文哈希）；复用失败时清理
+    pub cache_key: String,
+    /// 下一轮的预期查找键（上下文+本轮 user）；请求成功后与新会话信息一起写入，
+    /// 下一轮请求即可命中复用（两个键指向同一缓存条目）
+    pub next_key: String,
+    /// 本轮用户消息纯文本（缓存 last_user_text，用于区分"新轮次"与"编辑重答"）
+    pub user_text: String,
+    /// None = 冷启动新建会话并缓存；Some = 复用现有持久会话
+    pub reuse: Option<ReuseTarget>,
+    /// true = 编辑重答（edit_message，服务端截断旧分支）；false = 追加新轮次
+    pub regenerate: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
     pub prompt: String,
@@ -95,6 +124,8 @@ pub struct ChatRequest {
     pub search_enabled: bool,
     pub model_type: String,
     pub files: Vec<FilePayload>,
+    /// 会话复用计划；None = 传统临时会话（上传历史文件）行为
+    pub conversation: Option<ConversationPlan>,
 }
 
 /// v0_chat 返回值：SSE 字节流 + 账号标识
@@ -113,6 +144,9 @@ pin_project! {
         session_id: String,
         message_id: i64,
         finished: bool,
+        // true = 持久会话（会话复用）：结束时只 stop_stream，不 delete_session，
+        // 会话由 ConversationCache 负责生命周期（淘汰时才删）
+        persistent: bool,
         sessions: Arc<Mutex<HashMap<String, ActiveSession>>>,
     }
 
@@ -124,6 +158,7 @@ pin_project! {
             let session_id = this.session_id.clone();
             let message_id = *this.message_id;
             let finished = *this.finished;
+            let persistent = *this.persistent;
             let sessions = this.sessions.clone();
 
             // 从活跃 session 追踪中移除
@@ -140,9 +175,11 @@ pin_project! {
                         log::warn!(target: "ds_core::accounts", "stop_stream 失败: {}", e);
                     }
                 }
-                // 无论流是否完成，都清理临时 session
-                if let Err(e) = client.delete_session(&token, &session_id).await {
-                    log::warn!(target: "ds_core::accounts", "delete_session 失败: {}", e);
+                // 临时会话：无论流是否完成都清理；持久会话保留（服务端持有历史）
+                if !persistent {
+                    if let Err(e) = client.delete_session(&token, &session_id).await {
+                        log::warn!(target: "ds_core::accounts", "delete_session 失败: {}", e);
+                    }
                 }
             });
         }
@@ -157,6 +194,7 @@ impl<S> GuardedStream<S> {
         token: String,
         session_id: String,
         message_id: i64,
+        persistent: bool,
         sessions: Arc<Mutex<HashMap<String, ActiveSession>>>,
     ) -> Self {
         Self {
@@ -167,6 +205,7 @@ impl<S> GuardedStream<S> {
             session_id,
             message_id,
             finished: false,
+            persistent,
             sessions,
         }
     }
@@ -202,7 +241,27 @@ pub struct Completions {
     solver: RwLock<PowSolver>,
     pool: Arc<AccountPool>,
     active_sessions: Arc<Mutex<HashMap<String, ActiveSession>>>,
+    /// 会话复用缓存：context_hash → 持久 DeepSeek 会话（LRU + TTL）
+    conversations: Arc<Mutex<HashMap<String, CachedConversation>>>,
 }
+
+/// 会话复用缓存条目
+#[derive(Debug, Clone)]
+pub struct CachedConversation {
+    pub account_id: String,
+    pub session_id: String,
+    /// 最近一次请求消息 id（edit_message 锚点）
+    pub last_request_msg_id: i64,
+    /// 最近一次响应消息 id（Append 的 parent 锚点）
+    pub last_response_msg_id: i64,
+    /// 最近一次用户消息文本（区分新轮次 vs 编辑重答）
+    pub last_user_text: String,
+    pub model_type: String,
+    pub last_used_ms: u64,
+}
+
+const CONVO_CACHE_CAP: usize = 128;
+const CONVO_TTL_MS: u64 = 6 * 60 * 60 * 1000;
 
 impl Completions {
     pub async fn new(client: DsClient, solver: PowSolver, pool: AccountPool) -> Self {
@@ -216,7 +275,76 @@ impl Completions {
             solver: RwLock::new(solver),
             pool,
             active_sessions: Arc::new(Mutex::new(HashMap::new())),
+            conversations: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    // ---------- 会话复用缓存 ----------
+
+    pub(crate) fn lookup_conversation(&self, key: &str) -> Option<CachedConversation> {
+        let mut map = self.conversations.lock().unwrap();
+        let entry = map.get(key)?.clone();
+        let now_ms = now_ms_u64();
+        if now_ms.saturating_sub(entry.last_used_ms) > CONVO_TTL_MS {
+            map.remove(key);
+            self.spawn_delete_session(&entry.account_id, &entry.session_id);
+            return None;
+        }
+        Some(entry)
+    }
+
+    /// 同一会话写入多个键（查找键 + 下一轮预期键），LRU 淘汰按条目数计
+    pub(crate) fn insert_conversation_multi(
+        &self,
+        keys: Vec<String>,
+        entry: CachedConversation,
+    ) {
+        let mut map = self.conversations.lock().unwrap();
+        let fresh: Vec<String> = keys
+            .into_iter()
+            .filter(|k| !map.contains_key(k))
+            .collect();
+        if map.len() + fresh.len() > CONVO_CACHE_CAP {
+            // LRU：淘汰 last_used_ms 最小的条目（异步删服务端会话，尽力而为）
+            let mut by_age: Vec<(String, u64)> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), v.last_used_ms))
+                .collect();
+            by_age.sort_by_key(|(_, ms)| *ms);
+            let overflow = map.len() + fresh.len() - CONVO_CACHE_CAP;
+            let victim_keys: Vec<String> =
+                by_age.into_iter().take(overflow).map(|(k, _)| k).collect();
+            for victim_key in victim_keys {
+                if let Some(victim) = map.remove(&victim_key) {
+                    self.spawn_delete_session(&victim.account_id, &victim.session_id);
+                }
+            }
+        }
+        for k in fresh {
+            map.insert(k, entry.clone());
+        }
+    }
+
+    pub(crate) fn remove_conversation(&self, key: &str) {
+        self.conversations.lock().unwrap().remove(key);
+    }
+
+    /// 尽力而为地删除持久会话（淘汰/失效时）；账号可能已被移除或忙，失败静默
+    fn spawn_delete_session(&self, account_id: &str, session_id: &str) {
+        let token = self.pool.token_of(account_id);
+        // tokio RwLock 不可 Clone，先 try_read 取出 DsClient 克隆（拿不到就放弃）
+        let client = self.client.try_read().ok().map(|c| c.clone());
+        let session_id = session_id.to_string();
+        tokio::spawn(async move {
+            if let (Some(token), Some(client)) = (token, client) {
+                if let Err(e) = client.delete_session(&token, &session_id).await {
+                    log::debug!(
+                        target: "ds_core::accounts",
+                        "淘汰持久会话 {} 失败（忽略）: {}", session_id, e
+                    );
+                }
+            }
+        });
     }
 
     pub async fn v0_chat(
@@ -224,9 +352,44 @@ impl Completions {
         req: ChatRequest,
         request_id: &str,
     ) -> Result<ChatResponse, CoreError> {
+        // 会话复用优先：命中缓存则续聊/重答（历史由服务端持有，不再上传历史文件）
+        if let Some(plan) = &req.conversation {
+            if let Some(target) = &plan.reuse {
+                match self.v0_chat_reuse(&req, plan, target, request_id).await {
+                    Ok(resp) => return Ok(resp),
+                    Err(CoreError::NoAccounts) => return Err(CoreError::NoAccounts),
+                    Err(e) => {
+                        log::warn!(
+                            target: "ds_core::accounts",
+                            "req={} 会话复用失败，降级冷启动（历史文件路径）: {}", request_id, e
+                        );
+                        // 限流类错误保留缓存条目（会话仍有效）；其它错误视为会话失效
+                        if !matches!(e, CoreError::Overloaded) {
+                            self.remove_conversation(&plan.cache_key);
+                            self.remove_conversation(&plan.next_key);
+                        }
+                        // 清除 reuse 后走冷启动；缓存计划保留以便新会话回写
+                        let mut cold = req;
+                        if let Some(c) = cold.conversation.as_mut() {
+                            c.reuse = None;
+                        }
+                        return self.v0_chat_cold(cold, request_id).await;
+                    }
+                }
+            }
+        }
+        self.v0_chat_cold(req, request_id).await
+    }
+
+    /// 冷启动路径（原有行为）：新建临时/持久会话，历史上传为文件，完成后按需回写缓存
+    async fn v0_chat_cold(
+        &self,
+        req: ChatRequest,
+        request_id: &str,
+    ) -> Result<ChatResponse, CoreError> {
         const MAX_ATTEMPTS: usize = 3;
 
-        // 2. 拆分历史（支持 ChatML 和非 ChatML 格式）—— 与账号无关，只需做一次
+        // 拆分历史（支持 ChatML 和非 ChatML 格式）—— 与账号无关，只需做一次
         let (inline_prompt, history_content) = split_history_prompt(&req.prompt);
 
         if !history_content.is_empty() {
@@ -254,17 +417,12 @@ impl Completions {
                     return Err(CoreError::NoAccounts);
                 }
                 Err(CoreError::Overloaded) => {
-                    // Overloaded 来自：1) 号池无空闲账号（不可重试）2) 账号 rate_limit（已标记 Error，可换号重试）
-                    // 如果是号池空导致的 Overloaded，第二次也拿不到账号，直接返回
-                    // 如果是 rate_limit 导致的，账号已被标记 Error，下次会换号
                     if attempt + 1 >= MAX_ATTEMPTS {
                         return Err(CoreError::Overloaded);
                     }
-                    // 短暂延迟后重试（如果是号池空，重试也会快速失败）
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 }
                 Err(e) => {
-                    // 其他错误：ProviderError/Stream 等，账号已被标记 Error，换号重试
                     log::warn!(
                         target: "ds_core::accounts",
                         "req={} 请求失败 (attempt {}/{}): {}",
@@ -278,6 +436,214 @@ impl Completions {
             }
         }
         Err(CoreError::Overloaded)
+    }
+
+    /// 会话复用路径：同一账号的持久会话上续聊（Append）或编辑重答（Regenerate）
+    async fn v0_chat_reuse(
+        &self,
+        req: &ChatRequest,
+        plan: &ConversationPlan,
+        target: &ReuseTarget,
+        request_id: &str,
+    ) -> Result<ChatResponse, CoreError> {
+        // 1. 取创建会话的同一账号；忙则短等（应用侧发送是串行的，忙多为抖动）
+        let guard = {
+            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(5000);
+            loop {
+                if let Some(g) = self.pool.get_account_by_id(&target.account_id) {
+                    break g;
+                }
+                if self.pool.is_empty() {
+                    return Err(CoreError::NoAccounts);
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(CoreError::Overloaded);
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            }
+        };
+        let account = guard.account();
+        let account_id = account.display_id().to_string();
+        let token = account.token().to_string();
+
+        let client = self.client.read().await.clone();
+        log::debug!(
+            target: "ds_core::accounts",
+            "req={} 会话复用: session={}, account={}, regenerate={}",
+            request_id, target.session_id, account_id, plan.regenerate
+        );
+
+        // 2. 本轮新文件先上传到同一会话（编辑重答走 edit_message，不支持带文件）
+        let mut ref_file_ids: Vec<String> = Vec::new();
+        for file in &req.files {
+            let fid = self
+                .upload_and_poll(
+                    &token,
+                    &file.filename,
+                    &file.content_type,
+                    &file.content,
+                    request_id,
+                    &req.model_type,
+                    req.thinking_enabled,
+                )
+                .await?;
+            ref_file_ids.push(fid);
+        }
+
+        // 3. PoW + 发起请求（Append 用 completion，Regenerate 用 edit_message）
+        let pow_target = if plan.regenerate {
+            "/api/v0/chat/edit_message"
+        } else {
+            "/api/v0/chat/completion"
+        };
+        let pow_header = self.compute_pow_for_target(&token, pow_target).await?;
+
+        let mut raw_stream = if plan.regenerate {
+            let payload = EditMessagePayload {
+                chat_session_id: target.session_id.clone(),
+                message_id: target.last_request_msg_id,
+                prompt: req.prompt.clone(),
+                search_enabled: req.search_enabled,
+                thinking_enabled: req.thinking_enabled,
+                model_type: None,
+            };
+            client
+                .edit_message(&token, &pow_header, &payload)
+                .await
+                .map_err(|e| {
+                    self.pool.mark_error(&account_id);
+                    CoreError::from(e)
+                })?
+        } else {
+            let payload = CompletionPayload {
+                chat_session_id: target.session_id.clone(),
+                parent_message_id: Some(target.last_response_msg_id),
+                model_type: req.model_type.clone(),
+                prompt: req.prompt.clone(),
+                ref_file_ids,
+                thinking_enabled: req.thinking_enabled,
+                search_enabled: req.search_enabled,
+                preempt: false,
+            };
+            client
+                .completion(&token, &pow_header, &payload)
+                .await
+                .map_err(|e| {
+                    self.pool.mark_error(&account_id);
+                    CoreError::from(e)
+                })?
+        };
+
+        // 4. 收集前两个事件（ready + hint），并回写缓存锚点
+        let mut buf = Vec::new();
+        let mut text_buf = String::new();
+        let (ready_block, second_block) = loop {
+            let chunk = raw_stream
+                .next()
+                .await
+                .ok_or_else(|| {
+                    let raw = String::from_utf8_lossy(&buf);
+                    log::error!(
+                        target: "ds_core::accounts",
+                        "req={} 复用空 SSE 流, 已收到 {} 字节: {}", request_id, buf.len(), raw
+                    );
+                    // 残留字节里可能就是禁言提示（禁言账号常只下发 hint 即断流）；
+                    // 登录时已记录 mute_until，能给出精确到期时间
+                    if let Some(notice) = extract_mute_notice(&buf) {
+                        self.pool.mark_error(&account_id);
+                        let mute_until = account.mute_until();
+                        let msg = if notice.contains("user_is_muted") && mute_until > 0 {
+                            format!(
+                                "空 SSE 流：账号已被禁言至 {}（user_is_muted），到期前请更换账号",
+                                format_mute_time(mute_until)
+                            )
+                        } else {
+                            format!("空 SSE 流：{}", notice)
+                        };
+                        return CoreError::Stream(msg);
+                    }
+                    if buf.is_empty() {
+                        self.pool.mark_error(&account_id);
+                        let mute_until = account.mute_until();
+                        if mute_until > 0 {
+                            return CoreError::Stream(format!(
+                                "空 SSE 流：账号已被禁言至 {}（user_is_muted），到期前请更换账号",
+                                format_mute_time(mute_until)
+                            ));
+                        }
+                        CoreError::Stream(
+                            "空 SSE 流：服务端未返回任何数据，当前账号可能已被限制或禁言".to_string(),
+                        )
+                    } else {
+                        CoreError::Stream(format!("空 SSE 流 (已收到 {} 字节)", buf.len()))
+                    }
+                })?
+                .map_err(|e| CoreError::Stream(e.to_string()))?;
+            buf.extend_from_slice(&chunk);
+            text_buf.push_str(&String::from_utf8_lossy(&chunk));
+            if let Some((first, second)) = split_two_events(&text_buf) {
+                break (first.to_owned(), second.to_owned());
+            }
+        };
+
+        let (req_msg_id, stop_id) = parse_ready_message_ids(ready_block.as_bytes());
+
+        if let Some(err) = check_hint(&second_block) {
+            if let CoreError::Overloaded = &err {
+                self.pool.mark_error(&account_id);
+            } else if err.to_string().contains("禁言") {
+                // 禁言是账号级状态，标记 Error 避免同账号反复建会话
+                self.pool.mark_error(&account_id);
+                // 登录时记录了 mute_until，把精确到期时间补进提示
+                // （复用路径为持久会话：禁言不使其失效，无需 delete）
+                if err.to_string().contains("user_is_muted") && account.mute_until() > 0 {
+                    let enriched = CoreError::ProviderError(format!(
+                        "禁言提示：账号已被禁言至 {}（user_is_muted），到期前请更换账号",
+                        format_mute_time(account.mute_until())
+                    ));
+                    log::warn!(target: "ds_core::accounts", "req={} 复用请求禁言: {}", request_id, enriched);
+                    return Err(enriched);
+                }
+            }
+            log::warn!(
+                target: "ds_core::accounts",
+                "req={} 复用请求 hint 错误: {:?}", request_id, err
+            );
+            return Err(err);
+        }
+
+        // 5. 回写缓存（新锚点 + 本轮用户文本；查找键 + 下一轮键双写）
+        let entry = CachedConversation {
+            account_id: account_id.clone(),
+            session_id: target.session_id.clone(),
+            last_request_msg_id: req_msg_id,
+            last_response_msg_id: stop_id,
+            last_user_text: plan.user_text.clone(),
+            model_type: req.model_type.clone(),
+            last_used_ms: now_ms_u64(),
+        };
+        self.insert_conversation_multi(
+            vec![plan.cache_key.clone(), plan.next_key.clone()],
+            entry,
+        );
+
+        // 6. 重建流；持久会话：GuardedStream 只 stop_stream，不 delete
+        let stream =
+            futures::stream::once(futures::future::ready(Ok(Bytes::from(buf)))).chain(raw_stream);
+
+        Ok(ChatResponse {
+            stream: Box::pin(GuardedStream::new(
+                Box::pin(stream),
+                guard,
+                client.clone(),
+                token,
+                target.session_id.clone(),
+                stop_id,
+                true,
+                self.active_sessions.clone(),
+            )),
+            account_id,
+        })
     }
 
     /// 单次请求尝试（不含重试逻辑）
@@ -351,6 +717,8 @@ impl Completions {
                     "text/plain",
                     history_content.as_bytes(),
                     request_id,
+                    &req.model_type,
+                    req.thinking_enabled,
                 )
                 .await
             {
@@ -373,6 +741,8 @@ impl Completions {
                     &file.content_type,
                     &file.content,
                     request_id,
+                    &req.model_type,
+                    req.thinking_enabled,
                 )
                 .await
             {
@@ -406,11 +776,23 @@ impl Completions {
             "req={} completion PoW 计算完成", request_id
         );
 
-        // 6. 发起 completion（历史文件上传失败时退回到完整 prompt 内联发送）
-        let completion_prompt: &str = if history_upload_failed {
-            &req.prompt
+        // 6. 发起 completion。
+        // 历史文件上传失败时，绝不回退为完整 ChatML prompt 内联发送：多轮
+        // <｜end▁of▁sentence｜>/<｜User｜>/<｜Assistant｜> 原生标签的整段重放不是
+        // Web 端的请求形态（Web 端历史在服务端），是风控判定协议重放的封号特征。
+        // 安全降级：历史脱敏为纯文本角色标记（[用户]/[助手]）+ 长度截断，
+        // 拼接在 inline prompt 前；当前轮次保持原生标签（与 Web 单轮形态一致）。
+        let completion_prompt: String = if history_upload_failed {
+            let history_plain = sanitize_history_inline(history_content);
+            log::warn!(
+                target: "ds_core::accounts",
+                "req={} 历史上传失败，降级为脱敏纯文本历史（len={}）内联，不回传原生标签",
+                request_id,
+                history_plain.len()
+            );
+            format!("{}{}", history_plain, inline_prompt)
         } else {
-            inline_prompt
+            inline_prompt.to_string()
         };
 
         log::trace!(
@@ -423,7 +805,7 @@ impl Completions {
             chat_session_id: session_id.clone(),
             parent_message_id: None,
             model_type: req.model_type.clone(),
-            prompt: completion_prompt.to_string(),
+            prompt: completion_prompt,
             ref_file_ids,
             thinking_enabled: req.thinking_enabled,
             search_enabled: req.search_enabled,
@@ -451,7 +833,38 @@ impl Completions {
                         target: "ds_core::accounts",
                         "req={} 空 SSE 流, 已收到 {} 字节: {}", request_id, buf.len(), raw
                     );
-                    CoreError::Stream(format!("空 SSE 流 (已收到 {} 字节)", buf.len()))
+                    // 残留字节里可能就是禁言提示（禁言账号常只下发 hint 即断流）；
+                    // 登录时已记录 mute_until，能给出精确到期时间
+                    if let Some(notice) = extract_mute_notice(&buf) {
+                        self.pool.mark_error(&account_id);
+                        let mute_until = account.mute_until();
+                        let msg = if notice.contains("user_is_muted") && mute_until > 0 {
+                            format!(
+                                "空 SSE 流：账号已被禁言至 {}（user_is_muted），到期前请更换账号",
+                                format_mute_time(mute_until)
+                            )
+                        } else {
+                            format!("空 SSE 流：{}", notice)
+                        };
+                        return CoreError::Stream(msg);
+                    }
+                    // 零字节空流绝大多数是账号被限制/禁言/登录态失效（非网络抖动），
+                    // 标记 Error 触发换号重试，并把可能原因写进错误消息直达用户。
+                    if buf.is_empty() {
+                        self.pool.mark_error(&account_id);
+                        let mute_until = account.mute_until();
+                        if mute_until > 0 {
+                            return CoreError::Stream(format!(
+                                "空 SSE 流：账号已被禁言至 {}（user_is_muted），到期前请更换账号",
+                                format_mute_time(mute_until)
+                            ));
+                        }
+                        CoreError::Stream(
+                            "空 SSE 流：服务端未返回任何数据，当前账号可能已被限制或禁言".to_string(),
+                        )
+                    } else {
+                        CoreError::Stream(format!("空 SSE 流 (已收到 {} 字节)", buf.len()))
+                    }
                 })?
                 .map_err(|e| CoreError::Stream(e.to_string()))?;
             log::trace!(
@@ -466,7 +879,7 @@ impl Completions {
             }
         };
 
-        let (_, stop_id) = parse_ready_message_ids(ready_block.as_bytes());
+        let (req_msg_id, stop_id) = parse_ready_message_ids(ready_block.as_bytes());
 
         // 8. 检查 hint 事件（rate_limit / input_exceeds_limit）
         if let Some(err) = check_hint(&second_block) {
@@ -478,6 +891,21 @@ impl Completions {
                 // rate_limit 是账号级限流，标记 Error 触发换号重试
                 self.pool.mark_error(&account_id);
             } else {
+                if err.to_string().contains("禁言") {
+                    // 禁言是账号级状态，标记 Error 避免同账号反复建会话
+                    self.pool.mark_error(&account_id);
+                    // 登录时记录了 mute_until，把精确到期时间补进提示
+                    if err.to_string().contains("user_is_muted") && account.mute_until() > 0 {
+                        let enriched = CoreError::ProviderError(format!(
+                            "禁言提示：账号已被禁言至 {}（user_is_muted），到期前请更换账号",
+                            format_mute_time(account.mute_until())
+                        ));
+                        log::warn!(target: "ds_core::accounts", "req={} hint 禁言: {}", request_id, enriched);
+                        let _ = client.delete_session(&token, &session_id).await;
+                        session_guard.disarm();
+                        return Err(enriched);
+                    }
+                }
                 let hint_detail = second_block
                     .lines()
                     .find_map(|l| l.strip_prefix("data: "))
@@ -525,6 +953,31 @@ impl Completions {
         let stream =
             futures::stream::once(futures::future::ready(Ok(Bytes::from(buf)))).chain(raw_stream);
 
+        // 持久会话：冷启动命中缓存计划时，会话保留（历史由服务端持有），由缓存管理生命周期
+        let persistent = req.conversation.is_some();
+        if let Some(plan) = &req.conversation {
+            let entry = CachedConversation {
+                account_id: account_id.clone(),
+                session_id: session_id.clone(),
+                last_request_msg_id: req_msg_id,
+                last_response_msg_id: stop_id,
+                last_user_text: plan.user_text.clone(),
+                model_type: req.model_type.clone(),
+                last_used_ms: now_ms_u64(),
+            };
+            self.insert_conversation_multi(
+                vec![plan.cache_key.clone(), plan.next_key.clone()],
+                entry,
+            );
+            log::debug!(
+                target: "ds_core::accounts",
+                "req={} 持久会话已缓存: key={}..., session={}",
+                request_id,
+                &plan.cache_key[..plan.cache_key.len().min(12)],
+                session_id
+            );
+        }
+
         // 成功移交 GuardedStream：解除 SessionGuard 清理责任，收尾交给 GuardedStream（stop_stream + delete_session）
         session_guard.disarm();
 
@@ -536,6 +989,7 @@ impl Completions {
                 token,
                 session_id,
                 stop_id,
+                persistent,
                 self.active_sessions.clone(),
             )),
             account_id,
@@ -566,6 +1020,9 @@ impl Completions {
     }
 
     /// 上传文件并轮询直到 SUCCESS 或超时
+    ///
+    /// `model_type` / `thinking_enabled` 只用于填 web 端实抓的
+    /// `x-model-type` / `x-thinking-enabled` 请求头，不影响上传语义。
     async fn upload_and_poll(
         &self,
         token: &str,
@@ -573,6 +1030,8 @@ impl Completions {
         content_type: &str,
         content: &[u8],
         request_id: &str,
+        model_type: &str,
+        thinking_enabled: bool,
     ) -> Result<String, CoreError> {
         let pow_header = self
             .compute_pow_for_target(token, "/api/v0/file/upload_file")
@@ -582,7 +1041,15 @@ impl Completions {
             .client
             .read()
             .await
-            .upload_file(token, &pow_header, filename, content_type, content.to_vec())
+            .upload_file(
+                token,
+                &pow_header,
+                filename,
+                content_type,
+                content.to_vec(),
+                model_type,
+                thinking_enabled,
+            )
             .await?;
         let file_id = upload_data.id;
 
@@ -644,6 +1111,82 @@ impl Completions {
         email_or_mobile: &str,
     ) -> Result<String, crate::ds_core::accounts::PoolError> {
         self.pool.remove_account(email_or_mobile).await
+    }
+
+    /// 拉取云端会话列表（#10 同步已有对话）：从号池取一个空闲账号的 token
+    /// 调 fetch_page 并按 has_more 游标翻页（每页服务端封顶，实测 99 条/页）。
+    /// 以会话 id 去重防止游标参数失效时重复/死循环；单次同步最多 10 页。
+    pub async fn list_cloud_sessions(
+        &self,
+    ) -> Result<Vec<crate::ds_core::client::CloudSession>, CoreError> {
+        let guard = self
+            .pool
+            .get_account()
+            .ok_or_else(|| {
+                if self.pool.is_empty() {
+                    CoreError::NoAccounts
+                } else {
+                    CoreError::Overloaded
+                }
+            })?;
+        let token = guard.account().token().to_string();
+        let client = self.client.read().await.clone();
+        let mut all: Vec<crate::ds_core::client::CloudSession> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut cursor: Option<f64> = None;
+        let mut pages = 0;
+        loop {
+            let page = client
+                .fetch_session_page(&token, cursor)
+                .await
+                .map_err(CoreError::from)?;
+            let mut progressed = false;
+            for s in page.sessions {
+                if seen.insert(s.id.clone()) {
+                    // 列表按 updated_at 降序，最后一个 id 的 updated_at 即下一页游标
+                    cursor = Some(s.updated_at);
+                    progressed = true;
+                    all.push(s);
+                }
+            }
+            pages += 1;
+            if !page.has_more || !progressed || pages >= 10 {
+                if pages > 1 {
+                    log::info!(
+                        target: "ds_core::accounts",
+                        "云端会话分页完成: {} 条 / {} 页", all.len(), pages
+                    );
+                }
+                break;
+            }
+        }
+        drop(guard);
+        Ok(all)
+    }
+
+    /// 拉取云端会话的消息内容（#10 完整同步；与列表相同，无需 PoW）
+    pub async fn list_cloud_session_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::ds_core::client::CloudMessage>, CoreError> {
+        let guard = self
+            .pool
+            .get_account()
+            .ok_or_else(|| {
+                if self.pool.is_empty() {
+                    CoreError::NoAccounts
+                } else {
+                    CoreError::Overloaded
+                }
+            })?;
+        let token = guard.account().token().to_string();
+        let client = self.client.read().await.clone();
+        let messages = client
+            .fetch_session_messages(&token, session_id)
+            .await
+            .map_err(CoreError::from)?;
+        drop(guard);
+        Ok(messages)
     }
 
     /// 标记账号为 Error 状态
@@ -711,6 +1254,8 @@ impl Completions {
             config.deepseek.client_version.clone(),
             config.deepseek.client_platform.clone(),
             config.deepseek.client_locale.clone(),
+            config.deepseek.client_bundle_id.clone(),
+            config.deepseek.client_timezone_offset,
             config.proxy.url.as_deref(),
         );
         let wasm_bytes = client.get_wasm().await?;
@@ -830,7 +1375,105 @@ fn split_history_prompt(prompt: &str) -> (String, String) {
     (inline, history)
 }
 
+/// 历史上传失败时的安全降级：把待上传的历史脱敏为纯文本对话回顾。
+/// 关键约束：历史部分不允许出现任何 `<｜...｜>` 原生协议标签（含 tool 包装标签），
+/// 多轮原生标签整段内联会被风控判定为协议重放，实测稳定触发封号/禁言。
+/// 同时限制长度：应用侧 max_input_tokens 通常仅 4096，超长会 input_exceeds_limit。
+fn sanitize_history_inline(history_content: &str) -> String {
+    const MAX_CHARS: usize = 3000;
+
+    let header = "以下是基于此前对话历史的简要回顾（仅供参考）：\n";
+    let footer = "以上是历史回顾，请结合它回答接下来的问题。\n\n";
+
+    let stripped = history_content
+        .replace("[file content end]", "")
+        .replace("[file name]: IGNORE", "")
+        .replace("[file content begin]", "");
+
+    let mut body = String::new();
+    for block in parse_native_blocks(stripped.trim()) {
+        if block.content.trim().is_empty() {
+            continue;
+        }
+        let label = match block.role.as_str() {
+            "user" => "用户",
+            "assistant" => "助手",
+            "system" => "系统设定",
+            "tool" => "工具结果",
+            other => other,
+        };
+        body.push('[');
+        body.push_str(label);
+        body.push_str("] ");
+        body.push_str(strip_native_tags(&block.content).trim());
+        body.push('\n');
+    }
+
+    let mut out = format!("{}{}{}", header, body, footer);
+    let char_count = out.chars().count();
+    if char_count > MAX_CHARS {
+        // 保留尾部（更接近当前问题），并从截断后第一个换行起，避免切半个词
+        let keep_from = char_count - MAX_CHARS;
+        let tail: String = out.chars().skip(keep_from).collect();
+        let start = tail.find('\n').map(|i| i + 1).unwrap_or(0);
+        out = format!("（更早的历史已省略）\n{}", &tail[start..]);
+    }
+    out
+}
+
+/// 移除字符串中残留的 `<｜...｜>` 原生标签（不成对时移除起始标记及其后内容到字符串尾）
+fn strip_native_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find(TAG_START) {
+        out.push_str(&rest[..i]);
+        match rest[i + TAG_START.len()..].find(TAG_END) {
+            Some(j) => rest = &rest[i + TAG_START.len() + j + TAG_END.len()..],
+            None => {
+                // 未闭合：丢弃剩余全部，防止半截标签泄入 prompt
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 // ── SSE 解析辅助 ──────────────────────────────────────────────────────
+
+fn now_ms_u64() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// 从原始 SSE 字节中提取禁言提示。
+/// 实测两种形态：
+/// 1. 中文原文（若服务端下发）："由于违反用户使用规范，你的账号已被禁言至 2026 年 9 月 9 日 14:44…"——含到期时间，优先；
+/// 2. 含糊错误码 `user_is_muted`（网页端据此渲染禁言弹窗）——转换为可读提示。
+/// 禁言账号的 completion 可能只下发一条 hint 即关闭流（应用侧表现为"空 SSE 流"），
+/// 提示就在残留字节里——提取出来直达用户，替代笼统的空流报错。
+fn extract_mute_notice(raw: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(raw);
+    if let Some(idx) = text.find("由于违反").or_else(|| text.find("禁言")) {
+        let rest = &text[idx..];
+        let end = match rest.find('。') {
+            Some(i) => idx + i + '。'.len_utf8(),
+            None => (idx + 200).min(text.len()),
+        };
+        let snippet = text[idx..end].trim();
+        if !snippet.is_empty() {
+            return Some(snippet.to_string());
+        }
+    }
+    if text.contains("user_is_muted") {
+        return Some(
+            "账号已被禁言（user_is_muted）：到期时间请在网页端登录查看，到期前请更换账号".to_string(),
+        );
+    }
+    None
+}
 
 /// 从字符串中提取前两个完整 SSE 事件块
 fn split_two_events(buf: &str) -> Option<(&str, &str)> {
@@ -841,7 +1484,7 @@ fn split_two_events(buf: &str) -> Option<(&str, &str)> {
     Some((parts[0], parts[1]))
 }
 
-/// 检查 hint 事件，返回错误（rate_limit → Overloaded, input_exceeds_limit → ProviderError）
+/// 检查 hint 事件，返回错误（禁言 → 携带原文含到期时间；rate_limit → Overloaded；超长 → ProviderError）
 fn check_hint(event_block: &str) -> Option<CoreError> {
     let is_hint = event_block.lines().any(|l| {
         l.trim()
@@ -850,6 +1493,12 @@ fn check_hint(event_block: &str) -> Option<CoreError> {
     });
     if !is_hint {
         return None;
+    }
+    // 禁言提示（中文原文或 user_is_muted 错误码）优先：直达用户而非笼统报错
+    if event_block.contains("禁言") || event_block.contains("user_is_muted") {
+        let notice = extract_mute_notice(event_block.as_bytes())
+            .unwrap_or_else(|| "账号已被禁言（违反用户使用规范）".into());
+        return Some(CoreError::ProviderError(format!("禁言提示：{}", notice)));
     }
     if event_block.contains("rate_limit") {
         return Some(CoreError::Overloaded);
@@ -883,4 +1532,71 @@ fn parse_ready_message_ids(chunk: &[u8]) -> (i64, i64) {
         }
     }
     (1, 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_history_removes_native_tags() {
+        let history = "[file content end]\n\n\
+            <｜System｜>你是助手\n\
+            <｜User｜>你好\n\
+            <｜Assistant｜>你好！有什么可以帮你？\n\
+            <｜User｜>介绍一下Rust\n\
+            [file name]: IGNORE\n[file content begin]\n";
+        let out = sanitize_history_inline(history);
+        assert!(!out.contains("｜>") && !out.contains("<｜"), "残留原生标签: {}", out);
+        assert!(out.contains("[用户] 你好"));
+        assert!(out.contains("[助手] 你好！有什么可以帮你？"));
+        assert!(out.contains("[系统设定] 你是助手"));
+        assert!(out.starts_with("以下是"));
+    }
+
+    #[test]
+    fn sanitize_history_truncates_long_input() {
+        let mut history = String::from("[file content end]\n\n");
+        for i in 0..500 {
+            history.push_str(&format!("<｜User｜>这是第{}轮很长的用户消息内容，用来撑大历史体积。\n", i));
+            history.push_str(&format!("<｜Assistant｜>这是第{}轮同样很长的助手回复内容。\n", i));
+        }
+        history.push_str("[file name]: IGNORE\n[file content begin]\n");
+        let out = sanitize_history_inline(&history);
+        assert!(out.chars().count() <= 3200, "截断失败: {}", out.chars().count());
+        assert!(!out.contains("<｜"));
+        assert!(out.contains("已省略"));
+    }
+
+    #[test]
+    fn sanitize_history_unpaired_tag_dropped() {
+        let history = "<｜User｜>正常消息\n<｜Assistant｜>未闭合标签";
+        let out = sanitize_history_inline(history);
+        assert!(!out.contains("<｜"), "未闭合标签应整体丢弃: {}", out);
+        assert!(out.contains("[用户] 正常消息"));
+    }
+
+    #[test]
+    fn strip_tags_partial() {
+        assert_eq!(strip_native_tags("a<｜User｜>b"), "ab");
+        // 标签只剥壳，标签之间的内容保留（tool 包装内的正文属于历史内容）
+        assert_eq!(strip_native_tags("a<｜tool▁outputs▁begin｜>xb<｜tool▁outputs▁end｜>c"), "axbc");
+        assert_eq!(strip_native_tags("a<｜oops"), "a");
+    }
+
+    #[test]
+    fn mute_notice_extraction() {
+        // 形态 2（用户情报实测）：SSE 只含 user_is_muted 错误码，无中文
+        let sse_code = "event: hint\ndata: {\"type\":\"error\",\"content\":\"user_is_muted\",\"finish_reason\":\"user_is_muted\"}\n\n";
+        let notice = extract_mute_notice(sse_code.as_bytes()).unwrap();
+        assert!(notice.contains("user_is_muted"), "应识别错误码: {}", notice);
+        // 形态 1：中文原文（含到期时间）
+        let sse_cn = "data: {\"type\":\"error\",\"content\":\"由于违反用户使用规范，你的账号已被禁言至 2026 年 9 月 9 日 14:44，如有疑问请联系我们。\"}\n\n";
+        let notice = extract_mute_notice(sse_cn.as_bytes()).unwrap();
+        assert!(notice.contains("禁言至 2026 年 9 月 9 日 14:44"), "应含到期时间: {}", notice);
+        assert!(notice.starts_with("由于违反"), "应从句首截取: {}", notice);
+        assert!(notice.ends_with('。'), "应到句号为止: {}", notice);
+        // 无禁言内容 → None
+        assert!(extract_mute_notice(b"event: ready\ndata: {}\n\n").is_none());
+    }
 }

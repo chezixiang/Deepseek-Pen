@@ -100,6 +100,35 @@ fn format_response_text(rf: &crate::openai_adapter::types::ResponseFormat) -> St
 /// 顺序: [system(含 reminder)] [历史 user/tool/assistant 轮次...] <｜Assistant｜><think>[reminder]
 pub(crate) fn build(req: &ChatCompletionsRequest, tool_ctx: &ToolContext) -> String {
     let messages = merge_messages(&req.messages);
+
+    // Web 客户端形态对齐（full.har 实证）：全新会话的首条消息 prompt 是纯文本，
+    // 不含任何 <｜...｜> 原生标签（带图时图片走 ref_file_ids，prompt 仍是纯文本，
+    // 见 full.har entry#260）。单条 user 消息且无工具/格式约束时按 Web 形态发送，
+    // 最小化请求与真实流量的差异（风控面）。多轮/带系统提示/带工具的请求仍走
+    // 原生标签 + 历史文件拆分（原有行为，实测可用）。
+    let no_tools = tool_ctx.format_block.is_none()
+        && tool_ctx.defs_text.is_none()
+        && tool_ctx.instruction_text.is_none();
+    if no_tools && req.response_format.is_none() && messages.len() == 1 {
+        let only = &messages[0];
+        if only.role == "user" {
+            match &only.content {
+                Some(MessageContent::Text(text)) => return text.clone(),
+                Some(MessageContent::Parts(parts)) => {
+                    // 图片/文件内容经 ref_file_ids 传递，prompt 只保留文本部分
+                    let text = parts
+                        .iter()
+                        .filter_map(|p| p.text.as_deref())
+                        .filter(|t| !t.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return if text.is_empty() { "[图片]".to_string() } else { text };
+                }
+                _ => {}
+            }
+        }
+    }
+
     let mut parts: Vec<String> = Vec::with_capacity(messages.len());
     let mut i = 0;
     while i < messages.len() {

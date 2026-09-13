@@ -399,6 +399,9 @@ pub struct ChatCompletionsResponse {
     pub service_tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_fingerprint: Option<String>,
+    /// DeepSeek 自动生成的会话标题（透传，见 ChatCompletionsResponseChunk::ds_title）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ds_title: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -443,6 +446,10 @@ pub struct ChatCompletionsResponseChunk {
     pub service_tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_fingerprint: Option<String>,
+    /// DeepSeek 自动生成的会话标题（服务端在会话首条消息时下发，与 thinking/search 无关），
+    /// 随 finish chunk 透传给客户端，用于应用侧自动命名会话
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ds_title: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
