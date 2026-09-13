@@ -37,3 +37,9 @@ __pycache__/
 *.log
 **/logs/
 *- 副本*
+
+
+# prebuilt release binaries & real config (keep README/LICENSE/example tracked)
+ds-free-api/ds-free-api-v*/ds-free-api
+ds-free-api/ds-free-api-v*/ds-free-api.exe
+ds-free-api/ds-free-api-v*/config.toml
