@@ -1,5 +1,0 @@
-[2026-08-19T13:41:09.317+08:00 INFO   config] 已创建默认配置文件: config.toml
-[2026-08-19T13:41:09.597+08:00 INFO   store] stats.json 不存在，使用零值
-[2026-08-19T13:41:09.600+08:00 INFO   http::server] openai兼容base_url: http://127.0.0.1:22217
-[2026-08-19T13:41:09.602+08:00 INFO   http::server] anthropic兼容base_url: http://127.0.0.1:22217/anthropic
-[2026-08-19T13:41:09.603+08:00 INFO   http::server] 管理面板: http://127.0.0.1:22217/admin

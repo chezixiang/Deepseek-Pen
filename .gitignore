@@ -7,3 +7,33 @@
 
 # Dependencies
 node_modules/
+# ---- build artifacts / generated ----
+# falcon mini-program build output
+app/.falcon_/
+# compiled mini-program packages
+app/*.amr
+# webpack dist
+app/dist/
+# app build logs & temp
+app/build.log
+app/.temp/
+# embedded prebuilt backend binary
+app/backend/*
+!app/backend/config.example.toml
+app/src/services/ds-free-api-aarch64
+/ds-free-api-aarch64
+# test leftovers
+resp_test.json
+
+# ---- Rust ----
+target/
+**/target/
+
+# ---- Python ----
+__pycache__/
+*.pyc
+
+# ---- misc ----
+*.log
+**/logs/
+*- 副本*
