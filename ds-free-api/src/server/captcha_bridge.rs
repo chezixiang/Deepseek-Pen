@@ -22,7 +22,7 @@ use tokio::sync::oneshot;
 
 use super::handlers::AppState;
 
-const SDK_JS: &str = include_str!("../../../../CAPTCHA/captcha-sdk.min.js");
+const SDK_JS: &str = include_str!("../../../CAPTCHA/captcha-sdk.min.js");
 
 #[derive(Clone)]
 pub struct CaptchaStore {
