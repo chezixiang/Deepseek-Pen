@@ -65,21 +65,30 @@ app/
 ```bash
 cd Deepseek/app
 npm install            # 自动执行 aiot-vue-cli 补丁
-npm run build:prod     # 产出 8000000000000001.0_1_0.amr
+npm run build:prod     # 产出 8000000000182376.0_1_2.amr（文件名 = appid + package.json 的 version）
 ```
 
 > 构建需 Node 18（`build:prod` 脚本已通过 `npx node@18` 自动处理，无需本机装旧版）。
 > 构建日志里的「未找到以下模块: storage,langningchen,fs」属正常——这些是设备端原生模块，运行时解析。
+>
+> 版本号有两处，发布前一起改：`package.json` 的 `version`（决定 amr 文件名与 manifest）
+> 和 `src/services/store.js` 的 `APP_VERSION`（设置页/登录页显示的 "0.1.2 build N"）。
+> build N 由构建脚本自动 +1，不用手改。
+>
+> 完整构建（含 qjsc 预编译）约 15 分钟，13MB 的 store bundle 预编译最耗时，期间看起来"卡住"是正常的。
 
 ## 安装到词典笔
 
 ```bash
-adb push 8000000000000001.0_1_0.amr /userdisk/Favorite/
-adb shell "miniapp_cli install /userdisk/Favorite/8000000000000001.0_1_0.amr"
-adb shell "miniapp_cli start 1 index"    # appid 去掉 800 前缀
+adb push 8000000000182376.0_1_2.amr /userdisk/Favorite/
+adb shell "miniapp_cli install /userdisk/Favorite/8000000000182376.0_1_2.amr"
+adb shell "miniapp_cli start 8000000000182376 index"
 ```
 
-> appid 为 `8000000000000001`，安装名 = 去掉前导 `800` = `1`。
+> appid 为 `8000000000182376`（安装名可去掉前导 `800` 写成 `182376`，两种都能 `miniapp_cli start`）。
+>
+> **升级请用 `install` 覆盖安装**，别先 `uninstall`：`uninstall` 会删掉整个应用包目录，
+> `data/` 里的账号、设置、会话全部丢失（详见上文「数据存放位置」）。
 
 ## 后端（ds-free-api）
 

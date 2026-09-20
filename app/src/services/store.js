@@ -12,7 +12,7 @@ import { BUILD_NUM } from './build-info.js'
 
 // 应用版本号：格式 "主.次.修订 build N"。build N 由 scripts/build-wrapper.js
 // 在每次构建时对 build-info.js 的 BUILD_NUM 自动 +1（#17），便于用户确认是否更新。
-export const APP_VERSION = '0.1.1 build ' + BUILD_NUM
+export const APP_VERSION = '0.1.2 build ' + BUILD_NUM
 
 const KEY_CONVERSATIONS = 'ds:conversations'
 const KEY_SETTINGS = 'ds:settings'

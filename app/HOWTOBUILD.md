@@ -14,13 +14,15 @@
 ### 构建Deepseek miniapp前端
 -只需在Windows cmd环境运行即可
 
-1.用npm run build:prod进行完整构建（qjsc预编译阶段较长，约5-6分钟，请耐心等待）（注意工具使用的终端会超时，这是正常现象）
+1.用npm run build:prod进行完整构建（qjsc预编译阶段较长，约15分钟，请耐心等待）（注意工具使用的终端会超时，这是正常现象）
 2.如果1卡在“开始 qjsc 预编译”超过10分钟可以尝试 npm run build:dev
+3.发布前把 package.json 的 version 和 src/services/store.js 的 APP_VERSION 一起改成同一版本号
+（amr 文件名由 package.json 的 version 决定；build N 由构建脚本自动 +1，不用手改）
 
-amzhoxvzidbke+bryant@gmail.com
-Qwerasdfzxcv1234
+### 常用调试路径
+
 /userdisk/secondary/miniapp/data/mini_app/pkg/8000000000182376/data/ds-app.log
-/userdisk/ds-free-api/logs/runtime.log
+/userdisk/secondary/miniapp/data/mini_app/pkg/8000000000182376/data/ds-free-api/logs/runtime.log
 ps aux | grep "ds-free-api"
 
 
