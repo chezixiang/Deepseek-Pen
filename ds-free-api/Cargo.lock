@@ -943,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "ds-free-api"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "aes",
  "anyhow",

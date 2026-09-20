@@ -5,6 +5,10 @@
 
 ## 功能
 
+- **专用登录页**：账号登录 / 切换 / 退出都在独立登录页完成（首次启动自动进入），
+  设置页只保留入口与状态展示。布局对标 Lumo 邮箱（左侧 Logo，右侧表单），
+  右侧内容放在 `scroller` 里可上下滚动，并关闭了左滑返回手势（本页是应用入口页）。
+  设备凭据（device_id）由后端**自动生成**，用户无需任何操作。
 - **多对话**：会话抽屉，可新建 / 切换 / 删除，全部持久化到本地 storage。
 - **模型锁定**：一个对话一旦开始，模型模式（快速 / 专家 / 识图）不可中途切换，避免上下文错乱。
 - **三种模型**：快速模式（`deepseek-default`）、专家模式（`deepseek-expert`）、识图模式（快速模型 + 图片附件）。
@@ -32,8 +36,10 @@ app/
 ├── api-mock/                     # 浏览器/web 预览用 mock（原生模块 stub）
 └── src/
     ├── app.js                    # createApp
-    ├── app.json                  # 路由表：index / settings
+    ├── app.json                  # 路由表：startup / login / index / settings
     ├── pages/
+    │   ├── startup/startup.vue   # 启动页（部署后端 → 按是否已登录分流）
+    │   ├── login/login.vue       # 登录页（左 Logo / 右表单，账号管理都在这）
     │   ├── index/index.vue       # 主聊天页
     │   └── settings/settings.vue # 设置页
     └── services/
@@ -42,6 +48,17 @@ app/
         ├── store.js              # 会话/消息/设置 持久化（storage KV）
         └── images.js             # 相册读取 + base64（Shell）
 ```
+
+## 数据存放位置
+
+| 内容 | 路径（`$dataDir` = 应用包内 `data/`） |
+|------|----------------------------------------|
+| 会话 / 消息 / 设置 | `$dataDir/ds_settings.json`、`ds_conversations.json` 等 |
+| 框架 storage 副本 | `$dataDir/sharedpreferences/preferences.json` |
+| 后端与账号真源 | `$dataDir/ds-free-api/config.toml`（`[[accounts]]` 段） |
+
+> **卸载会清空 `$dataDir`**：`miniapp_cli uninstall` 删掉整个应用包目录，
+> 账号与设置一并丢失，重装后需重新登录。同版本 `install` 覆盖安装则保留 `data/`。
 
 ## 构建
 

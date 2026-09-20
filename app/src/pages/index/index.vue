@@ -648,6 +648,15 @@ export default {
             this.settings = await loadSettings()
             this.cacheTheme()
             appLog('[index] init theme=' + (this.settings && this.settings.theme) + ' isDark=' + this.isDark + ' authMode=' + (this.settings && this.settings.authMode))
+            // 未登录兜底：内置模式且没有任何账号时，引导到专用登录页
+            // （正常路径由 startup 页判断；这里防御直接进入 index 的情况）
+            if (this.settings && this.settings.authMode === 'builtin' && !this.settings.dsConfigured) {
+                appLog('[index] 未配置账号，跳转登录页')
+                try {
+                    $falcon.navTo('login')
+                } catch (e) { /* 忽略 */ }
+                return
+            }
             this.setDebugLog()
             this.ensureEmojiFontIfEnabled()
             // 兜底拉起后端：startup 页可能因生命周期问题从未执行 ensureBackendRunning，

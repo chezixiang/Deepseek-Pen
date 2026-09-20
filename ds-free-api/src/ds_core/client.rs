@@ -141,12 +141,26 @@ pub struct UserInfo {
 }
 
 /// 禁言状态（users/current 与登录响应的 biz_data.chat）
+///
+/// 注意：上游未禁言时 `mute_until` 会显式返回 `null`（而不是省略字段或给 0）。
+/// `#[serde(default)]` 只在该字段**缺失**时生效，遇到 `null` 会让整个登录响应
+/// 反序列化失败（"invalid type: null, expected f64"）→ 账号登录不了、账号池恒为 0。
+/// 这里改成 null 也走默认值，保证最常见的「未禁言」正常登录。
 #[derive(Debug, Deserialize)]
 pub struct ChatMute {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub is_muted: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub mute_until: f64,
+}
+
+/// 把 JSON `null` 当作「字段缺失」，回落到该类型的默认值。
+fn null_to_default<'de, D, T>(de: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(de)?.unwrap_or_default())
 }
 
 #[derive(Debug, Deserialize)]
@@ -613,6 +627,12 @@ impl DsClient {
         Ok(h)
     }
 
+    /// 当前 User-Agent（设备凭据自动生成时复用同一身份）
+    #[must_use]
+    pub fn user_agent(&self) -> String {
+        self.user_agent.clone()
+    }
+
     fn auth_headers(&self, token: &str) -> Result<wreq::header::HeaderMap, ClientError> {
         let mut h = self.web_base_headers()?;
         h.insert(
@@ -1036,7 +1056,69 @@ impl DsClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{origin_of, CreateSessionWrapper, Envelope};
+    use super::{origin_of, ChatMute, CreateSessionWrapper, Envelope, LoginData, UserInfo};
+
+    /// 回归：未禁言的账号，上游登录响应里 `mute_until` 是显式 null。
+    /// 旧实现（裸 #[serde(default)]）会整体反序列化失败，账号永远登录不了。
+    #[test]
+    fn login_response_with_null_mute_until_parses() {
+        let json = r#"{
+            "code": 0,
+            "msg": "",
+            "user": {
+                "id": "u-1",
+                "token": "tok",
+                "email": "a@b.com",
+                "mobile_number": null,
+                "chat": {
+                    "is_muted": null,
+                    "mute_until": null
+                }
+            }
+        }"#;
+        let data: LoginData =
+            serde_json::from_str(json).expect("null mute_until 必须能解析（未禁言的常见情况）");
+        let chat = data.user.chat.expect("chat 字段应存在");
+        assert_eq!(chat.is_muted, 0);
+        assert_eq!(chat.mute_until, 0.0);
+    }
+
+    /// 禁言账号仍要正确读出到期时间（回归保护：宽容解析不能把真实值吃掉）
+    #[test]
+    fn login_response_with_real_mute_until_keeps_value() {
+        let json = r#"{
+            "code": 0,
+            "msg": "",
+            "user": {
+                "id": "u-1",
+                "token": "tok",
+                "chat": { "is_muted": 1, "mute_until": 1790000000 }
+            }
+        }"#;
+        let data: LoginData = serde_json::from_str(json).expect("禁言响应应能解析");
+        let chat = data.user.chat.expect("chat 字段应存在");
+        assert_eq!(chat.is_muted, 1);
+        assert_eq!(chat.mute_until, 1790000000.0);
+    }
+
+    /// chat 缺字段时也应回落为默认值（老响应/字段演进的兼容性）
+    #[test]
+    fn chat_mute_missing_fields_default() {
+        let chat: ChatMute =
+            serde_json::from_str(r#"{}"#).expect("空 chat 对象应回落默认值");
+        assert_eq!(chat.is_muted, 0);
+        assert_eq!(chat.mute_until, 0.0);
+    }
+
+    /// 防止 UserInfo 意外变严：没有 chat 字段的旧响应也能解析
+    #[test]
+    fn user_info_without_chat_parses() {
+        let user: UserInfo = serde_json::from_str(
+            r#"{"id":"u-1","token":"tok","email":"a@b.com"}"#,
+        )
+        .expect("没有 chat 字段的响应应能解析");
+        assert!(user.chat.is_none());
+    }
 
     #[test]
     fn derives_web_origin_from_api_base() {

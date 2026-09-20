@@ -5,11 +5,11 @@
 -构建时间较长
 -请使用Powershell（和wsl）
 
-1.构建目标 wsl --cd /mnt/d/codes/youdao/Deepseek/ds-free-api/ds-free-api-0.2.6/ bash -ic "cargo build --release"
+1.构建目标 wsl --cd /mnt/g/youdao/Deepseek/ds-free-api bash -lc "cargo build --release"
 
-2.压缩以便节省空间 wsl --cd /mnt/d/codes/youdao/Deepseek/ds-free-api/ds-free-api-0.2.6/target/aarch64-unknown-linux-gnu/release/ bash -ic "upx --lzma ds-free-api"
+2.压缩以便节省空间 wsl --cd /mnt/g/youdao/Deepseek/ds-free-api/target/aarch64-unknown-linux-gnu/release bash -lc "upx --lzma ds-free-api"
 
-3.复制到指定地点 Copy-Item -Path "D:\codes\youdao\Deepseek\ds-free-api\ds-free-api-0.2.6\target\aarch64-unknown-linux-gnu\release\ds-free-api" -Destination "D:\codes\youdao\Deepseek\app\backend\linux-aarch64-gnu\" -Force
+3.复制到指定地点 Copy-Item -Path "G:\youdao\Deepseek\ds-free-api\target\aarch64-unknown-linux-gnu\release\ds-free-api" -Destination "G:\youdao\Deepseek\app\backend\linux-aarch64-gnu\" -Force
 
 ### 构建Deepseek miniapp前端
 -只需在Windows cmd环境运行即可

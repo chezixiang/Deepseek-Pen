@@ -501,6 +501,52 @@ export async function updateDsFreeApiAccount(user, pass) {
   }
 }
 
+/**
+ * 清空本机 ds-free-api 的登录账号（把 config.toml 的 [[accounts]] 段置空）并重启服务。
+ *
+ * 账号的真源是 config.toml：应用侧的 ds:accounts 只是显示名缓存，
+ * 从缓存里删一条记录并不会真正退出登录（账号池仍会拿旧凭据登录）。
+ * 登录页的「移除账号」必须走这里才名副其实。
+ * 返回 { ok, message }；配置已落盘即视为成功，探活失败只提示不报错。
+ */
+export async function clearDsFreeApiAccount() {
+  const DS_CONFIG = dsConfigPath()
+  try {
+    const raw = await readFile(DS_CONFIG)
+    if (raw === null) return makeErr(10201, '无法读取 ds-free-api 配置文件（路径：' + DS_CONFIG + '）')
+    const next = replaceAccount(raw, '', '')
+    if (next === null) return makeErr(10203, 'config.toml 中未找到 [[accounts]] 段')
+
+    // 备份 + 原子写入，等待异步 execShell 真正完成（与账号更新同款可靠模式）
+    const tmp = joinDataDir('dsconfig.tmp.toml')
+    const resultFile = joinDataDir('dsconfig-result.txt')
+    const writeOk = await writeFile(tmp, next)
+    if (!writeOk) return makeErr(10402, '写入临时配置文件失败')
+    await writeFile(resultFile, '')
+    const cmd =
+      'cp ' + shq(DS_CONFIG) + ' ' + shq(DS_CONFIG + '.bak') + ' && ' +
+      'cp ' + shq(tmp) + ' ' + shq(DS_CONFIG + '.new') + ' && ' +
+      'mv -f ' + shq(DS_CONFIG + '.new') + ' ' + shq(DS_CONFIG) + ' && ' +
+      'printf ok > ' + shq(resultFile) + ' || printf failed > ' + shq(resultFile)
+    if (!execShell(cmd)) return makeErr(10403, '启动配置更新命令失败')
+    const result = String(await waitForFile(resultFile, 10000) || '').trim()
+    execShell('rm -f ' + shq(tmp) + ' ' + shq(resultFile) + ' ' + shq(DS_CONFIG + '.new') + ' 2>/dev/null || true')
+    if (result !== 'ok') return makeErr(10403, '写入配置文件失败')
+
+    const restartResult = await restartDsFreeApi()
+    if (!restartResult.ok) return restartResult
+
+    const healthy = await healthCheck()
+    appLog('[account] 已清空本机账号 health=' + healthy)
+    return {
+      ok: true,
+      message: healthy ? '已移除账号' : '账号已移除，后端仍在重启中'
+    }
+  } catch (e) {
+    return makeErr(10002, '移除账号失败：' + (e && e.message ? e.message : String(e)))
+  }
+}
+
 // ---------- 调试模式代理（Socks5/HTTP） ----------
 // 把出站代理写入本机 config.toml 的 [proxy] 段并重启后端。url 为空 = 清除代理直连。
 // 支持 http://host:port 与 socks5://host:port（后端 wreq 原生支持两种协议）。
@@ -761,8 +807,26 @@ async function readLoginFailureReason() {
 // ========== 后端部署（base64 内嵌二进制，运行时回写） ==========
 // 后端二进制已打包成 base64 内嵌在 backend-blob.js 中，首次运行时自动写入 /userdisk/ds-free-api
 
-import { BACKEND_B64, BACKEND_NAME, BACKEND_ARCH } from './backend-blob.js'
+import { BACKEND_B64, BACKEND_NAME, BACKEND_ARCH, BACKEND_SHA } from './backend-blob.js'
 import { httpRequest } from './http.js'
+
+// 已部署后端的版本标记：记录上次落盘的二进制摘要（BACKEND_SHA）。
+// 仅凭「文件存在且非空」跳过部署会让覆盖安装时后端永远停在旧版本
+// —— 后端修了 bug（如登录响应解析）用户却拿不到。见 deployBackend 快速路径。
+function backendMarkerPath() {
+  return joinDataDir('ds-backend.sha')
+}
+
+// 判断设备上已部署的后端是否就是当前内嵌的这份
+async function deployedBackendMatches() {
+  if (!BACKEND_SHA) return false
+  try {
+    const cur = String(await readFile(backendMarkerPath()) || '').trim()
+    return cur === BACKEND_SHA
+  } catch (e) {
+    return false
+  }
+}
 
 // 本二进制支持的 CPU 架构。BACKEND_ARCH 形如 "linux-aarch64-gnu"，取中段比较 uname -m。
 // 当前仅用于日志/诊断展示，不参与部署阻断（部署成败由 healthCheck 判定）。
@@ -780,14 +844,16 @@ export async function deployBackend() {
   // 一次性迁移旧目录里的 config.toml（幂等，见 migrateLegacyDir 注释）
   await migrateLegacyDir()
 
-  // 优化：目标二进制已存在且非空时，跳过 6MB base64 写盘 + 解码 + 比较（同一安装内
-  // 每次启动都做这些很慢）。只需 chmod +x 保执行位，直接视为 unchanged。
-  // 二进制更新由"卸载重装"保证（data 目录清空 → targetBin 不存在 → 走全量部署）。
+  // 快速路径：设备上已有二进制，且其摘要与本次内嵌的一致时才能跳过
+  // 6MB base64 写盘 + 解码（同一安装内每次启动都做这些很慢）。
+  // 摘要用 ds-backend.sha 记录（全量部署成功后写入）。注意不能用
+  // 「文件存在且非空」判断——那样覆盖安装（data 目录保留）时后端永远停在旧版本，
+  // 后端修了 bug 用户也拿不到；摘要匹配才真正说明是这一份。
   const targetBinExists = await exists(targetBin)
   if (targetBinExists) {
     const st = await statSize(targetBin)
-    if (st > 0) {
-      appLog('[deploy] 已存在且非空（size=' + st + '），跳过解码比较')
+    if (st > 0 && (await deployedBackendMatches())) {
+      appLog('[deploy] 已存在且摘要匹配（size=' + st + '），跳过解码比较')
       const resultFile = joinDataDir('ds-deploy-result.txt')
       await writeFile(resultFile, '')
       execShell('mkdir -p ' + shq(targetLogDir) + '; chmod +x ' + shq(targetBin) + '; printf unchanged > ' + shq(resultFile))
@@ -798,6 +864,8 @@ export async function deployBackend() {
       }
       // chmod/写结果失败则继续走全量部署
       appLog('[deploy] 快速路径失败 result=' + (result || '(空)') + '，走全量')
+    } else if (st > 0) {
+      appLog('[deploy] 已有二进制但摘要不匹配（内嵌 ' + (BACKEND_SHA || '无') + '），走全量部署更新后端')
     }
   }
 
@@ -839,7 +907,10 @@ export async function deployBackend() {
       return makeErr(10405, '更新后端二进制失败（result=' + (result || '空') + '，$dataDir=' + String($dataDir) + '，tmpBin=' + (tmpExists ? '存在' : '缺失') + '，targetBin=' + (targetExists ? '存在' : '缺失') + '）')
     }
     var backendUpdated = result === 'updated'
-    appLog('[deploy] ok updated=' + backendUpdated)
+    // 落盘摘要标记：下次启动摘要一致即可走快速路径跳过 6MB 解码。
+    // 解码成功（updated 或 unchanged）都写，失败路径不写、下次仍会重试。
+    if (BACKEND_SHA) await writeFile(backendMarkerPath(), BACKEND_SHA)
+    appLog('[deploy] ok updated=' + backendUpdated + ' sha=' + (BACKEND_SHA || '无'))
   } catch (e) {
     appLog('[deploy] EXCEPTION ' + (e && e.message ? e.message : String(e)))
     return makeErr(10002, '部署后端失败：' + (e && e.message ? e.message : String(e)))
@@ -993,60 +1064,29 @@ export async function readDsFreeApiPort() {
   return DS_PORTS[0]
 }
 
-// 探测本机是否安装了 WPE 浏览器 miniapp（appid 8001779591038449）
-// 各机型安装分区不同，逐个候选路径检查
-const BROWSER_APP_DIRS = [
-  '/userdisk/secondary/miniapp/data/mini_app/pkg/8001779591038449',
-  '/userdata/miniapp/data/mini_app/pkg/8001779591038449',
-  '/data/miniapp/data/mini_app/pkg/8001779591038449',
-]
-
-export async function detectBrowserApp() {
-  for (const dir of BROWSER_APP_DIRS) {
-    if (await exists(dir)) return true
-  }
-  return false
-}
-
-// 打开设备验证流程：
-// - 笔上有 WPE 浏览器 miniapp → navTo 直达本机验证页（真实 WebKit 跑官方 SDK）
-// - 没有浏览器 → 请求后端生成二维码（LAN 监听器 :22230），返回给界面展示，
-//   用户手机扫码在其真实浏览器完成验证，凭据经同一 WiFi 自动回写后端
-export async function openDeviceVerification(apiKey) {
-  const hasBrowser = await detectBrowserApp()
-  if (hasBrowser) {
+// 设备凭据（device_id）现在由后端**完全自动**生成：ds-free-api 启动时检测到
+// 账号缺凭据会直接走数美注册协议取得（用户无感），无需浏览器/扫码/任何操作。
+// 详见 ds-free-api/docs/deepseek-verification-analysis.md §5f。
+//
+// 本函数仅保留为**可选的自检入口**（调试模式用）：查询后端凭据补齐情况。
+export async function checkDeviceCredentials() {
+  try {
     const port = await readDsFreeApiPort()
-    const url =
-      'http://127.0.0.1:' + port + '/device?key=' + encodeURIComponent(String(apiKey || ''))
-    try {
-      $falcon.navTo('falcon://1779591038449/index', { url: url })
-      appLog('[device] 已拉起浏览器进行设备验证')
-      return { ok: true, mode: 'browser', message: '已打开浏览器，请在页面里完成验证后返回' }
-    } catch (e) {
-      appLog('[device] 拉起浏览器失败: ' + (e && e.message ? e.message : String(e)))
-      return makeErr(10002, '打开浏览器失败：' + (e && e.message ? e.message : String(e)))
+    const result = await httpRequest({
+      url: 'http://127.0.0.1:' + port + '/health',
+      method: 'GET',
+      timeout: 8000,
+    })
+    if (result.statusCode !== 200 || !result.data) {
+      return makeErr(10503, '后端未就绪（' + (result.error || 'HTTP ' + result.statusCode) + '）')
     }
-  }
-
-  // 无浏览器：二维码方案
-  const port = await readDsFreeApiPort()
-  const result = await httpRequest({
-    url: 'http://127.0.0.1:' + port + '/device/qr?key=' + encodeURIComponent(String(apiKey || '')),
-    method: 'GET',
-    timeout: 10000,
-  })
-  if (result.statusCode !== 200 || !result.data || !result.data.ok) {
-    const msg = (result.data && result.data.message) || result.error || ('HTTP ' + result.statusCode)
-    return makeErr(10002, '生成二维码失败：' + msg)
-  }
-  appLog('[device] 二维码已生成: ' + result.data.qr_path)
-  return {
-    ok: true,
-    mode: 'qr',
-    qrPath: result.data.qr_path,
-    url: result.data.url,
-    ip: result.data.ip,
-    message: '请用手机扫一扫（同一 WiFi），在手机浏览器里完成验证',
+    const total = (result.data.accounts && result.data.accounts.total) || 0
+    if (total > 0) {
+      return { ok: true, message: '设备凭据已就绪（' + total + ' 个账号可用）' }
+    }
+    return { ok: false, message: '账号尚未就绪：请确认账号密码正确；设备凭据由后端自动生成，无需手动操作' }
+  } catch (e) {
+    return makeErr(10503, '检查失败：' + (e && e.message ? e.message : String(e)))
   }
 }
 

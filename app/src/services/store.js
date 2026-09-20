@@ -301,3 +301,123 @@ export async function loadAccountTrouble() {
     return []
   }
 }
+
+// ---------- 账号（专用登录页） ----------
+// 账号真源是后端 config.toml 的 [[accounts]] 段（native.updateDsFreeApiAccount 写入）。
+// 这里只把 config 与用户输入的显示名缓存合并成登录页要的视图。
+//
+// 多账号暂缓：ds-free-api 的 config.toml 支持多个 [[accounts]]，但应用侧写入函数
+// （native.js updateDsFreeApiAccount / clearDsFreeApiAccount）只改写*第一个*段，
+// 所以登录页按「单账号」呈现——列出 config 里已有的账号、标出当前使用的一个。
+// 多账号完整增删需后端 /admin API 配合（后端已具备 add_account/remove_account 能力）。
+
+const KEY_ACCOUNTS = 'ds:accounts'
+const KEY_ACTIVE_ACCOUNT = 'ds:activeAccount'
+
+/// 解析 config.toml 中全部 [[accounts]] 段（只取标识字段，不读密码）
+function parseAllAccounts(raw) {
+  if (!raw) return []
+  const out = []
+  const sections = String(raw).split('[[accounts]]')
+  for (let i = 1; i < sections.length; i++) {
+    const seg = sections[i].split('\n[')[0]
+    const em = seg.match(/email\s*=\s*"([^"]*)"/)
+    const mo = seg.match(/mobile\s*=\s*"([^"]*)"/)
+    const email = em && em[1] ? em[1].trim() : ''
+    const mobile = mo && mo[1] ? mo[1].trim() : ''
+    const id = email || mobile
+    if (id) out.push({ id, email, mobile })
+  }
+  return out
+}
+
+function maskAccountId(id) {
+  const v = String(id || '')
+  const at = v.indexOf('@')
+  if (at > 0) {
+    const name = v.slice(0, at)
+    return name.slice(0, 2) + '***' + v.slice(at)
+  }
+  if (v.length >= 7) return v.slice(0, 3) + '****' + v.slice(-4)
+  return v
+}
+
+/// 账号列表（登录页用）：config.toml 账号 + 活动标记
+export async function loadAccountList() {
+  let fromConfig = []
+  try {
+    const raw = stripTomlComments(await readFile(dsConfigPath()))
+    fromConfig = parseAllAccounts(raw)
+  } catch (e) { /* 忽略 */ }
+
+  let cached = []
+  try {
+    const v = await getJSON(KEY_ACCOUNTS, [])
+    cached = Array.isArray(v) ? v : []
+  } catch (e) { /* 忽略 */ }
+
+  const active = (await getJSON(KEY_ACTIVE_ACCOUNT, '')) || ''
+  const merged = fromConfig.map((a) => {
+    const hit = cached.find((c) => c.id === a.id)
+    return {
+      id: a.id,
+      display: hit && hit.display ? hit.display : maskAccountId(a.id),
+      active: a.id === active,
+      state: ''
+    }
+  })
+  if (merged.length && !merged.some((m) => m.active)) merged[0].active = true
+  return merged
+}
+
+/// 记住账号（应用侧缓存；真源仍是 config.toml）
+export async function upsertAccount(id) {
+  try {
+    const list = await getJSON(KEY_ACCOUNTS, [])
+    const arr = Array.isArray(list) ? list : []
+    const key = String(id || '').trim()
+    if (!key) return false
+    if (!arr.some((a) => a.id === key)) {
+      arr.push({ id: key, display: maskAccountId(key), addedAt: Date.now() })
+      await setJSON(KEY_ACCOUNTS, arr.slice(-10))
+    }
+    return true
+  } catch (e) {
+    return false
+  }
+}
+
+/// 从缓存移除指定 id 的账号（登录页「移除」用）。
+/// 注意：账号真源是 config.toml，真正退出登录要调 native.clearDsFreeApiAccount()；
+/// 这里只负责清掉显示名缓存，避免移除后还留着旧昵称。
+export async function removeAccountById(id) {
+  try {
+    const key = String(id || '').trim()
+    if (!key) return false
+    const list = await getJSON(KEY_ACCOUNTS, [])
+    const arr = (Array.isArray(list) ? list : []).filter((a) => a && a.id !== key)
+    await setJSON(KEY_ACCOUNTS, arr)
+    return true
+  } catch (e) {
+    return false
+  }
+}
+
+/// 设置当前活动账号（登录页切换用）
+export async function setActiveAccount(id) {
+  try {
+    await setJSON(KEY_ACTIVE_ACCOUNT, String(id || ''))
+    return true
+  } catch (e) {
+    return false
+  }
+}
+
+/// 读取当前活动账号
+export async function loadActiveAccount() {
+  try {
+    return (await getJSON(KEY_ACTIVE_ACCOUNT, '')) || ''
+  } catch (e) {
+    return ''
+  }
+}

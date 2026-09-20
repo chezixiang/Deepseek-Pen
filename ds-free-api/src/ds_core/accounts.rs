@@ -723,6 +723,16 @@ async fn try_init_account(
         ));
     }
 
+    // 设备凭据兜底（用户无感）：缺有效 device_id 时即时 mint。
+    // 启动路径已由 device_bootstrap 批量补齐；此处覆盖运行时新增账号
+    // （管理面板/应用添加）与历史配置的漏网情况。
+    let (device_id, _smid) = crate::device_bootstrap::ensure_one(
+        &client.user_agent(),
+        &creds.device_id,
+        &creds.smid,
+    )
+    .await;
+
     let login_payload = LoginPayload {
         email: if creds.email.is_empty() {
             None
@@ -740,7 +750,7 @@ async fn try_init_account(
         } else {
             Some(creds.area_code.clone())
         },
-        device_id: creds.device_id.clone(),
+        device_id,
         os: "web".to_string(),
     };
 

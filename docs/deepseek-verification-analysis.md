@@ -284,6 +284,54 @@ deviceId（E2E 已证明签发后可通过 DeepSeek 登录校验），但**风�
    device.html 轮询回传 (uid, aesKey, iv, 加密前明文, 线缆请求体)
 2. 用真实浏览器捕获的配对数据做**判定实验**：
    - 原样重放真实请求 → **1100 + deviceId**（服务端不校验重放）
+   - 用真实 payload + 全新 uid/key 重新加密提交 → **1100**（加密链正确）
+   - 逐组替换字段（加密组 / 明数组 / 全替换）→ 全部 **1100**
+3. 结论：加密链、canonical 语义都与 JS 一致；差异在**字段完整性**
+4. 对比 Rust 产物与真实 payload：**Rust 少 5 个字段**（`dv/gs/ko/pu/td`）
+   —— 重写 payload 构造时被删漏。补齐后 **81 键完全对齐**。
+
+**最终验证**：
+- 宿主侧 `cargo run --example mint_probe`：**5/5 成功**（88 字符 device_id）
+- 笔上酸测（假密码账号）：`device_id 生成成功（88 字符）` →
+  登录返回 `PASSWORD_OR_USER_NAME_IS_WRONG` → **凭据通过数美设备校验**
+  （未触发 biz_code 11），停在账号密码环节
+
+**关键技术点（供未来参考）**：
+- canonical 序列化（`_0x22bd14` 的 md5 输入）真实语义：**顶层按键排序**，
+  顶层数字 ×10000，**嵌套对象不递归**（`'' + {}` → `"[object Object]"`），
+  数组 → 逗号连接。我最初的递归实现是错的（已修正并有测试锁定）
+- 请求体 7 字段：`appId / organization / ep / data / os:"web" /
+  encode:5 / compress:2`（后三个是编码链元数据）
+- 调试开关保留：`DS_MINT_DUMP=<path>` 落盘 payload/body 供离线比对
+
+### 5g. 最终方案定型（2026-09-20）：纯后端自动，用户零操作
+
+经过 §5c（WPE 浏览器 navTo）、§5d–5f（纯 Rust mint）两条路径的实践，最终定型为：
+
+**device_id 完全由后端自动生成，用户/应用都无需任何操作。**
+
+- 后端 `device_bootstrap::ensure_device_credentials`：启动时为所有缺凭据的账号
+  mint 并持久化（幂等：已有 `B`/`D` 前缀凭据的跳过）
+- `try_init_account` 里再兜一层 `ensure_one`：覆盖运行时新增账号（应用/管理面板）
+- app 侧只需填写账号密码，登录成功后凭据已就绪
+
+**被废弃的路径与原因**：
+- **WPE 浏览器 navTo**：`detectBrowserApp()` 用 app 沙箱的 fs 读
+  `/userdisk/secondary/miniapp/.../8001779591038449`——该目录权限 `drwx------`
+  （700，root 独占），沙箱读不到 → 检测恒为 false → 永远走不到浏览器分支
+  （bug 报告 1 的根因）。且该浏览器 miniapp 并非所有机型都有（用户已确认）。
+- **手机扫码**：需要用户手机、同一 WiFi、理解成本高（用户反馈"不明白是什么鬼"），
+  在纯后端方案面前完全冗余。
+
+`pages/login/login.vue`（专用登录页 + 账号管理）是新的用户入口；设置页只保留
+账号状态展示与跳转入口。
+
+**排查方法（一次跑通的关键）**：
+1. 给 fp.min.js 打补丁（`tools/fp-reverse/patch-canonical.js`）暴露 canonical
+   拼接串，另在 `/device/fp-patched.js` 由后端**同源**提供补丁版 SDK，
+   device.html 轮询回传 (uid, aesKey, iv, 加密前明文, 线缆请求体)
+2. 用真实浏览器捕获的配对数据做**判定实验**：
+   - 原样重放真实请求 → **1100 + deviceId**（服务端不校验重放）
    - 用真实 payload + 全新 uid/key 重新加密提交 → **1100**（我的加密链正确）
    - 逐组替换字段（加密组 / 明数组 / 全替换）→ 全部 **1100**
 3. 结论：加密链、canonical 语义都与 JS 一致；差异在**字段完整性**

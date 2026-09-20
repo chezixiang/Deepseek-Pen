@@ -2,6 +2,7 @@
 // 把 backend 二进制转成 base64 内嵌到 JS 模块，供 deployBackend() 运行时写入 /userdisk
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const backendDir = path.resolve('backend');
 const outFile = path.resolve('src/services/backend-blob.js');
@@ -35,16 +36,22 @@ const data = fs.readFileSync(src)
 const b64 = data.toString('base64')
 const blobName = path.basename(src)
 const archTag = archTagFor(src)
+// 二进制内容摘要（前 16 位十六进制）：运行时用它判断设备上已部署的后端
+// 是否就是这个版本。只比对「文件存在且非空」会让覆盖安装时后端永远不更新
+// （见 native.js deployBackend 的快速路径）。
+const sha = crypto.createHash('sha256').update(data).digest('hex').slice(0, 16)
 
 const content = `// 此文件由 scripts/inline-backend.js 自动生成，不要手动编辑。
 // 内嵌 ds-free-api 二进制（${blobName}，base64，架构 ${archTag}）
 export const BACKEND_B64 = ${JSON.stringify(b64)}
 export const BACKEND_NAME = ${JSON.stringify(blobName)}
 export const BACKEND_ARCH = ${JSON.stringify(archTag)}
+export const BACKEND_SHA = ${JSON.stringify(sha)}
 `
 
 fs.writeFileSync(outFile, content)
 console.log('内嵌完成:', outFile)
 console.log('架构标签:', archTag)
+console.log('二进制摘要:', sha)
 console.log('原始大小:', (data.length / 1024).toFixed(1), 'KB')
 console.log('Base64 长度:', (b64.length / 1024).toFixed(1), 'KB')

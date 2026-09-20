@@ -91,41 +91,9 @@ pub async fn run(mut config: Config, config_path: PathBuf) -> anyhow::Result<()>
     let host = config.server.host.clone();
     let port = config.server.port;
 
-    // 设备凭据补齐：账号的 device_id 不是数美签发格式（'B'/'D' 前缀）时，
-    // 通过纯 Rust 注册请求伪造向 deviceprofile/v4 取得真实凭据并持久化。
-    // 失败不阻断启动（沿用旧凭据重试登录，行为与升级前一致）。
-    {
-        let ua = config.deepseek.user_agent.clone();
-        for acct in config.accounts.iter_mut() {
-            let looks_issued =
-                acct.device_id.starts_with('B') || acct.device_id.starts_with('D');
-            if looks_issued {
-                continue;
-            }
-            log::info!(
-                target: "device_mint",
-                "账号 {} 缺少数美签发的 device_id，正在通过注册协议生成…",
-                if acct.email.is_empty() { acct.mobile.as_str() } else { acct.email.as_str() }
-            );
-            match crate::ds_core::mint_device_id(&ua).await {
-                Ok(id) => {
-                    log::info!(target: "device_mint", "device_id 生成成功（{} 字符）", id.len());
-                    acct.device_id = id;
-                    if !acct.smid.is_empty() {
-                        // smid 由注册流程同步生成，无需变更
-                    }
-                }
-                Err(e) => {
-                    log::warn!(target: "device_mint", "device_id 生成失败（登录可能被设备风控拒绝）: {e}");
-                }
-            }
-        }
-        if config.accounts.iter().any(|a| a.device_id.starts_with('B')) {
-            if let Err(e) = config.save(&config_path) {
-                log::warn!(target: "device_mint", "凭据持久化失败: {e}");
-            }
-        }
-    }
+    // 设备凭据补齐（用户无感）：账号缺数美签发的 device_id 时自动 mint 并持久化。
+    // 详见 docs/deepseek-verification-analysis.md §5f。
+    crate::device_bootstrap::ensure_device_credentials(&mut config, &config_path).await;
 
     let adapter = Arc::new(OpenAIAdapter::new(&config).await?);
     let config = Arc::new(tokio::sync::RwLock::new(config));

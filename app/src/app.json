@@ -1,6 +1,7 @@
 {
   "pages": {
     "startup": "pages/startup/startup.vue",
+    "login": "pages/login/login.vue",
     "index": "pages/index/index.vue",
     "settings": "pages/settings/settings.vue"
   },

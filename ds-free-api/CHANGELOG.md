@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.13] - 2026-09-20
+
+### Fixed（登录失败：上游为空值字段导致反序列化中断）
+- **`ChatMute.mute_until` / `is_muted` 遇到 JSON `null` 时整个登录响应解析失败**：
+  上游在账号**未禁言**时会显式返回 `"mute_until": null`，而 `#[serde(default)]`
+  只在字段**缺失**时生效 —— 于是最常见的正常账号反而登录不了，账号池恒为
+  `total: 0`、服务一直降级运行，应用侧表现为"账号密码都对但用不了"。
+  实测报错：`invalid type: null, expected f64 at line 1 column 375`。
+  改为 `deserialize_with = "null_to_default"`（null 当作字段缺失回落默认值），
+  并补 4 个回归单测覆盖：null / 真实禁言时间 / 空 chat 对象 / 无 chat 字段。
+
+## [0.2.12] - 2026-09-20
+
+### Changed（设备凭据改为纯后端自动，用户零操作）
+- **新增 `device_bootstrap` 模块**：启动时为所有缺凭据的账号自动 mint device_id
+  并持久化（幂等：已有 `B`/`D` 前缀凭据跳过）；`try_init_account` 再兜一层
+  `ensure_one` 覆盖运行时新增账号（应用/管理面板添加）
+- `mint_device_id` 返回 `(device_id, smid)` 并自带 `B` 前缀，注册流程产出的
+  smidV2 一并写入配置（保持 device_id + smid 双绑定与真实浏览器一致）
+- `DsClient::user_agent()` 访问器（凭据生成复用同一浏览器身份）
+
+### Removed（app 侧废弃的验证路径）
+- **WPE 浏览器 navTo 方案**：`detectBrowserApp()` 用 app 沙箱读
+  `/userdisk/secondary/miniapp/.../8001779591038449`，该目录权限 700（root 独占），
+  沙箱读不到导致检测恒为 false → 浏览器分支永不执行（bug 报告 1 的根因）；
+  且该浏览器 miniapp 并非所有机型都预装
+- **手机扫码方案**：需用户手机 + 同一 WiFi + 理解成本高，被纯后端方案取代
+- 设置页的"设备验证"子块（改为跳转专用登录页）
+
 ## [0.2.11] - 2026-09-20
 
 ### Added（纯 Rust device_id 生成：deviceprofile 注册协议逆向完成）

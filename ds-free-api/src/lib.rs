@@ -2,6 +2,7 @@
 
 pub mod anthropic_compat;
 pub mod config;
+pub mod device_bootstrap;
 pub mod ds_core;
 pub mod openai_adapter;
 pub mod server;

@@ -17,27 +17,19 @@
                 </div>
             </div>
 
-            <!-- 内置 ds-free-api：DeepSeek 官方账号密码 -->
+            <!-- 内置 ds-free-api：账号由专用登录页管理（本页只显示状态 + 入口） -->
             <template v-if="form.authMode === 'builtin'">
                 <div :class="dc('field')">
-                    <text :class="dc('label')">DeepSeek 账号（邮箱或手机号）</text>
-                    <div :class="dc('input')" @click="editField('dsUser')">
-                        <text :class="form.dsUser ? dc('input-text') : dc('input-text-ph')">{{ form.dsUser || '点击输入' }}</text>
+                    <text :class="dc('label')">DeepSeek 账号</text>
+                    <div :class="dc('acct-row')">
+                        <text :class="dc('acct-name')">{{ maskedDsUser }}</text>
+                        <text :class="form.dsConfigured ? dc('acct-ok') : dc('acct-bad')">{{ form.dsConfigured ? '已登录' : '未登录' }}</text>
                     </div>
                 </div>
-                <div :class="dc('field')">
-                    <text :class="dc('label')">DeepSeek 密码</text>
-                    <div :class="dc('input')" @click="editField('dsPass')">
-                        <text :class="form.dsPass ? dc('input-text') : dc('input-text-ph')">{{ dsPassDisplay() }}</text>
-                    </div>
-                </div>
-                <text :class="form.dsConfigured ? dc('field-hint') : dc('field-hint-warn')">{{ form.dsConfigured ? '已配置账号，可直接对话' : '未配置账号，请填写后保存' }}</text>
                 <text v-if="trouble.length" :class="dc('field-hint-warn')">⚠️ 最近账号异常 {{ trouble.length }} 次，最早检出 {{ fmtTime(trouble[0].t) }}（{{ trouble[0].kind }}）：{{ trouble[0].message }}</text>
                 <div :class="dc('field')">
-                    <text :class="dc('label')">设备验证（登录被设备风控拒绝时使用）</text>
-                    <text :class="dc('chip')" @click="openDeviceVerify">打开本机浏览器生成设备凭据</text>
-                    <text :class="dc('field-hint')">将在本机浏览器中运行 DeepSeek 官方设备组件，自动生成凭据并写入配置，完成后返回本应用重新保存账号</text>
-                    <text v-if="deviceVerifyMsg" :class="dc('field-hint')">{{ deviceVerifyMsg }}</text>
+                    <text :class="dc('nav-btn')" @click="goLogin">{{ form.dsConfigured ? '管理账号 / 切换' : '去登录' }}</text>
+                    <text :class="dc('field-hint')">登录、切换账号、退出登录都在登录页完成；设备凭据由后端自动生成，无需手动操作</text>
                 </div>
             </template>
 
@@ -184,7 +176,7 @@
 <script>
 import { MODES } from '../../services/ds.js'
 import { DEFAULT_SETTINGS, APP_VERSION, loadSettings, saveSettings, loadConversations, saveConversations, deleteMessages, saveActiveId, readLocalDsPass, loadAccountTrouble } from '../../services/store.js'
-import { openTextEditor, updateDsFreeApiAccount, readDsFreeApiProxy, updateDsFreeApiProxy, validateProxyUrl, openDeviceVerification, INPUT_TYPES, deployBackend, ensureBackendRunning } from '../../services/native.js'
+import { openTextEditor, updateDsFreeApiAccount, readDsFreeApiProxy, updateDsFreeApiProxy, validateProxyUrl, INPUT_TYPES, deployBackend, ensureBackendRunning } from '../../services/native.js'
 import { appLog, appLogTail, appLogClear, backendLogTail, backendLogClear } from '../../services/app-log.js'
 import { ensureEmojiFont } from '../../services/emoji-font.js'
 
@@ -218,7 +210,6 @@ export default {
             emojiFontMsg: '',
             proxyUrl: '',
             proxyMsg: '',
-            deviceVerifyMsg: '',
             trouble: []
         }
     },
@@ -244,6 +235,15 @@ export default {
         visibleModes() {
             // 模型已合并，MODES 只剩一项；保留该 computed 以兼容多模式重新上线的情况
             return MODES
+        },
+        // 账号在设置页只做展示，按邮箱/手机号各自掩码（避免整串明文暴露在设置页）
+        maskedDsUser() {
+            const v = String((this.form && this.form.dsUser) || '')
+            if (!v) return '未登录'
+            const at = v.indexOf('@')
+            if (at > 0) return v.slice(0, 2) + '***' + v.slice(at)
+            if (v.length >= 7) return v.slice(0, 3) + '****' + v.slice(-4)
+            return v
         }
     },
     methods: {
@@ -377,27 +377,13 @@ export default {
         // 设备验证：拉起本机 WPE 浏览器（miniapp 1779591038449）打开后端
         // /device 辅助页，在真实浏览器环境运行官方数美 SDK 生成 device_id，
         // 由页面直接回写后端配置并重新登录。纯笔内完成。
-        async openDeviceVerify() {
-            if (this.form.authMode !== 'builtin') {
-                this.deviceVerifyMsg = '自定义端点模式无需设备验证（由服务端处理）'
-                this.$forceUpdate()
-                return
-            }
-            this.deviceVerifyMsg = '正在确认后端状态…'
-            this.$forceUpdate()
+                // 账号管理已移至专用登录页（pages/login）：设置页只保留入口。
+        goLogin() {
             try {
-                const r = await ensureBackendRunning()
-                if (!r.ok) {
-                    this.deviceVerifyMsg = '后端未就绪：' + (r.message || '请稍后重试')
-                    this.$forceUpdate()
-                    return
-                }
-                const result = await openDeviceVerification(this.form.apiKey || '')
-                this.deviceVerifyMsg = result.message
+                $falcon.navTo('login')
             } catch (e) {
-                this.deviceVerifyMsg = '启动失败：' + (e && e.message ? e.message : String(e))
+                appLog('[settings] 跳转登录页失败: ' + (e && e.message ? e.message : String(e)))
             }
-            this.$forceUpdate()
         },
         // 出站代理（调试模式）：写入本机后端 config.toml 的 [proxy] 段并重启后端。
         // 留空提交 = 清除代理恢复直连。
@@ -656,6 +642,37 @@ export default {
 .modes {
     flex-direction: row;
     align-items: center;
+}
+/* 账号展示行：账号名左、状态右，比裸文本更易读 */
+.acct-row {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    height: 40px;
+    background-color: #f2f3f5;
+    border-radius: 8px;
+    padding: 0 12px;
+}
+.acct-name {
+    font-size: 18px;
+    color: #222222;
+}
+.acct-ok {
+    font-size: 16px;
+    color: #188038;
+}
+.acct-bad {
+    font-size: 16px;
+    color: #d93025;
+}
+/* 跳转按钮：整行按钮比 chip 更像可点击的入口 */
+.nav-btn {
+    font-size: 18px;
+    color: #1a73e8;
+    text-align: center;
+    background-color: #eef4fe;
+    border-radius: 8px;
+    padding: 10px 0;
 }
 .chip {
     font-size: 18px;
@@ -936,6 +953,35 @@ export default {
     padding: 10px 16px;
     border-bottom-width: 1px;
     border-bottom-color: #2a2a2a;
+}
+.acct-row-dark {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    height: 40px;
+    background-color: #2a2a2a;
+    border-radius: 8px;
+    padding: 0 12px;
+}
+.acct-name-dark {
+    font-size: 18px;
+    color: #ffffff;
+}
+.acct-ok-dark {
+    font-size: 16px;
+    color: #81c995;
+}
+.acct-bad-dark {
+    font-size: 16px;
+    color: #ff8a80;
+}
+.nav-btn-dark {
+    font-size: 18px;
+    color: #82b1ff;
+    text-align: center;
+    background-color: #1e2a3a;
+    border-radius: 8px;
+    padding: 10px 0;
 }
 
 /* ========== 诊断日志面板（#6/#11）：固定适配横屏 936×280 ========== */

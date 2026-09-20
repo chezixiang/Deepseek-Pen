@@ -95,7 +95,7 @@ export default {
                 this.status = 'ready'
                 this.statusDetail = '已使用自定义服务地址'
                 setTimeout(() => {
-                    this.$app.router.replace({ uri: '/index' })
+                    $falcon.navTo('index')
                 }, 300)
                 return
             }
@@ -111,10 +111,21 @@ export default {
 
             // 快速确认一次（后端可能还在登录 DeepSeek，health 已通但账号未就绪时也允许进入）
             const quick = await checkBackendHealth({ maxAttempts: 1, interval: 0 })
+
+            // 未配置账号 → 进专用登录页（首次使用的主入口）；已配置 → 直接进主页
+            // （老用户升级后无感）。dsConfigured 由 loadSettings 从本机 config.toml
+            // 的 [[accounts]] 段探测。
+            let configured = false
+            try {
+                const s2 = await loadSettings()
+                configured = !!(s2 && s2.dsConfigured)
+            } catch (e) { /* 探测失败按未配置处理 */ }
+
             this.status = 'ready'
             this.statusDetail = quick.warning || '后端服务已就绪'
+            const target = configured ? '/index' : '/login'
             setTimeout(() => {
-                this.$app.router.replace({ uri: '/index' })
+                $falcon.navTo(target === '/login' ? 'login' : 'index')
             }, 300)
         },
         
@@ -141,7 +152,7 @@ export default {
                     }
 
                     setTimeout(() => {
-                        this.$app.router.replace({ uri: '/index' })
+                        $falcon.navTo('index')
                     }, 500)
                 } else {
                     this.statusDetail = result.error || '正在等待后端服务...'

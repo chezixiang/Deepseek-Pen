@@ -303,8 +303,12 @@ fn chrono_rw_string() -> String {
     )
 }
 
-/// 执行一次注册，返回服务端签发的 device_id（'B' 前缀 + base64 体）
-pub async fn mint_device_id(user_agent: &str) -> Result<String, String> {
+/// 执行一次注册，返回 `(device_id, smid)`。
+///
+/// device_id 为服务端签发的 base64 体（调用方负责加 'B' 前缀，
+/// 见 device_bootstrap::is_issued）；smid 为注册流程中本地生成的 smidV2，
+/// 与 device_id 构成同一设备身份的两半（真实浏览器两者同源）。
+pub async fn mint_device_id(user_agent: &str) -> Result<(String, String), String> {
     let uid = uuid_v4();
     let smid = gen_smid_v2();
 
@@ -394,7 +398,7 @@ pub async fn mint_device_id(user_agent: &str) -> Result<String, String> {
             .and_then(|d| d.as_str())
             .filter(|s| !s.is_empty())
         {
-            return Ok(id.to_string());
+            return Ok((format!("B{id}"), smid));
         }
     }
     Err(format!("注册未通过: {}", &text[..text.len().min(200)]))
