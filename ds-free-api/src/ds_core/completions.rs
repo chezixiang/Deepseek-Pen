@@ -1257,6 +1257,10 @@ impl Completions {
             config.deepseek.client_bundle_id.clone(),
             config.deepseek.client_timezone_offset,
             config.proxy.url.as_deref(),
+            crate::ds_core::client::preloaded_cookies_from_accounts(&config.accounts),
+            config.deepseek.hif_leim.clone(),
+            config.deepseek.hif_dliq.clone(),
+            config.deepseek.hif_auto_fetch,
         );
         let wasm_bytes = client.get_wasm().await?;
         let solver = PowSolver::new(&wasm_bytes)?;

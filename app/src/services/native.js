@@ -299,9 +299,25 @@ function replaceApiKey(raw, apiKey) {
   return raw + (raw.endsWith('\n') ? '' : '\n') + apiKeyBlock
 }
 
-// 行级修复 [deepseek] 段的旧版指纹（Chrome/151 Edg UA、Android/35、2.0.4），
-// 与 rquest Emulation::Chrome136 的 TLS 指纹对齐；只替换命中旧值的行，保留其它配置。
-const NEW_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36'
+// 行级修复 [deepseek] 段的旧版指纹（Chrome/151 Edg UA、Android/35、2.0.4，
+// 以及更早的 Windows 桌面 Chrome 136），与 rquest Emulation::Chrome136 的
+// TLS 指纹对齐，并把浏览器身份切到目标平台 Linux aarch64（词典笔原生平台，
+// UA/平台与真实硬件一致；Windows UA 在 ARM64 Linux 设备上是可识别的错配）。
+// 只替换命中旧值的行，保留其它配置。
+const NEW_USER_AGENT = 'Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36'
+
+// 需要改写为 Linux aarch64 UA 的历史值：旧版 Chrome/151 + Edg、Android 端 UA、
+// Windows 桌面 UA、以及 x86_64 的 Linux UA（目标平台是 aarch64）
+function isOutdatedUserAgent(val) {
+  if (val.indexOf('X11; Linux aarch64') >= 0) return false
+  return (
+    val.indexOf('Chrome/') >= 0 ||
+    val.indexOf('Edg/') >= 0 ||
+    val.indexOf('Android/') >= 0 ||
+    val.indexOf('Windows NT') >= 0 ||
+    val.trim() === ''
+  )
+}
 
 function fixFingerprint(raw) {
   const lines = String(raw || '').split('\n')
@@ -324,7 +340,7 @@ function fixFingerprint(raw) {
     const val = kv[2]
     seen[key] = true
     lastDeepseekLine = i
-    if (key === 'user_agent' && (val.indexOf('Chrome/151') >= 0 || val.indexOf('Edg/151') >= 0 || val.indexOf('Android/35') >= 0)) {
+    if (key === 'user_agent' && isOutdatedUserAgent(val)) {
       lines[i] = 'user_agent = "' + NEW_USER_AGENT + '"'
       changed = true
     } else if (key === 'client_version' && (val === '2.0.4' || val === '2.0.3' || val === '2.3.0' || val === '2.4.0')) {
@@ -485,6 +501,131 @@ export async function updateDsFreeApiAccount(user, pass) {
   }
 }
 
+// ---------- 调试模式代理（Socks5/HTTP） ----------
+// 把出站代理写入本机 config.toml 的 [proxy] 段并重启后端。url 为空 = 清除代理直连。
+// 支持 http://host:port 与 socks5://host:port（后端 wreq 原生支持两种协议）。
+// 该代理作用于 ds-free-api → chat.deepseek.com 的全部出站请求（含 PoW wasm 下载），
+// 用于调试模式下的抓包/内网穿透/绕过 WAF；应用自身访问 127.0.0.1 后端不走代理。
+
+// 校验代理 URL：允许 http/https/socks5/socks5h，host 非空；返回错误文案或 null
+export function validateProxyUrl(url) {
+  const s = String(url || '').trim()
+  if (!s) return null // 空 = 清除代理，合法
+  const m = s.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/([^/?#]+)$/)
+  if (!m) return '格式不正确（形如 socks5://192.168.1.5:1080 或 http://192.168.1.5:7890）'
+  const scheme = m[1].toLowerCase()
+  if (scheme !== 'http' && scheme !== 'https' && scheme !== 'socks5' && scheme !== 'socks5h') {
+    return '仅支持 http/https/socks5 代理'
+  }
+  let authority = m[2]
+  const at = authority.lastIndexOf('@')
+  if (at >= 0) authority = authority.slice(at + 1)
+  const host = authority.replace(/:\d+$/, '')
+  if (!host) return '缺少主机地址'
+  return null
+}
+
+// 行级替换 [proxy] 段（纯字符串操作）；url 为空时整段移除，否则段尾追加/改写
+function replaceProxySection(raw, url) {
+  const lines = String(raw || '').split('\n')
+  let start = -1
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim() === '[proxy]') {
+      start = i
+      break
+    }
+  }
+  let end = lines.length
+  if (start >= 0) {
+    for (let i = start + 1; i < lines.length; i++) {
+      if (lines[i].trim().startsWith('[')) {
+        end = i
+        break
+      }
+    }
+  }
+  const before = lines.slice(0, start >= 0 ? start : lines.length)
+  const after = lines.slice(end)
+  if (!url) {
+    return before.concat(after).join('\n')
+  }
+  const block = ['[proxy]', 'url = "' + tomlEscape(url) + '"']
+  return before.concat(block, after).join('\n')
+}
+
+// 读取当前 [proxy].url（未配置返回 ''）
+export async function readDsFreeApiProxy() {
+  const raw = String((await readFile(dsConfigPath())) || '')
+  let start = -1
+  const lines = raw.split('\n')
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim() === '[proxy]') {
+      start = i
+      break
+    }
+  }
+  if (start < 0) return ''
+  for (let i = start + 1; i < lines.length; i++) {
+    const trimmed = lines[i].trim()
+    if (trimmed.startsWith('[')) break
+    const kv = trimmed.match(/^url\s*=\s*"([^"]*)"/)
+    if (kv) return kv[1]
+  }
+  return ''
+}
+
+/**
+ * 更新本机 ds-free-api 的出站代理并重启服务（调试模式用）。
+ * @param {string} url 代理地址（http/https/socks5/socks5h），空串 = 清除代理直连
+ * 返回 { ok, message }。写入即生效（配置已落盘 + 后端已重启 + 探活）。
+ */
+export async function updateDsFreeApiProxy(url) {
+  const clean = String(url || '').trim()
+  const invalid = validateProxyUrl(clean)
+  if (invalid) return makeErr(10001, '代理地址' + invalid)
+  const DS_CONFIG = dsConfigPath()
+  try {
+    const raw = await readFile(DS_CONFIG)
+    if (raw === null) return makeErr(10201, '无法读取 ds-free-api 配置文件（路径：' + DS_CONFIG + '）')
+    const next = replaceProxySection(raw, clean)
+    if (next === raw) return { ok: true, message: clean ? '代理未变化' : '本就未配置代理' }
+
+    // 备份 + 原子写入，等待 execShell 完成（与账号更新同款可靠模式）
+    const tmp = joinDataDir('dsproxy.tmp.toml')
+    const resultFile = joinDataDir('dsproxy-result.txt')
+    const writeOk = await writeFile(tmp, next)
+    if (!writeOk) return makeErr(10402, '写入临时配置文件失败')
+    await writeFile(resultFile, '')
+    const cmd =
+      'cp ' + shq(DS_CONFIG) + ' ' + shq(DS_CONFIG + '.bak') + ' && ' +
+      'cp ' + shq(tmp) + ' ' + shq(DS_CONFIG + '.new') + ' && ' +
+      'mv -f ' + shq(DS_CONFIG + '.new') + ' ' + shq(DS_CONFIG) + ' && ' +
+      'printf ok > ' + shq(resultFile) + ' || printf failed > ' + shq(resultFile)
+    if (!execShell(cmd)) return makeErr(10403, '启动配置更新命令失败')
+    const result = String(await waitForFile(resultFile, 10000) || '').trim()
+    execShell('rm -f ' + shq(tmp) + ' ' + shq(resultFile) + ' ' + shq(DS_CONFIG + '.new') + ' 2>/dev/null || true')
+    if (result !== 'ok') return makeErr(10403, '写入配置文件失败')
+
+    // 重启后端使代理生效
+    const restartResult = await restartDsFreeApi()
+    if (!restartResult.ok) return restartResult
+
+    const healthy = await healthCheck()
+    appLog('[proxy] 已' + (clean ? '设置' : '清除') + '代理 health=' + healthy + ' url=' + (clean || '(直连)'))
+    if (clean) {
+      return {
+        ok: true,
+        message: healthy
+          ? '代理已生效：' + clean
+          : '代理已写入并重启后端，但探活未通过——请确认代理可用且地址正确'
+      }
+    }
+    return { ok: true, message: healthy ? '已恢复直连' : '已恢复直连并重启后端，探活未通过' }
+  } catch (e) {
+    return makeErr(10002, '更新代理失败：' + (e && e.message ? e.message : String(e)))
+  }
+}
+
 async function restartDsFreeApi() {
   const DS_FREE_API_DIR = dsHomeDir()
   const binPath = joinPath(DS_FREE_API_DIR, 'ds-free-api')
@@ -596,6 +737,7 @@ async function readLoginFailureReason() {
     // 只看尾部 120 行（本次启动的日志），从后往前找第一条匹配的原因
     const tail = lines.slice(-120).reverse()
     const patterns = [
+      { re: /RISK_DEVICE|设备风控|device_id/i, msg: '设备指纹被风控拒绝：请在 PC 浏览器登录一次 chat.deepseek.com，从 users/login 请求体抓取真实 device_id 填入账号配置' },
       { re: /人机验证|captcha/i, msg: '需要完成人机验证（请在设置里打开验证链接）' },
       { re: /禁言|user_is_muted/i, msg: '该账号已被禁言，到期前请更换账号' },
       { re: /密码错误|wrong password|invalid.*password|账号或密码/i, msg: '账号或密码错误' },
@@ -620,6 +762,7 @@ async function readLoginFailureReason() {
 // 后端二进制已打包成 base64 内嵌在 backend-blob.js 中，首次运行时自动写入 /userdisk/ds-free-api
 
 import { BACKEND_B64, BACKEND_NAME, BACKEND_ARCH } from './backend-blob.js'
+import { httpRequest } from './http.js'
 
 // 本二进制支持的 CPU 架构。BACKEND_ARCH 形如 "linux-aarch64-gnu"，取中段比较 uname -m。
 // 当前仅用于日志/诊断展示，不参与部署阻断（部署成败由 healthCheck 判定）。
@@ -738,6 +881,8 @@ export async function deployBackend() {
   // 写入最小 config.toml（供后续 updateDsFreeApiAccount 改写 [[accounts]]）。
   // model_types 只有 "default"：官方 2026-09-12 合并了快速/专家/识图，
   // expert 与 vision 已 enabled:false，default 自带图片理解（file_feature.vision=true）。
+  // 浏览器指纹统一 Linux aarch64 Chrome 136（与后端 Emulation::Chrome136 的
+  // TLS 指纹同大版本，且与词典笔真实硬件平台一致）。
   const minConfig = [
     '[server]',
     'port = 22217',
@@ -746,7 +891,7 @@ export async function deployBackend() {
     '[deepseek]',
     'api_base = "https://chat.deepseek.com/api/v0"',
     'wasm_url = "https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm"',
-    'user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"',
+    'user_agent = "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"',
     'client_version = "2.5.0"',
     'client_platform = "web"',
     'client_locale = "zh_CN"',
@@ -756,6 +901,8 @@ export async function deployBackend() {
     // 实测 input_character_limit = 2621440；旧模板写 4096 会把长上下文提前截断
     'max_input_tokens = [1048576]',
     'max_output_tokens = [384000]',
+    // 每账号每小时请求上限（上游实测 ~215 次/小时会触发禁言；0 = 不限制）
+    'hourly_request_quota = 60',
     '',
     '[[accounts]]',
     'email = ""',
@@ -829,6 +976,78 @@ async function doEnsureBackend() {
   }
   appLog('[ensure] DONE')
   return { ok: true, message: deployResult.message }
+}
+
+// 探测当前存活的后端端口（健康检查逐口探测，返回第一个 ok 的端口；全挂时回 22217）
+export async function readDsFreeApiPort() {
+  for (const port of DS_PORTS) {
+    const probe = joinDataDir('dsport_' + Date.now() + '_' + port + '.txt')
+    await writeFile(probe, '')
+    execShell('curl -s -m 1 http://127.0.0.1:' + port + '/health > ' + shq(probe) + ' 2>&1')
+    const out = await waitForFile(probe, 1500)
+    execShell('rm -f ' + shq(probe) + ' 2>/dev/null || true')
+    if (out !== null && String(out).indexOf('"status":"ok"') >= 0) {
+      return port
+    }
+  }
+  return DS_PORTS[0]
+}
+
+// 探测本机是否安装了 WPE 浏览器 miniapp（appid 8001779591038449）
+// 各机型安装分区不同，逐个候选路径检查
+const BROWSER_APP_DIRS = [
+  '/userdisk/secondary/miniapp/data/mini_app/pkg/8001779591038449',
+  '/userdata/miniapp/data/mini_app/pkg/8001779591038449',
+  '/data/miniapp/data/mini_app/pkg/8001779591038449',
+]
+
+export async function detectBrowserApp() {
+  for (const dir of BROWSER_APP_DIRS) {
+    if (await exists(dir)) return true
+  }
+  return false
+}
+
+// 打开设备验证流程：
+// - 笔上有 WPE 浏览器 miniapp → navTo 直达本机验证页（真实 WebKit 跑官方 SDK）
+// - 没有浏览器 → 请求后端生成二维码（LAN 监听器 :22230），返回给界面展示，
+//   用户手机扫码在其真实浏览器完成验证，凭据经同一 WiFi 自动回写后端
+export async function openDeviceVerification(apiKey) {
+  const hasBrowser = await detectBrowserApp()
+  if (hasBrowser) {
+    const port = await readDsFreeApiPort()
+    const url =
+      'http://127.0.0.1:' + port + '/device?key=' + encodeURIComponent(String(apiKey || ''))
+    try {
+      $falcon.navTo('falcon://1779591038449/index', { url: url })
+      appLog('[device] 已拉起浏览器进行设备验证')
+      return { ok: true, mode: 'browser', message: '已打开浏览器，请在页面里完成验证后返回' }
+    } catch (e) {
+      appLog('[device] 拉起浏览器失败: ' + (e && e.message ? e.message : String(e)))
+      return makeErr(10002, '打开浏览器失败：' + (e && e.message ? e.message : String(e)))
+    }
+  }
+
+  // 无浏览器：二维码方案
+  const port = await readDsFreeApiPort()
+  const result = await httpRequest({
+    url: 'http://127.0.0.1:' + port + '/device/qr?key=' + encodeURIComponent(String(apiKey || '')),
+    method: 'GET',
+    timeout: 10000,
+  })
+  if (result.statusCode !== 200 || !result.data || !result.data.ok) {
+    const msg = (result.data && result.data.message) || result.error || ('HTTP ' + result.statusCode)
+    return makeErr(10002, '生成二维码失败：' + msg)
+  }
+  appLog('[device] 二维码已生成: ' + result.data.qr_path)
+  return {
+    ok: true,
+    mode: 'qr',
+    qrPath: result.data.qr_path,
+    url: result.data.url,
+    ip: result.data.ip,
+    message: '请用手机扫一扫（同一 WiFi），在手机浏览器里完成验证',
+  }
 }
 
 // 系统输入法编辑器统一走 @dictpen/core 封装，确保与 SDK 新版输入法/语音识别逻辑一致。

@@ -9,8 +9,8 @@
 use bytes::Bytes;
 use futures::{Stream, TryStreamExt};
 use log::warn;
-use rquest::multipart::{Form, Part};
-use rquest_util::Emulation;
+use wreq::multipart::{Form, Part};
+use wreq_util::Emulation;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use thiserror::Error;
@@ -34,7 +34,7 @@ const ENDPOINT_FILE_FETCH: &str = "/file/fetch_files";
 pub enum ClientError {
     /// HTTP 层错误（网络、超时、DNS 等）
     #[error("HTTP error: {0}")]
-    Http(#[from] rquest::Error),
+    Http(#[from] wreq::Error),
 
     /// HTTP 状态码非 2xx
     #[error("HTTP status {status}: {body}")]
@@ -370,7 +370,7 @@ pub struct StopStreamPayload {
 }
 
 /// Check if a response is an AWS WAF Challenge (US IP restriction)
-fn is_waf_challenge(resp: &rquest::Response) -> bool {
+fn is_waf_challenge(resp: &wreq::Response) -> bool {
     resp.status().as_u16() == 202 && resp.headers().get("x-amzn-waf-action").is_some()
 }
 
@@ -406,7 +406,7 @@ fn print_waf_hint() {
 
 #[derive(Clone)]
 pub struct DsClient {
-    http: rquest::Client,
+    http: wreq::Client,
     api_base: String,
     wasm_url: String,
     user_agent: String,
@@ -415,6 +415,11 @@ pub struct DsClient {
     client_locale: String,
     client_bundle_id: String,
     client_timezone_offset: i32,
+    /// HIF token 动态获取管理器（x-hif-leim / x-hif-dliq）
+    hif: crate::ds_core::hif::HifManager,
+    /// 静态覆盖值（配置 hif_leim / hif_dliq；非空时优先于动态值）
+    hif_static_leim: String,
+    hif_static_dliq: String,
     /// Origin/Referer 用的站点根（由 api_base 去掉 `/api/v0` 推导）
     web_origin: String,
 }
@@ -432,6 +437,52 @@ fn origin_of(api_base: &str) -> String {
     s.to_string()
 }
 
+/// 构建共享 cookie jar，并预置从浏览器抓取的身份 cookie（可选）。
+///
+/// 抓包（.probe/new.jsonl）实证：登录请求同时携带 body 里的 device_id 和
+/// Cookie 里的 smidV2（数美 SDK 写入），两者是同一设备身份的两半。
+/// 服务端看到"device_id 有而 smidV2 无"的组合与真实浏览器不符。
+/// 预置值来自账号配置的抓取结果（见 Account.smid），非伪造。
+fn build_cookie_jar(api_base: &str, preloaded: Vec<String>) -> wreq::cookie::Jar {
+    let jar = wreq::cookie::Jar::default();
+    if !preloaded.is_empty() {
+        let origin = origin_of(api_base) + "/";
+        if let Ok(url) = wreq::Url::parse(&origin) {
+            for cookie in preloaded {
+                jar.add_cookie_str(&cookie, &url);
+            }
+        }
+    }
+    jar
+}
+
+/// 从账号配置推导预置身份 cookie（smidV2，取第一个非空值）。
+///
+/// smidV2 是设备级 cookie（不是账号级）：同一台设备上的多个账号共用同一个
+/// 值才是与真实浏览器一致的行为。若配置了多个**不同** smid，说明用户按账号
+/// 分别抓取了——但共享客户端只有一个 jar，无法按账号区分，告警并采用第一个。
+pub fn preloaded_cookies_from_accounts(accounts: &[crate::config::Account]) -> Vec<String> {
+    let distinct: std::collections::HashSet<&str> = accounts
+        .iter()
+        .map(|a| a.smid.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut it = distinct.iter();
+    match it.next() {
+        Some(&v) => {
+            if distinct.len() > 1 {
+                log::warn!(
+                    target: "ds_core::client",
+                    "配置了 {} 个不同的 smidV2，但客户端共享一个 cookie jar（设备级身份）；已采用其中一个，建议同设备的账号统一填写同一个值",
+                    distinct.len()
+                );
+            }
+            vec![format!("smidV2={}", v)]
+        }
+        None => Vec::new(),
+    }
+}
+
 impl DsClient {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -444,16 +495,41 @@ impl DsClient {
         client_bundle_id: String,
         client_timezone_offset: i32,
         proxy_url: Option<&str>,
+        preloaded_cookies: Vec<String>,
+        hif_static_leim: String,
+        hif_static_dliq: String,
+        hif_auto_fetch: bool,
     ) -> Self {
-        let mut builder = rquest::Client::builder()
+        let mut builder = wreq::Client::builder()
             .emulation(Emulation::Chrome136)
-            .redirect(rquest::redirect::Policy::limited(10));
-        if let Some(url) = proxy_url.and_then(|u| rquest::Proxy::all(u).ok()) {
+            // 客户端级 UA：覆盖 emulation 的默认值（其 profile 默认 OS 为 macOS，
+            // 会发 "Macintosh; Intel Mac OS X" UA）。HIF token 拉取、wasm 下载等
+            // 未逐请求覆盖 UA 的请求也必须与身份一致（Linux aarch64 Chrome 136）。
+            .user_agent(user_agent.clone())
+            .redirect(wreq::redirect::Policy::limited(10))
+            // 浏览器行为对齐（new.jsonl 抓包实证）：真实客户端带 Cookie 头——
+            // HWWAFSESID/HWWAFSESTIME（华为云 WAF）、ds_session_id、smidV2（数美）
+            // 均随响应 Set-Cookie 累积并在后续请求回传。此前未启用 cookie store，
+            // 请求链上完全无 cookie 是一个可识别的自动化特征。
+            .cookie_provider(std::sync::Arc::new(build_cookie_jar(
+                &api_base,
+                preloaded_cookies,
+            )));
+        if let Some(url) = proxy_url.and_then(|u| wreq::Proxy::all(u).ok()) {
             builder = builder.proxy(url);
         }
         let web_origin = origin_of(&api_base);
+        let http = builder.build().expect("构建 HTTP 客户端失败");
+
+        // HIF token 动态获取（x-hif-leim / x-hif-dliq）：bundle 逆向证实这是
+        // DeepSeek 分发服务下发的公开凭据（非本地生成），用后台任务定期拉取。
+        let hif = crate::ds_core::hif::HifManager::default();
+        if hif_auto_fetch {
+            hif.spawn_refresh(http.clone(), web_origin.clone());
+        }
+
         Self {
-            http: builder.build().expect("构建 HTTP 客户端失败"),
+            http,
             api_base,
             wasm_url,
             user_agent,
@@ -462,22 +538,25 @@ impl DsClient {
             client_locale,
             client_bundle_id,
             client_timezone_offset,
+            hif,
+            hif_static_leim,
+            hif_static_dliq,
             web_origin,
         }
     }
 
     /// Web 端 XHR 请求头基线。
     ///
-    /// `rquest_util::Emulation` 的默认头是**页面导航**语义
+    /// `wreq_util::Emulation` 的默认头是**页面导航**语义
     /// （`sec-fetch-site: none` / `mode: navigate` / `dest: document` /
     /// `upgrade-insecure-requests: 1` / `accept: text/html…` / `accept-language: en-US`），
     /// 用它发 JSON API POST 在服务端是不存在的组合——浏览器 fetch 永远发
     /// `same-origin` + `cors` + `empty` + `accept: */*`，且带 `origin`/`referer`。
     /// 必须逐个覆盖，否则整条请求链都能被一眼识别为自动化客户端（封号主因）。
-    fn web_base_headers(&self) -> Result<rquest::header::HeaderMap, ClientError> {
-        use rquest::header::{HeaderValue, ACCEPT, ACCEPT_LANGUAGE, ORIGIN, REFERER, USER_AGENT};
+    fn web_base_headers(&self) -> Result<wreq::header::HeaderMap, ClientError> {
+        use wreq::header::{HeaderValue, ACCEPT, ACCEPT_LANGUAGE, ORIGIN, REFERER, USER_AGENT};
 
-        let mut h = rquest::header::HeaderMap::new();
+        let mut h = wreq::header::HeaderMap::new();
         let hv = |name: &str, s: &str| -> Result<HeaderValue, ClientError> {
             HeaderValue::from_str(s)
                 .map_err(|e| ClientError::InvalidHeader(format!("{name}: {e}")))
@@ -495,8 +574,17 @@ impl DsClient {
         h.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
         h.insert("sec-fetch-mode", HeaderValue::from_static("cors"));
         h.insert("sec-fetch-dest", HeaderValue::from_static("empty"));
+        // Client Hints 平台修正：wreq 的 Chrome136 emulation 默认发
+        // `sec-ch-ua-platform: "macOS"`（其 profile 默认 OS），与我们的
+        // `X11; Linux aarch64` UA 自相矛盾——风控引擎会做 UA↔client-hints
+        // 交叉校验（httpbin 实测确认）。真实 Linux Chrome 发送 "Linux"。
+        // sec-ch-ua / sec-ch-ua-mobile 由 emulation 提供（版本号与 Chrome136 一致）。
+        h.insert(
+            "sec-ch-ua-platform",
+            HeaderValue::from_static("\"Linux\""),
+        );
         // 导航专用头必须显式清除，emulation 默认会带上
-        h.remove(rquest::header::UPGRADE_INSECURE_REQUESTS);
+        h.remove(wreq::header::UPGRADE_INSECURE_REQUESTS);
         h.insert("priority", HeaderValue::from_static("u=1, i"));
 
         h.insert(
@@ -525,11 +613,11 @@ impl DsClient {
         Ok(h)
     }
 
-    fn auth_headers(&self, token: &str) -> Result<rquest::header::HeaderMap, ClientError> {
+    fn auth_headers(&self, token: &str) -> Result<wreq::header::HeaderMap, ClientError> {
         let mut h = self.web_base_headers()?;
         h.insert(
-            rquest::header::AUTHORIZATION,
-            rquest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            wreq::header::AUTHORIZATION,
+            wreq::header::HeaderValue::from_str(&format!("Bearer {token}"))
                 .map_err(|e| ClientError::InvalidHeader(format!("Authorization: {e}")))?,
         );
         Ok(h)
@@ -539,18 +627,34 @@ impl DsClient {
         &self,
         token: &str,
         pow_response: &str,
-    ) -> Result<rquest::header::HeaderMap, ClientError> {
+    ) -> Result<wreq::header::HeaderMap, ClientError> {
         let mut h = self.auth_headers(token)?;
         h.insert(
             "X-Ds-Pow-Response",
-            rquest::header::HeaderValue::from_str(pow_response)
+            wreq::header::HeaderValue::from_str(pow_response)
                 .map_err(|e| ClientError::InvalidHeader(format!("X-Ds-Pow-Response: {e}")))?,
         );
         Ok(h)
     }
 
+    /// 当前 leim 值：静态配置优先，否则取后台拉取的动态值
+    async fn current_hif_leim(&self) -> Option<String> {
+        if !self.hif_static_leim.is_empty() {
+            return Some(self.hif_static_leim.clone());
+        }
+        self.hif.leim().await
+    }
+
+    /// 当前 dliq 值：静态配置优先，否则取后台拉取的动态值
+    async fn current_hif_dliq(&self) -> Option<String> {
+        if !self.hif_static_dliq.is_empty() {
+            return Some(self.hif_static_dliq.clone());
+        }
+        self.hif.dliq().await
+    }
+
     async fn parse_envelope<T: serde::de::DeserializeOwned>(
-        resp: rquest::Response,
+        resp: wreq::Response,
     ) -> Result<T, ClientError> {
         let status = resp.status();
         if !status.is_success() {
@@ -568,8 +672,8 @@ impl DsClient {
         // 登录前无 token，但其余 web 头必须齐全；referer 指向登录页（实抓一致）
         let mut h = self.web_base_headers()?;
         h.insert(
-            rquest::header::REFERER,
-            rquest::header::HeaderValue::from_str(&format!("{}/sign_in", self.web_origin))
+            wreq::header::REFERER,
+            wreq::header::HeaderValue::from_str(&format!("{}/sign_in", self.web_origin))
                 .map_err(|e| ClientError::InvalidHeader(format!("Referer: {e}")))?,
         );
         let resp = self
@@ -751,10 +855,29 @@ impl DsClient {
         pow_response: &str,
         payload: &CompletionPayload,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Bytes, ClientError>> + Send>>, ClientError> {
+        let mut h = self.auth_headers_with_pow(token, pow_response)?;
+        // HIF 头：new.jsonl 实测仅 /chat/completion 携带（login、create_session、
+        // create_pow_challenge、upload_file 均无）。值为分发服务下发的动态凭据
+        // （见 hif.rs），静态配置值优先，否则用后台拉取的当前值；都没有则不发
+        // （等价于前端冷启动首个请求在 poller 成功前的形态）。
+        if let Some(v) = self.current_hif_leim().await {
+            h.insert(
+                "x-hif-leim",
+                wreq::header::HeaderValue::from_str(&v)
+                    .map_err(|e| ClientError::InvalidHeader(format!("x-hif-leim: {e}")))?,
+            );
+        }
+        if let Some(v) = self.current_hif_dliq().await {
+            h.insert(
+                "x-hif-dliq",
+                wreq::header::HeaderValue::from_str(&v)
+                    .map_err(|e| ClientError::InvalidHeader(format!("x-hif-dliq: {e}")))?,
+            );
+        }
         let resp = self
             .http
             .post(format!("{}{}", self.api_base, ENDPOINT_CHAT_COMPLETION))
-            .headers(self.auth_headers_with_pow(token, pow_response)?)
+            .headers(h)
             .json(payload)
             .send()
             .await?;
@@ -857,17 +980,17 @@ impl DsClient {
         let mut h = self.auth_headers_with_pow(token, pow_response)?;
         h.insert(
             "X-File-Size",
-            rquest::header::HeaderValue::from_str(&file_size.to_string())
+            wreq::header::HeaderValue::from_str(&file_size.to_string())
                 .map_err(|e| ClientError::InvalidHeader(format!("X-File-Size: {e}")))?,
         );
         h.insert(
             "X-Model-Type",
-            rquest::header::HeaderValue::from_str(model_type)
+            wreq::header::HeaderValue::from_str(model_type)
                 .map_err(|e| ClientError::InvalidHeader(format!("X-Model-Type: {e}")))?,
         );
         h.insert(
             "X-Thinking-Enabled",
-            rquest::header::HeaderValue::from_static(if thinking_enabled { "1" } else { "0" }),
+            wreq::header::HeaderValue::from_static(if thinking_enabled { "1" } else { "0" }),
         );
 
         let resp = self

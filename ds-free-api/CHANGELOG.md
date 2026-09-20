@@ -4,6 +4,119 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.11] - 2026-09-20
+
+### Added（纯 Rust device_id 生成：deviceprofile 注册协议逆向完成）
+- **`ds_core/mint.rs`**：不依赖浏览器/JS 引擎，直接在 Rust 内完成数美
+  deviceprofile/v4 注册并取得服务端签发的 device_id。协议全链路逆向自
+  fp.min.js（方法见 docs/deepseek-verification-analysis.md §5d–5f）：
+  - uid = UUID v4；**AES key = md5(uid)[..16] 的 ASCII 字节**（实证），
+    iv 固定 `0102030405060708`，明文 = base64(gzip(81 键指纹 JSON))，
+    AES-128-CBC + ZeroPadding → hex = `data`
+  - `ep` = RSA-PKCS1v1.5(uid, 数美公钥)（服务器解出 uid 自行派生 AES key）
+  - 请求体 7 字段：`appId/organization/ep/data/os:"web"/encode:5/compress:2`
+  - 17 个 DES 逐字段加密（canvas/UA/时区/时间戳/uid 等），密钥为每字段
+    独立的硬编码 8 字符串，密码学复用本地 sm_des crate
+  - `ip` 字段 = DES(canonical 哈希)；canonical 语义为"顶层键排序、数字
+    ×10000、嵌套对象不递归（[object Object]）、数组逗号连接"
+- **启动时自动补齐**：账号 device_id 非数美签发格式（无 `B`/`D` 前缀）时
+  自动 mint 并持久化（失败不阻断，沿用旧值）
+- **调试辅助**：`DS_MINT_DUMP=<path>` 落盘 payload/body；
+  `/device/fp-patched.js` 提供插桩版 SDK（同源）用于差分调试；
+  `/device-id-capture/debug` 收集真实浏览器内部状态
+- 实证：宿主 5/5 成功；笔上酸测 mint 的凭据通过设备校验（登录推进到
+  账密环节而非 biz_code 11）
+- 单元测试：canonical JS 语义、smid 格式、AES 分组、字段往返（共 166 项）
+
+## [0.2.10] - 2026-09-19
+
+### Added（纯笔内 device_id 方案：利用笔上 WPE WebKit 浏览器 miniapp）
+- **设备验证辅助页** `src/server/device_capture.rs`：发现笔自带 WPE WebKit 浏览器
+  miniapp（appid 8001779591038449，wpe4ydpv2），新增 `/device` 页面在其真实浏览器
+  环境里运行 DeepSeek 官方数美 SDK（fp.min.js，organization/公钥来自 main bundle
+  逆向），生成**真实** device_id + smidV2 后经 `/device-id-capture/submit` 自动写入
+  config.toml 对应账号并重新登录——零伪造、零外部设备、纯笔内闭环
+- **端点**：`GET /device`（辅助页）、`GET /device-id-capture/accounts`（掩码账号
+  列表）、`POST /device-id-capture/submit`（写入 + 重登）；全部要求 key 等于已配置
+  API Key，服务仅绑 127.0.0.1（浏览器在笔上，无外部暴露）
+- **词典笔端**：设置页新增「设备验证」入口（builtin 模式），通过
+  `$falcon.navTo('falcon://1779591038449/index', {url})` 拉起浏览器加载辅助页；
+  登录因 RISK_DEVICE_DETECTED 失败时的日志提示已指向该入口
+- 新增掩码/模板单元测试
+
+## [0.2.9] - 2026-09-19
+
+### Added（x-hif-leim 逆向突破：无需 JS 引擎，动态凭据直接拉取）
+- **`ds_core::hif` 模块**：bundle（main.7d19d7e901.js）逆向证实 x-hif-leim /
+  x-hif-dliq **不是本地 JS 生成**，而是页面内 poller 从 DeepSeek 分发服务
+  （hif-leim/hif-dliq.deepseek.com/query）定期拉取的公开凭据——裸 curl 实测
+  即可取得，无鉴权、TTL 600s。`HifManager` 后台任务按前端同款策略轮询
+  （成功按 TTL 刷新、失败 1s 起倍增退避封顶 600s），leim/dliq 独立轮询
+- **`completion()` 自动附加** `x-hif-leim` / `x-hif-dliq`（有值才发），与真实
+  浏览器行为一致；此前两个头从未发送
+- **配置**：`hif_auto_fetch`（默认 true）、`hif_leim` / `hif_dliq`（静态覆盖，
+  仅调试实验用）
+- 新增单元测试（端点常量、token 存取），共 161 项
+
+### 结论
+**无需嵌入 JS 执行器**：x-hif-leim 是纯 HTTP 动态凭据，Rust 原生实现即取即用，
+取到的是真实有效 token 而非伪造值。此前 0.2.8 中"hif_leim 静态透传"升级为
+动态拉取 + 静态覆盖。
+
+## [0.2.8] - 2026-09-19
+
+### Added（.probe/new.jsonl 抓包分析产物，详见 docs/deepseek-verification-analysis.md）
+- **cookie store**：wreq 启用 `cookies` feature 并挂共享 Jar——抓包实证真实浏览器
+  全程携带 HWWAFSESID/HWWAFSESTIME（华为云 WAF）、ds_session_id、smidV2（数美）
+  等cookie，此前我们的请求链零 cookie 是明显的自动化特征
+- **`Account.smid`**（可选）：数美 smidV2 Cookie 透传。登录请求同时携带 body 的
+  device_id 与 cookie 的 smidV2（同一设备身份的两半），只发 device_id 与真实浏览器
+  不符；从浏览器 Cookie 抓取后填入，同设备多账号共用一个值；留空 = 不发
+- **`DeepSeekConfig.hif_leim`**（可选）：x-hif-leim 请求头透传。抓包实证仅
+  /chat/completion 携带、页面加载级作用域（全会话恒定一个值）、前端混淆 JS 生成
+  无法复现、服务端当前未强制；留空 = 不发
+- **`examples/header_probe.rs`**：头指纹实测探针（httpbin.org 回显，验证
+  UA ↔ client-hints 一致性）
+
+### Fixed
+- **sec-ch-ua-platform 与 UA 矛盾**：wreq Chrome136 emulation 默认发送
+  `sec-ch-ua-platform: "macOS"`（profile 默认 OS），与我们的 `X11; Linux aarch64`
+  UA 自相矛盾（httpbin 实测确认）；显式覆盖为 `"Linux"`
+
+## [0.2.7] - 2026-09-19
+
+### Added
+- **每账号每小时请求配额**（`hourly_request_quota`，默认 60，0 = 不限制）：
+  上游实测同一账号累计约 215 次/小时会被禁言（biz_code 5）且为延迟判定，
+  配额用尽的账号本窗口内不再被分配（会话亲和的续聊请求除外，用量照常计数）；
+  `AccountStatus` 新增 `used_this_hour` / `quota_exhausted` 字段
+- **device_id 风控处理**（对齐上游 NIyueeE/ds-free-api v0.4.0 的实测结论）：
+  - 登录返回 `RISK_DEVICE_DETECTED`（biz_code 11）时映射为带抓取指引的明确错误，
+    不再盲目重试；`init_account` 对该错误短路
+  - 多账号共用同一 `device_id` 时启动告警（设备级指纹被上游用于关联画像，
+    共用显著提升连坐禁言风险）
+  - `Account.device_id` 文档补齐抓取步骤（users/login 请求体 / `SMSdk.getDeviceId()`）
+- **`default_search_enabled` 配置**（默认 `true` 保持历史行为；`false` 时未传
+  `web_search_options` 即关闭搜索，减少 DeepSeek 侧系统提示词注入）
+- **`input_character_limits` 配置**（与 model_types 等长校验，旧配置自动补齐，
+  上游实测 2621440）
+- **模型注册表裸名**：`default` 等裸 model_type 名可直接作为 model_id 使用
+- **词典笔端（app/）**：
+  - 调试模式出站代理：设置页可写入 `[proxy]`（Socks5/HTTP）并自动重启后端
+  - Emoji 文字替换降级：设备不支持字体注册（无 weex/dom 模块）时，
+    emoji 渲染为文字标签（如 [赞]），不再出现白块；字体注册成功则自动关闭替换
+
+### Changed
+- **浏览器指纹切换为 Linux aarch64 Chrome**：默认 UA 从 Windows 桌面
+  Chrome/136 改为 `X11; Linux aarch64` Chrome/136（与 Emulation::Chrome136
+  的 TLS 指纹同大版本、与词典笔真实硬件平台一致）；`fingerprint.rs` 重写为
+  运行时动态采集（/proc/meminfo 内存、available_parallelism 核数、framebuffer
+  屏幕、chrono 时区、系统 locale、/sys GPU 信息、machine-id 派生 canvas 替代
+  哈希），配置可选逐字段覆盖
+- **词典笔端自动修复**：`fixFingerprint` 会把历史 UA（Windows/x86_64/Android）
+  就地改写为 Linux aarch64 Chrome 136，最小配置模板同步更新并写入
+  `hourly_request_quota`
+
 ## [0.2.6] - 2026-05-05
 
 ### Added

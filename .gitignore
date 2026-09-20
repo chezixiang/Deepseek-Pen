@@ -43,3 +43,6 @@ __pycache__/
 ds-free-api/ds-free-api-v*/ds-free-api
 ds-free-api/ds-free-api-v*/ds-free-api.exe
 ds-free-api/ds-free-api-v*/config.toml
+target-wsl/
+target-*/
+ds-free-api-newest/

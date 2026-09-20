@@ -18,13 +18,20 @@ pub(crate) struct ModelResolution {
 ///
 /// thinking_enabled 在 reasoning_effort 非 "none" 时启用。
 /// 若 reasoning_effort 未提供，默认按 "high" 处理（即 reasoning 默认开启）。
-/// search_enabled 默认开启（DeepSeek 后端在搜索模式下注入更强的系统提示词）。
-/// 显式设置 web_search_options 可覆盖行为。
+///
+/// # search
+///
+/// 搜索模式会让 DeepSeek 后端注入更强的系统提示词。判定顺序：
+/// 1. 显式提供 `web_search_options` → 开启（`search_context_size == "none"`
+///    视为显式关闭，沿用本服务自定义语义）；
+/// 2. 未提供 → 取 `default_search_enabled`（配置项，默认 `true` 保持历史行为；
+///    设为 `false` 则严格遵循 OpenAI 语义——未传即关闭）。
 pub(crate) fn resolve(
     registry: &HashMap<String, String>,
     model_id: &str,
     reasoning_effort: Option<&str>,
     web_search_options: Option<&WebSearchOptions>,
+    default_search_enabled: bool,
 ) -> Result<ModelResolution, String> {
     let key = model_id.to_lowercase();
     let model_type = registry
@@ -35,14 +42,13 @@ pub(crate) fn resolve(
     let reasoning_effort = reasoning_effort.unwrap_or("high");
     let thinking_enabled = reasoning_effort != "none";
 
-    // search_context_size == "none" 时显式关闭搜索；未传时保持默认开启（与 README 一致）
     let search_enabled = match web_search_options {
         Some(opts) => opts
             .search_context_size
             .as_deref()
             .map(|s| s != "none")
             .unwrap_or(true),
-        None => true,
+        None => default_search_enabled,
     };
 
     Ok(ModelResolution {

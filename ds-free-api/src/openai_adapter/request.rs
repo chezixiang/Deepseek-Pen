@@ -75,6 +75,7 @@ mod tests {
             &req.model,
             req.reasoning_effort.as_deref(),
             req.web_search_options.as_ref(),
+            true,
         )
         .map_err(OpenAIAdapterError::BadRequest)?;
 

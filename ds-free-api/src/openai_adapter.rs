@@ -49,6 +49,8 @@ pub struct OpenAIAdapter {
     model_aliases: tokio::sync::RwLock<Vec<String>>,
     max_input_tokens: tokio::sync::RwLock<Vec<u32>>,
     max_output_tokens: tokio::sync::RwLock<Vec<u32>>,
+    /// 未显式传 web_search_options 时是否默认开启搜索
+    default_search_enabled: tokio::sync::RwLock<bool>,
     tag_config: tokio::sync::RwLock<Arc<response::TagConfig>>,
     /// 缓存的 tiktoken BPE 编码器（避免每次请求重建）
     bpe: Option<Arc<tiktoken_rs::CoreBPE>>,
@@ -69,6 +71,7 @@ impl OpenAIAdapter {
             model_aliases: tokio::sync::RwLock::new(config.deepseek.model_aliases.clone()),
             max_input_tokens: tokio::sync::RwLock::new(config.deepseek.max_input_tokens.clone()),
             max_output_tokens: tokio::sync::RwLock::new(config.deepseek.max_output_tokens.clone()),
+            default_search_enabled: tokio::sync::RwLock::new(config.deepseek.default_search_enabled),
             tag_config: tokio::sync::RwLock::new(Arc::new(response::TagConfig::from_config(
                 &config.deepseek.tool_call,
             ))),
@@ -127,6 +130,7 @@ impl OpenAIAdapter {
             &req.model,
             req.reasoning_effort.as_deref(),
             req.web_search_options.as_ref(),
+            *self.default_search_enabled.read().await,
         )
         .map_err(OpenAIAdapterError::BadRequest)?;
         drop(registry);
@@ -312,6 +316,7 @@ impl OpenAIAdapter {
             &chat_req.model,
             chat_req.reasoning_effort.as_deref(),
             chat_req.web_search_options.as_ref(),
+            *self.default_search_enabled.read().await,
         )
         .map_err(OpenAIAdapterError::BadRequest)?;
         let ds_req = crate::ds_core::ChatRequest {
@@ -442,6 +447,7 @@ impl OpenAIAdapter {
         *self.model_aliases.write().await = new_config.deepseek.model_aliases.clone();
         *self.max_input_tokens.write().await = new_config.deepseek.max_input_tokens.clone();
         *self.max_output_tokens.write().await = new_config.deepseek.max_output_tokens.clone();
+        *self.default_search_enabled.write().await = new_config.deepseek.default_search_enabled;
         *self.tag_config.write().await = Arc::new(response::TagConfig::from_config(
             &new_config.deepseek.tool_call,
         ));

@@ -33,6 +33,12 @@
                 </div>
                 <text :class="form.dsConfigured ? dc('field-hint') : dc('field-hint-warn')">{{ form.dsConfigured ? '已配置账号，可直接对话' : '未配置账号，请填写后保存' }}</text>
                 <text v-if="trouble.length" :class="dc('field-hint-warn')">⚠️ 最近账号异常 {{ trouble.length }} 次，最早检出 {{ fmtTime(trouble[0].t) }}（{{ trouble[0].kind }}）：{{ trouble[0].message }}</text>
+                <div :class="dc('field')">
+                    <text :class="dc('label')">设备验证（登录被设备风控拒绝时使用）</text>
+                    <text :class="dc('chip')" @click="openDeviceVerify">打开本机浏览器生成设备凭据</text>
+                    <text :class="dc('field-hint')">将在本机浏览器中运行 DeepSeek 官方设备组件，自动生成凭据并写入配置，完成后返回本应用重新保存账号</text>
+                    <text v-if="deviceVerifyMsg" :class="dc('field-hint')">{{ deviceVerifyMsg }}</text>
+                </div>
             </template>
 
             <!-- OpenAI 兼容端点：baseUrl + apiKey -->
@@ -115,7 +121,16 @@
             <div :class="dc('field')">
                 <text :class="dc('label')">Emoji 字体（实验，联网下载约 10MB）</text>
                 <text :class="form.emojiFont ? dc('chip-active') : dc('chip')" @click="toggleEmojiFont">{{ form.emojiFont ? '开启' : '关闭' }}</text>
+                <text :class="dc('field-hint')">设备不支持字体注册时会自动用文字替换 Emoji（如 [赞]），不会出现白块</text>
                 <text v-if="emojiFontMsg" :class="dc('field-hint')">{{ emojiFontMsg }}</text>
+            </div>
+            <div :class="dc('field')" v-if="form.debugMode">
+                <text :class="dc('label')">出站代理（Socks5/HTTP）</text>
+                <div :class="dc('input')" @click="editProxy">
+                    <text :class="proxyUrl ? dc('input-text') : dc('input-text-ph')">{{ proxyUrl || '未设置，如 socks5://192.168.1.5:1080' }}</text>
+                </div>
+                <text :class="dc('field-hint')">后端访问 DeepSeek 走此代理（抓包/绕过 WAF 用），留空恢复直连；保存后自动重启后端</text>
+                <text v-if="proxyMsg" :class="dc('field-hint')">{{ proxyMsg }}</text>
             </div>
 
             <text :class="dc('danger')" @click="resetData">清空全部对话数据</text>
@@ -169,7 +184,7 @@
 <script>
 import { MODES } from '../../services/ds.js'
 import { DEFAULT_SETTINGS, APP_VERSION, loadSettings, saveSettings, loadConversations, saveConversations, deleteMessages, saveActiveId, readLocalDsPass, loadAccountTrouble } from '../../services/store.js'
-import { openTextEditor, updateDsFreeApiAccount, INPUT_TYPES, deployBackend } from '../../services/native.js'
+import { openTextEditor, updateDsFreeApiAccount, readDsFreeApiProxy, updateDsFreeApiProxy, validateProxyUrl, openDeviceVerification, INPUT_TYPES, deployBackend, ensureBackendRunning } from '../../services/native.js'
 import { appLog, appLogTail, appLogClear, backendLogTail, backendLogClear } from '../../services/app-log.js'
 import { ensureEmojiFont } from '../../services/emoji-font.js'
 
@@ -201,6 +216,9 @@ export default {
             logLines: 80,
             logGen: 0, // 0=当前 1=上一份（轮转保留）
             emojiFontMsg: '',
+            proxyUrl: '',
+            proxyMsg: '',
+            deviceVerifyMsg: '',
             trouble: []
         }
     },
@@ -244,6 +262,13 @@ export default {
             // 后台部署后端（不阻塞页面渲染，避免"保存键按不下去"）
             this.backendError = ''
             if (this.form.authMode === 'builtin') {
+              // 读取本机后端当前代理配置（调试模式的出站代理）
+              readDsFreeApiProxy()
+                .then((u) => {
+                  this.proxyUrl = u || ''
+                  this.$forceUpdate()
+                })
+                .catch(() => {})
               // Bug 修复：增加部署状态标记，保存时检查部署是否完成
               this.backendDeploying = true
               this.$forceUpdate()
@@ -346,6 +371,60 @@ export default {
                 }
             } else {
                 this.emojiFontMsg = '已关闭（重新打开会复用已下载的字体）'
+            }
+            this.$forceUpdate()
+        },
+        // 设备验证：拉起本机 WPE 浏览器（miniapp 1779591038449）打开后端
+        // /device 辅助页，在真实浏览器环境运行官方数美 SDK 生成 device_id，
+        // 由页面直接回写后端配置并重新登录。纯笔内完成。
+        async openDeviceVerify() {
+            if (this.form.authMode !== 'builtin') {
+                this.deviceVerifyMsg = '自定义端点模式无需设备验证（由服务端处理）'
+                this.$forceUpdate()
+                return
+            }
+            this.deviceVerifyMsg = '正在确认后端状态…'
+            this.$forceUpdate()
+            try {
+                const r = await ensureBackendRunning()
+                if (!r.ok) {
+                    this.deviceVerifyMsg = '后端未就绪：' + (r.message || '请稍后重试')
+                    this.$forceUpdate()
+                    return
+                }
+                const result = await openDeviceVerification(this.form.apiKey || '')
+                this.deviceVerifyMsg = result.message
+            } catch (e) {
+                this.deviceVerifyMsg = '启动失败：' + (e && e.message ? e.message : String(e))
+            }
+            this.$forceUpdate()
+        },
+        // 出站代理（调试模式）：写入本机后端 config.toml 的 [proxy] 段并重启后端。
+        // 留空提交 = 清除代理恢复直连。
+        async editProxy() {
+            const text = await openTextEditor(INPUT_TYPES.EN_US_ONLY, this.proxyUrl || '')
+            if (text === null) return
+            const v = String(text).trim()
+            const invalid = validateProxyUrl(v)
+            if (invalid) {
+                this.proxyMsg = invalid
+                this.$forceUpdate()
+                return
+            }
+            if (this.form.authMode !== 'builtin') {
+                this.proxyMsg = '仅内置后端模式使用本机代理（当前为自定义端点模式）'
+                this.$forceUpdate()
+                return
+            }
+            this.proxyMsg = v ? '正在写入代理配置并重启后端…' : '正在清除代理并重启后端…'
+            this.$forceUpdate()
+            try {
+                const r = await updateDsFreeApiProxy(v)
+                if (r.ok) this.proxyUrl = v
+                this.proxyMsg = r.message
+                appLog('[settings] 代理更新 ok=' + r.ok + ' msg=' + (r.message || ''))
+            } catch (e) {
+                this.proxyMsg = '失败：' + (e && e.message ? e.message : String(e))
             }
             this.$forceUpdate()
         },

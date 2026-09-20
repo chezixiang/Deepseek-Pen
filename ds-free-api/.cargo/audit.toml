@@ -1,2 +1,20 @@
+# cargo-audit 配置 —— 记录已评估并接受的上游告警
+#
+# 用法：cargo audit（CI 与 just check 均使用 plain audit，真实漏洞会以非零退出码失败）
+# 如需包含 warning 级告警：cargo audit --deny warnings
+
 [advisories]
-ignore = ["RUSTSEC-2026-0002"]
+ignore = [
+    # wasmtime 早期版本的类型索引混淆；本项目仅用 wasmtime 执行 DeepSeek 的 PoW WASM，
+    # 不加载任何第三方模块，攻击面不可达。当前已升级到 48.x，保留此条以防回退。
+    "RUSTSEC-2026-0002",
+    # lru 0.13 的 LruCache::pop() 缺少 panic 安全（unsound，非直接漏洞）。
+    # 该 crate 由 wreq 5.3.0 传递引入，上游 5.x 已全线 yank、6.0 仍为 rc，本仓库无法升级消除。
+    # 触发前提是缓存 key 的 Drop 实现 panic 且使用 catch_unwind；本项目未使用该模式。
+    "RUSTSEC-2026-0253",
+]
+
+# wreq / wreq-util 5.x 已被上游 yank（6.0 仍是 rc），无法在保持当前 API 的前提下升级。
+# 关闭 yanked 检查，避免长期出现无法消除的噪音告警。
+[yanked]
+enabled = false

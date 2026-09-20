@@ -73,15 +73,37 @@ pub struct Account {
     pub area_code: String,
     /// 密码
     pub password: String,
-    /// 设备 ID（UUID 格式，首次自动生成后持久化；用于风控识别）
+    /// 设备 ID（数美/Shumei 浏览器设备指纹）
+    ///
+    /// 登录请求体里的 device_id 字段。上游风控对它有硬校验：
+    /// - **实测不可伪造**：伪造值（无论 base64 还是普通字符串）登录会返回
+    ///   `RISK_DEVICE_DETECTED`（biz_code 11）。留空时本服务会生成随机 UUID
+    ///   兜底——若登录被 11 号错误拒绝，请按下方步骤抓取真实值填入。
+    /// - 建议**每个账号使用独立的 device_id**：设备级指纹被上游用于关联与画像，
+    ///   同一指纹下挂多个账号、累计数百次请求后会被禁言（biz_code 5）。
+    ///
+    /// 抓取步骤：用 Chrome 打开 https://chat.deepseek.com/sign_in 并登录一次 →
+    /// 开发者工具 → Network → 过滤 `users/login` → 复制请求 Payload 里的
+    /// `device_id` 值。简化方案：控制台执行 `SMSdk.getDeviceId()`（等 SMSdk 就绪）。
     #[serde(default = "generate_device_id")]
     pub device_id: String,
+    /// 数美 smidV2 Cookie（可选，配合 device_id 使用）
+    ///
+    /// 抓包（.probe/new.jsonl）实证：真实浏览器的登录请求**同时**携带 body 里的
+    /// device_id 和 Cookie 里的 smidV2（数美 SDK 写入），两者是同一设备身份的
+    /// 两半。仅带 device_id 而无 smidV2 与真实浏览器不符，可能是伪造 device_id
+    /// 被风控拒绝的深层原因之一。
+    ///
+    /// 抓取：同一浏览器 DevTools → Application → Cookies → chat.deepseek.com →
+    /// 复制 `smidV2` 的值。同设备的多个账号填同一个值（与真实多账号浏览器一致）。
+    /// 留空 = 不发送（维持现有行为）。
+    #[serde(default)]
+    pub smid: String,
 }
 
 /// 生成随机设备 ID（UUID v4 格式）
 fn generate_device_id() -> String {
-    use std::fmt::Write;
-    let mut rng = std::collections::hash_map::RandomState::new();
+    let rng = std::collections::hash_map::RandomState::new();
     let hash1 = std::hash::BuildHasher::hash_one(&rng, std::time::SystemTime::now());
     let hash2 = std::hash::BuildHasher::hash_one(&rng, std::process::id());
     format!(
@@ -130,6 +152,10 @@ pub struct DeepSeekConfig {
     /// 各模型类型的输出 token 限制（与 model_types 按索引一一对应）
     #[serde(default = "default_max_output_tokens")]
     pub max_output_tokens: Vec<u32>,
+    /// 各模型类型的单次输入字符数限制（与 model_types 按索引一一对应）。
+    /// 上游对全部 model_type 均返回 input_character_limit = 2621440。
+    #[serde(default = "default_input_character_limits")]
+    pub input_character_limits: Vec<u32>,
     /// 工具调用标签配置（自定义回退标签）
     #[serde(default)]
     pub tool_call: ToolCallTagConfig,
@@ -138,9 +164,40 @@ pub struct DeepSeekConfig {
     /// 则仅 deepseek-v4-pro → expert（index 1），空字符串被跳过
     #[serde(default)]
     pub model_aliases: Vec<String>,
-    /// 设备指纹配置（可选，用于风控绕过；留空使用默认模板）
+    /// 每账号每小时请求上限（0 = 不限制）
+    ///
+    /// 上游实测同一账号累计约 215 次请求/小时量级会被禁言（biz_code=5），
+    /// 且禁言是**延迟判定**的（跑完才封）。配额在账号维度做窗口限流：
+    /// 达到上限的账号在本窗口内不再被分配，由池中其他账号承接。
+    #[serde(default = "default_hourly_request_quota")]
+    pub hourly_request_quota: u64,
+    /// 未显式传入 `web_search_options` 时是否默认开启搜索模式（默认 true）
+    ///
+    /// `true` 保持历史行为（始终搜索）；设为 `false` 则严格遵循 OpenAI 语义
+    /// （未传即关闭），可减少 DeepSeek 侧的系统提示词注入。
+    #[serde(default = "default_search_enabled")]
+    pub default_search_enabled: bool,
+    /// 设备指纹配置（可选；留空则从运行环境动态采集硬件特征）
     #[serde(default)]
     pub fingerprint: Option<serde_json::Value>,
+    /// x-hif-leim / x-hif-dliq 动态凭据（详见 docs/deepseek-verification-analysis.md §3）
+    ///
+    /// bundle 逆向结论：这两个头**不是本地 JS 生成的**，而是浏览器页面内的
+    /// poller 从 DeepSeek 分发服务（hif-leim/hif-dliq.deepseek.com/query）定期
+    /// 拉取的公开凭据（无鉴权，TTL 默认 600s）。因此默认由后台任务**动态拉取**
+    /// 并在 completion 上附加——与真实浏览器行为一致，无需伪造。
+    ///
+    /// `hif_leim` / `hif_dliq`：静态覆盖值（仅调试实验用，如复现抓包）。
+    /// 非空时优先于动态值。留空 = 使用动态获取。
+    #[serde(default)]
+    pub hif_leim: String,
+    /// x-hif-dliq 的静态覆盖值（同上，留空 = 使用动态获取）
+    #[serde(default)]
+    pub hif_dliq: String,
+    /// 是否自动拉取 HIF 动态凭据（默认 true，与真实浏览器行为一致）。
+    /// 关闭后 completion 不带 x-hif-leim/x-hif-dliq 头（服务端当前不强制）。
+    #[serde(default = "default_hif_auto_fetch")]
+    pub hif_auto_fetch: bool,
 }
 
 /// 工具调用标签配置
@@ -197,8 +254,15 @@ impl Default for DeepSeekConfig {
             model_types: default_model_types(),
             max_input_tokens: default_max_input_tokens(),
             max_output_tokens: default_max_output_tokens(),
+            input_character_limits: default_input_character_limits(),
             tool_call: ToolCallTagConfig::default(),
             model_aliases: Vec::new(),
+            hourly_request_quota: default_hourly_request_quota(),
+            default_search_enabled: default_search_enabled(),
+            fingerprint: None,
+            hif_leim: String::new(),
+            hif_dliq: String::new(),
+            hif_auto_fetch: default_hif_auto_fetch(),
         }
     }
 }
@@ -224,6 +288,28 @@ fn default_max_output_tokens() -> Vec<u32> {
     vec![384_000]
 }
 
+/// 各模型类型的单次输入字符数限制（上游 settings 实测 2621440）
+fn default_input_character_limits() -> Vec<u32> {
+    vec![2_621_440]
+}
+
+/// 每账号每小时请求上限默认值：60。
+/// 远低于上游实测触发禁言的 ~215 次/小时量级，同时单账号仍能支撑常规
+/// 交互式使用。需要更高吞吐时应增加账号数量，而不是抬高这个值。
+fn default_hourly_request_quota() -> u64 {
+    60
+}
+
+/// 未传 `web_search_options` 时默认开启搜索（与历史行为一致）
+fn default_search_enabled() -> bool {
+    true
+}
+
+/// HIF 动态凭据自动拉取默认开启（与真实浏览器行为一致，失败自动降级为不发）
+fn default_hif_auto_fetch() -> bool {
+    true
+}
+
 /// 默认 X-Client-Bundle-Id —— new.jsonl 实抓 web 端固定值
 fn default_client_bundle_id() -> String {
     "com.deepseek.chat".to_string()
@@ -236,10 +322,18 @@ fn default_client_timezone_offset() -> i32 {
 
 impl DeepSeekConfig {
     /// 生成 OpenAI 模型注册表映射
+    ///
+    /// 每个 model_type 注册两种写法，便于客户端直接用裸名（例如 Claude Code
+    /// 里把 `model` 设成 `default`）：
+    /// - `deepseek-{ty}`（标准 ID）
+    /// - `{ty}`（裸 model_type 名，如 `default`）
     pub fn model_registry(&self) -> std::collections::HashMap<String, String> {
         let mut map = std::collections::HashMap::new();
         for (i, ty) in self.model_types.iter().enumerate() {
             map.insert(format!("deepseek-{}", ty).to_lowercase(), ty.clone());
+            // 裸名兜底：不覆盖用户显式起的别名
+            map.entry(ty.to_lowercase())
+                .or_insert_with(|| ty.clone());
             if let Some(alias) = self.model_aliases.get(i) {
                 let alias = alias.trim().to_lowercase();
                 if !alias.is_empty() {
@@ -281,11 +375,12 @@ fn default_wasm_url() -> String {
     "https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm".to_string()
 }
 
-/// 默认 User-Agent —— 与 rquest 的 Emulation::Chrome136（TLS/JA3 指纹）保持一致。
-/// 此前默认值为 "DeepSeek/2.0.4 Android/35"（app 端 UA），但 TLS 指纹是桌面 Chrome 136，
-/// 服务端指纹分析可识别 UA 与 TLS 不匹配，易触发风控/禁言。统一为桌面 Chrome 136 web 端组合。
+/// 默认 User-Agent —— Linux aarch64 桌面 Chrome（与 wreq 的 Emulation::Chrome136
+/// TLS/JA3 指纹同大版本）。目标运行平台即 aarch64 Linux（词典笔），浏览器身份
+/// 与真实硬件平台一致；此前是 Windows 桌面 UA，在 ARM64 Linux 设备上属于
+/// 可识别的 UA/平台错配。统一由 fingerprint 模块单点维护。
 fn default_user_agent() -> String {
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36".to_string()
+    crate::ds_core::default_user_agent()
 }
 
 /// 默认 X-Client-Version —— 对应 DeepSeek web 端。
@@ -311,8 +406,21 @@ impl Config {
         let content = std::fs::read_to_string(path)?;
         let mut config: Self = toml::de::from_str(&content)?;
         config.dedup_accounts();
+        config.pad_limit_lists();
         config.validate()?;
         Ok(config)
+    }
+
+    /// 旧配置兼容：input_character_limits 是后加入的字段，老 config 里没有，
+    /// 反序列化后长度为 1，与多模型 model_types 校验必然冲突。按最后一个值
+    /// 补齐到与 model_types 等长（多出的项截断）。
+    fn pad_limit_lists(&mut self) {
+        let n = self.deepseek.model_types.len();
+        if n == 0 || self.deepseek.input_character_limits.len() == n {
+            return;
+        }
+        let fill = self.deepseek.input_character_limits.last().copied().unwrap_or(2_621_440);
+        self.deepseek.input_character_limits.resize(n, fill);
     }
 
     /// 按 email（优先）或 mobile 去重，保留首次出现的账号
@@ -409,6 +517,13 @@ impl Config {
             return Err(ConfigError::Validation(format!(
                 "max_output_tokens 长度({})必须与 model_types 长度({})一致",
                 self.deepseek.max_output_tokens.len(),
+                n
+            )));
+        }
+        if self.deepseek.input_character_limits.len() != n {
+            return Err(ConfigError::Validation(format!(
+                "input_character_limits 长度({})必须与 model_types 长度({})一致",
+                self.deepseek.input_character_limits.len(),
                 n
             )));
         }

@@ -54,7 +54,7 @@
                                 :class="dc('thumb')"
                                 resize="cover"
                                 :src="fileUrl(img.path)" />
-                        </div>                        <text :class="dc('bubble-text-user')" v-if="m.content">{{ m.content }}</text>
+                        </div>                        <text :class="dc('bubble-text-user')" v-if="m.content">{{ dispText(m.content) }}</text>
                     </div>
                     <div class="msg-actions">
                         <text :class="dc('action')" @click="editMessage(m)">修改</text>
@@ -72,7 +72,7 @@
                             <template v-else>
                                 <div v-if="m.reasoning" :class="dc('reasoning')" @click="toggleReasoning(m.id)">
                                     <text :class="dc('reasoning-head')">{{ isReasoningCollapsed(m.id) ? '展开思考过程' : '收起思考过程' }}</text>
-                                    <text v-if="!isReasoningCollapsed(m.id)" :class="dc('reasoning-body')">{{ m.reasoning }}</text>
+                                    <text v-if="!isReasoningCollapsed(m.id)" :class="dc('reasoning-body')">{{ dispText(m.reasoning) }}</text>
                                 </div>
                                 <text v-if="m.error" :class="dc('bubble-text-error')">{{ m.error }}</text>
                                 <div v-else :class="dc('md')">
@@ -81,7 +81,7 @@
                                             <text v-for="(s, si) in spans(block.text)" :key="si" :class="spanClass(s)"><text v-for="(r, ri) in emojiRuns(s.text)" :key="ri" :class="emojiRunClass(s, r)">{{ r.t }}</text></text>
                                         </div>
                                         <text v-else-if="block.type === 'code'" :class="dc('md-code')">{{ block.text }}</text>
-                                        <text v-else-if="block.type === 'quote'" :class="dc('md-quote')">{{ block.text }}</text>
+                                        <text v-else-if="block.type === 'quote'" :class="dc('md-quote')">{{ dispText(block.text) }}</text>
                                         <text v-else-if="block.type === 'hr'" :class="dc('md-hr')">————————</text>
                                         <div v-else-if="block.type === 'list'" :class="dc('md-list')">
                                             <div v-for="(item, ii) in block.items" :key="ii" class="md-li-row">
@@ -89,7 +89,7 @@
                                                 <text v-for="(s, si) in spans(item)" :key="si" :class="spanClass(s)"><text v-for="(r, ri) in emojiRuns(s.text)" :key="ri" :class="emojiRunClass(s, r)">{{ r.t }}</text></text>
                                             </div>
                                         </div>
-                                        <text v-else :class="dc('md-heading') + ' md-' + block.type">{{ block.text }}</text>
+                                        <text v-else :class="dc('md-heading') + ' md-' + block.type">{{ dispText(block.text) }}</text>
                                     </div>
                                 </div>
                                 <text v-if="m.pending" :class="dc('streaming-hint')">正在生成…</text>
@@ -190,6 +190,7 @@ import { listAlbum, readImageDataUrl } from '../../services/images.js'
 import { openTextEditor, setDebugLogEnabled, stopStream, INPUT_TYPES, ensureBackendRunning } from '../../services/native.js'
 import { markdownToBlocks, inlineSpans, splitEmojiRuns } from '../../services/markdown.js'
 import { ensureEmojiFont } from '../../services/emoji-font.js'
+import { substituteEmoji } from '../../services/emoji-subst.js'
 import { createBackendMonitor } from '../../services/backend-health.js'
 import { appLog } from '../../services/app-log.js'
 
@@ -488,15 +489,23 @@ export default {
             cache.set(key, result)
             return result
         },
-        // emoji 片段拆分（带缓存）：emoji run 单独套 NotoColorEmoji 字体（#2）
+        // emoji 片段拆分（带缓存）：emoji run 单独套 NotoColorEmoji 字体（#2）。
+        // 字体注册不可用时（本设备无 weex/dom 模块），先用 substituteEmoji 把
+        // emoji 换成文字标签，避免白块；注册成功后关闭替换并清缓存重新渲染。
         emojiRuns(text) {
             const key = String(text === undefined || text === null ? '' : text)
             const cache = this._emojiCache || (this._emojiCache = new Map())
             if (cache.has(key)) return cache.get(key)
-            const result = splitEmojiRuns(key)
+            const source = this._emojiFontActive ? key : substituteEmoji(key)
+            const result = splitEmojiRuns(source)
             if (cache.size > 600) cache.clear()
             cache.set(key, result)
             return result
+        },
+        // 纯文本展示路径（用户消息 / 思考过程 / 引用 / 标题）：字体不可用时替换 emoji
+        dispText(text) {
+            const key = String(text === undefined || text === null ? '' : text)
+            return this._emojiFontActive ? key : substituteEmoji(key)
         },
         emojiRunClass(s, r) {
             return this.spanClass(s) + (r.e ? ' md-emoji' : '')
@@ -582,20 +591,26 @@ export default {
         },
 
         // ---------- 初始化 / 生命周期 ----------
-        // Emoji 字体开关打开时：下载（如需）并注册，成功后重渲染生效（#2）
+        // Emoji 字体开关打开时：下载（如需）并注册，成功后重渲染生效（#2）。
+        // 注册成功 → 关闭文本替换（_emojiFontActive），清缓存后强制重渲染；
+        // 注册失败（设备不支持/下载失败）→ 保持替换，emoji 以文字标签展示。
         ensureEmojiFontIfEnabled() {
             if (!(this.settings && this.settings.emojiFont)) return
             ensureEmojiFont()
                 .then((r) => {
                     if (r.ok) {
+                        this._emojiFontActive = true
+                        if (this._emojiCache) this._emojiCache.clear()
                         this.$forceUpdate()
                         return
                     }
                     // 失败原因写日志：开关显示"已开启"但只渲染出白块时，
                     // 用户能在"查看日志"里看到到底是设备不支持还是下载失败。
-                    appLog('[index] emoji 字体不可用：' + (r.message || '未知原因'))
+                    this._emojiFontActive = false
+                    appLog('[index] emoji 字体不可用（已用文字替换 emoji）：' + (r.message || '未知原因'))
                 })
                 .catch((e) => {
+                    this._emojiFontActive = false
                     appLog('[index] emoji 字体异常：' + (e && e.message ? e.message : String(e)))
                 })
         },

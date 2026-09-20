@@ -3,7 +3,7 @@
 //! 1 account = 1 session = 1 concurrency。多并发需横向扩展账号数。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use dashmap::DashMap;
@@ -56,6 +56,10 @@ pub struct AccountStatus {
     pub last_released_ms: i64,
     /// 连续登录失败次数
     pub error_count: u8,
+    /// 当前配额窗口内已用请求数
+    pub used_this_hour: u64,
+    /// 本窗口是否已用尽配额（0 配额 = 不限制，恒为 false）
+    pub quota_exhausted: bool,
 }
 
 pub struct Account {
@@ -71,10 +75,68 @@ pub struct Account {
     mute_until: AtomicI64,
     /// 原始凭据（用于重新登录）
     creds: AccountConfig,
+    /// 滑动窗口内的请求计数（用于每小时配额）
+    window: RequestWindow,
 }
 
 /// 连续登录失败上限，达到后标记为 Invalid
 const MAX_ERROR_COUNT: u8 = 3;
+
+/// 一小时窗口请求计数器
+///
+/// 上游实测同一账号累计约 215 次请求后会被禁言（biz_code=5），且禁言是
+/// **延迟判定**的（跑完才封）。实现为「固定起点 + 一小时」的简单窗口：
+/// 达到上限后该账号本窗口内不可用，窗口过期自动恢复。精度足够且纯原子
+/// 操作、不加锁。
+struct RequestWindow {
+    /// 窗口起点（Unix 秒）
+    started_at: AtomicI64,
+    /// 窗口内累计请求数
+    count: AtomicU64,
+}
+
+/// 配额窗口长度：1 小时
+const WINDOW_SECS: i64 = 3600;
+
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+impl RequestWindow {
+    fn new() -> Self {
+        Self {
+            started_at: AtomicI64::new(now_secs()),
+            count: AtomicU64::new(0),
+        }
+    }
+
+    /// 记一次请求并返回窗口内的累计值；跨窗口时自动重置
+    fn record(&self) -> u64 {
+        let now = now_secs();
+        let start = self.started_at.load(Ordering::Relaxed);
+        if now - start >= WINDOW_SECS
+            && self
+                .started_at
+                .compare_exchange(start, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.count.store(0, Ordering::Relaxed);
+        }
+        self.count.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// 当前窗口内已用请求数（不修改状态；过期窗口视作 0）
+    fn used(&self) -> u64 {
+        if now_secs() - self.started_at.load(Ordering::Relaxed) >= WINDOW_SECS {
+            0
+        } else {
+            self.count.load(Ordering::Relaxed)
+        }
+    }
+}
 
 impl Account {
     pub fn token(&self) -> Arc<str> {
@@ -109,6 +171,23 @@ impl Account {
 
     pub fn set_mute_until(&self, secs: i64) {
         self.mute_until.store(secs, Ordering::Relaxed);
+    }
+
+    /// 该账号在本配额窗口内是否还能继续使用（`limit == 0` 表示不限制）
+    fn within_quota(&self, limit: u64) -> bool {
+        limit == 0 || self.window.used() < limit
+    }
+
+    /// 记一次请求用量；达到配额时打一次告警
+    fn record_request(&self, limit: u64) {
+        let used = self.window.record();
+        if limit > 0 && used == limit {
+            warn!(
+                target: "ds_core::accounts",
+                "账号 {} 已达到每小时请求配额（{}），本窗口内不再分配；上游在账号累计数百次请求后会禁言，请增加账号数而不是抬高配额",
+                self.display_id(), limit
+            );
+        }
     }
 }
 
@@ -153,6 +232,8 @@ impl Drop for AccountGuard {
 }
 
 pub struct AccountPool {
+    /// 每账号每小时请求上限（0 = 不限制）
+    hourly_quota: u64,
     /// key = display_id (email or mobile), value = Account
     accounts: DashMap<String, Arc<Account>>,
     client: RwLock<Option<DsClient>>,
@@ -164,6 +245,14 @@ pub enum PoolError {
     /// 所有账号初始化失败（没有可用账号）
     #[error("所有账号初始化失败")]
     AllAccountsFailed,
+
+    /// 登录被设备风控拒绝：device_id 无效/伪造（biz_code 11, RISK_DEVICE_DETECTED）
+    #[error("设备风控拦截: {message}")]
+    RiskDeviceDetected {
+        #[allow(dead_code)]
+        code: i64,
+        message: String,
+    },
 
     /// 下游客户端错误（网络、API 错误等）
     #[error("客户端错误: {0}")]
@@ -191,8 +280,9 @@ pub enum PoolError {
 }
 
 impl AccountPool {
-    pub fn new() -> Self {
+    pub fn new(hourly_quota: u64) -> Self {
         Self {
+            hourly_quota,
             accounts: DashMap::new(),
             client: RwLock::new(None),
             solver: RwLock::new(None),
@@ -213,6 +303,8 @@ impl AccountPool {
         if creds.is_empty() {
             return Ok(());
         }
+
+        warn_on_shared_device_ids(&creds);
 
         use futures::future::join_all;
         use std::sync::Arc;
@@ -325,8 +417,8 @@ impl AccountPool {
 
     /// 获取空闲最久的可用账号（不等待，立即返回）
     ///
-    /// 遍历所有账号，选冷却已过且空闲时间最长的那个，最大化每次使用间隔。
-    /// DashMap 无锁读，不阻塞并发请求。
+    /// 遍历所有账号，选冷却已过、配额未用尽且空闲时间最长的那个，
+    /// 最大化每次使用间隔。DashMap 无锁读，不阻塞并发请求。
     pub fn get_account(&self) -> Option<AccountGuard> {
         if self.accounts.is_empty() {
             return None;
@@ -343,6 +435,10 @@ impl AccountPool {
         for entry in self.accounts.iter() {
             let account = entry.value();
             if !account.is_available() {
+                continue;
+            }
+            // 超出每小时配额的账号本窗口内不再分配（0 = 不限制）
+            if !account.within_quota(self.hourly_quota) {
                 continue;
             }
             let idle = now_ms - account.last_released.load(Ordering::Relaxed);
@@ -362,10 +458,14 @@ impl AccountPool {
                 Ordering::Relaxed,
             )
             .ok()?;
+        account.record_request(self.hourly_quota);
         Some(AccountGuard { account })
     }
 
     /// 获取指定账号（会话复用：续聊/重答必须用创建会话的同一账号），空闲时立即返回
+    ///
+    /// 会话亲和优先于配额：续聊中的请求即使账号配额已满也放行（否则对话中断），
+    /// 但用量照常计数。
     pub fn get_account_by_id(&self, email_or_mobile: &str) -> Option<AccountGuard> {
         let entry = self.accounts.get(email_or_mobile)?;
         let account = entry.value();
@@ -381,6 +481,7 @@ impl AccountPool {
                 Ordering::Relaxed,
             )
             .ok()?;
+        account.record_request(self.hourly_quota);
         Some(AccountGuard {
             account: Arc::clone(account),
         })
@@ -404,6 +505,8 @@ impl AccountPool {
                     state: a.state().as_str().to_string(),
                     last_released_ms: a.last_released.load(Ordering::Relaxed),
                     error_count: a.error_count.load(Ordering::Relaxed),
+                    used_this_hour: a.window.used(),
+                    quota_exhausted: !a.within_quota(self.hourly_quota),
                 }
             })
             .collect()
@@ -561,6 +664,8 @@ async fn init_account(
         // 后续重试跳过，避免登录阶段反复发 completion
         match try_init_account(creds, client, solver, attempt == 1).await {
             Ok(account) => return Ok(account),
+            // 设备风控拒绝（伪造/无效 device_id）：重试无意义，直接返回明确指引
+            Err(e @ PoolError::RiskDeviceDetected { .. }) => return Err(e),
             Err(e) => {
                 last_error = Some(e);
                 if attempt < 3 {
@@ -571,6 +676,38 @@ async fn init_account(
     }
 
     Err(last_error.expect("循环至少执行一次"))
+}
+
+/// 检测多个账号共用同一个 `device_id` 并告警（不阻止启动，只让用户看到风险）
+///
+/// 设备指纹是**设备级**的，上游用它做关联与画像。上游实测：同一个 device_id
+/// 下挂多个账号、累计数百次请求后，这些账号会被禁言（biz_code=5）。
+fn warn_on_shared_device_ids(creds: &[AccountConfig]) {
+    let mut by_device: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::new();
+    for c in creds {
+        let device = c.device_id.trim();
+        if device.is_empty() {
+            continue;
+        }
+        let id = if c.email.is_empty() {
+            c.mobile.as_str()
+        } else {
+            c.email.as_str()
+        };
+        by_device.entry(device).or_default().push(id);
+    }
+
+    for (device, accounts) in by_device {
+        if accounts.len() > 1 {
+            let prefix: String = device.chars().take(12).collect();
+            warn!(
+                target: "ds_core::accounts",
+                "{} 个账号共用同一个 device_id（{}…）：{}。设备指纹被上游用于关联与画像，共用会显著提升连坐禁言风险；建议每个账号用独立浏览器配置文件各抓取一个 device_id",
+                accounts.len(), prefix, accounts.join(", ")
+            );
+        }
+    }
 }
 
 async fn try_init_account(
@@ -622,6 +759,26 @@ async fn try_init_account(
             let _result = crate::server::captcha_bridge::wait_for_solution(rx, 600).await;
             // 用户完成验证后重试登录（若 DeepSeek 需要把验证结果带回，可在此扩展登录参数）
             client.login(&login_payload).await?
+        }
+        Err(ClientError::Business { code, msg })
+            if code == 11 || msg.to_uppercase().contains("RISK_DEVICE") =>
+        {
+            // 数美设备风控拒绝：device_id 无效/伪造。重试无意义，返回带
+            // 抓取指引的错误（device_id 无法在服务端伪造，必须真机抓取）。
+            warn!(
+                target: "ds_core::accounts",
+                "登录被设备风控拒绝（biz_code={} {}）：当前 device_id 无效。请用 Chrome 登录一次 \
+                 chat.deepseek.com，在 Network 面板 users/login 请求体中复制真实 device_id 填入账号配置",
+                code, msg
+            );
+            return Err(PoolError::RiskDeviceDetected {
+                code,
+                message: format!(
+                    "登录被设备风控拒绝（{}）：device_id 无效或缺失。请在浏览器登录 \
+                     chat.deepseek.com 一次，从 users/login 请求体抓取真实 device_id 填入该账号配置（每个账号独立一个）",
+                    msg
+                ),
+            });
         }
         Err(e) => return Err(e.into()),
     };
@@ -680,6 +837,7 @@ async fn try_init_account(
         error_count: AtomicU8::new(0),
         mute_until: AtomicI64::new(mute_until),
         creds: creds.clone(),
+        window: RequestWindow::new(),
     })
 }
 
@@ -722,4 +880,150 @@ async fn health_check(
         model_type, display_id, start.elapsed()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn account(email: &str, device_id: &str) -> AccountConfig {
+        AccountConfig {
+            email: email.to_string(),
+            mobile: String::new(),
+            area_code: String::new(),
+            password: "pw".to_string(),
+            device_id: device_id.to_string(),
+            smid: String::new(),
+        }
+    }
+
+    fn idle_account(email: &str) -> Arc<Account> {
+        Arc::new(Account {
+            token: std::sync::RwLock::new("t".into()),
+            email: email.to_string(),
+            mobile: String::new(),
+            state: AtomicU8::new(AccountState::Idle as u8),
+            last_released: AtomicI64::new(0),
+            error_count: AtomicU8::new(0),
+            mute_until: AtomicI64::new(0),
+            creds: account(email, "dev"),
+            window: RequestWindow::new(),
+        })
+    }
+
+    #[test]
+    fn window_counts_and_reports_usage() {
+        let w = RequestWindow::new();
+        assert_eq!(w.used(), 0);
+        assert_eq!(w.record(), 1);
+        assert_eq!(w.record(), 2);
+        assert_eq!(w.used(), 2);
+    }
+
+    #[test]
+    fn quota_of_zero_means_unlimited() {
+        let a = idle_account("a@example.com");
+        for _ in 0..500 {
+            a.record_request(0);
+        }
+        assert!(a.within_quota(0), "0 必须表示不限制");
+    }
+
+    #[test]
+    fn account_is_blocked_after_reaching_quota() {
+        let a = idle_account("a@example.com");
+        let limit = 3;
+        assert!(a.within_quota(limit));
+        a.record_request(limit);
+        a.record_request(limit);
+        assert!(a.within_quota(limit), "达到上限前仍可用");
+        a.record_request(limit);
+        assert!(!a.within_quota(limit), "达到上限后该窗口内不应再被分配");
+    }
+
+    #[test]
+    fn expired_window_resets_usage() {
+        let w = RequestWindow::new();
+        for _ in 0..5 {
+            w.record();
+        }
+        assert_eq!(w.used(), 5);
+        // 把窗口起点拨回过去，模拟窗口过期
+        w.started_at
+            .store(now_secs() - WINDOW_SECS - 1, Ordering::Relaxed);
+        assert_eq!(w.used(), 0, "窗口过期后用量应视作 0");
+        assert_eq!(w.record(), 1, "过期后重新计数应从 1 开始");
+    }
+
+    #[test]
+    fn shared_device_ids_are_detected() {
+        let creds = vec![
+            account("a@example.com", "same-device"),
+            account("b@example.com", "same-device"),
+            account("c@example.com", "own-device"),
+        ];
+        let mut by_device: std::collections::HashMap<&str, Vec<&str>> =
+            std::collections::HashMap::new();
+        for c in &creds {
+            if !c.device_id.trim().is_empty() {
+                by_device
+                    .entry(c.device_id.as_str())
+                    .or_default()
+                    .push(c.email.as_str());
+            }
+        }
+        let shared: Vec<_> = by_device.iter().filter(|(_, v)| v.len() > 1).collect();
+        assert_eq!(shared.len(), 1, "应只检出一组共用指纹");
+        assert_eq!(shared[0].1.len(), 2);
+    }
+
+    #[test]
+    fn pool_skips_accounts_that_exhausted_their_quota() {
+        let pool = AccountPool::new(2);
+        pool.accounts
+            .insert("a@example.com".to_string(), idle_account("a@example.com"));
+
+        // 配额 2：第一次可分配；手动释放（模拟 Guard Drop）后第二次仍可；
+        // 用尽后（配额 2 计满）不再分配
+        let g1 = pool.get_account();
+        assert!(g1.is_some(), "第 1 次应可分配");
+        drop(g1); // Guard Drop 释放回 Idle，但已计入 1 次用量
+        let g2 = pool.get_account();
+        assert!(g2.is_some(), "第 2 次应可分配");
+        drop(g2);
+        assert!(
+            pool.get_account().is_none(),
+            "配额用尽后不应再分配该账号（调用方据此返回 429）"
+        );
+    }
+
+    #[test]
+    fn pool_with_unlimited_quota_never_blocks() {
+        let pool = AccountPool::new(0);
+        pool.accounts
+            .insert("a@example.com".to_string(), idle_account("a@example.com"));
+        for i in 0..50 {
+            let guard = pool.get_account();
+            assert!(guard.is_some(), "配额 0 时第 {i} 次也应可分配");
+            drop(guard);
+        }
+    }
+
+    #[test]
+    fn exhausted_account_does_not_block_other_accounts() {
+        let pool = AccountPool::new(1);
+        pool.accounts
+            .insert("a@example.com".to_string(), idle_account("a@example.com"));
+        pool.accounts
+            .insert("b@example.com".to_string(), idle_account("b@example.com"));
+
+        // 两个账号各能用 1 次（顺序取决于「空闲最久」策略）
+        let g1 = pool.get_account();
+        assert!(g1.is_some());
+        drop(g1);
+        let g2 = pool.get_account();
+        assert!(g2.is_some());
+        drop(g2);
+        assert!(pool.get_account().is_none(), "两个账号都用尽后应返回 None");
+    }
 }

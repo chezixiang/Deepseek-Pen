@@ -5,12 +5,15 @@
 mod accounts;
 mod client;
 mod completions;
+mod hif;
+mod mint;
 mod pow;
 mod fingerprint;
 
 pub use accounts::AccountStatus;
 pub use accounts::PoolError;
-pub use fingerprint::{DeviceFingerprint, submit_fingerprint};
+pub use fingerprint::{default_user_agent, DeviceFingerprint, submit_fingerprint};
+pub use mint::mint_device_id;
 pub use client::{CloudMessage, CloudSession};
 pub use completions::{
     CachedConversation, ChatRequest, ChatResponse, ConversationPlan, FilePayload, ReuseTarget,
@@ -67,12 +70,26 @@ impl DeepSeekCore {
             config.deepseek.client_bundle_id.clone(),
             config.deepseek.client_timezone_offset,
             config.proxy.url.as_deref(),
+            client::preloaded_cookies_from_accounts(&config.accounts),
+            config.deepseek.hif_leim.clone(),
+            config.deepseek.hif_dliq.clone(),
+            config.deepseek.hif_auto_fetch,
         );
 
         let wasm_bytes = client.get_wasm().await?;
         let solver = PowSolver::new(&wasm_bytes)?;
 
-        let pool = AccountPool::new();
+        // 启动时动态采集一次设备指纹并记录（Linux aarch64 Chrome 身份 + 真实
+        // 硬件特征）。用于核对 UA/平台一致性与排查风控问题。
+        let fp = fingerprint::DeviceFingerprint::from_config(config.deepseek.fingerprint.as_ref());
+        log::info!(
+            target: "ds_core::fingerprint",
+            "设备指纹（动态采集）: platform={}, ua={}, screen={}, cores={}, memGB={}, tz={}min, webgl={}",
+            fp.platform, fp.user_agent, fp.screen, fp.hardware_concurrency,
+            fp.device_memory, fp.timezone_offset, fp.webgl_fingerprint
+        );
+
+        let pool = AccountPool::new(config.deepseek.hourly_request_quota);
         pool.init(config.accounts.clone(), &client, &solver)
             .await
             .map_err(|e| match e {
@@ -81,6 +98,9 @@ impl DeepSeekCore {
                 }
                 accounts::PoolError::Client(e) => CoreError::ProviderError(e.to_string()),
                 accounts::PoolError::Pow(e) => CoreError::ProofOfWorkFailed(e),
+                accounts::PoolError::RiskDeviceDetected { message, .. } => {
+                    CoreError::ProviderError(message)
+                }
                 accounts::PoolError::Validation(msg) => {
                     CoreError::ProviderError(format!("配置错误: {}", msg))
                 }

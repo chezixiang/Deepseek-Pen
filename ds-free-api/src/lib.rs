@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 pub mod anthropic_compat;
 pub mod config;
 pub mod ds_core;
