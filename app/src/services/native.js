@@ -438,13 +438,37 @@ async function truncateRuntimeLog() {
  * 返回 { ok, message }。写入即视为成功（配置已落盘），health 探活失败也不回滚用户输入，
  * 只提示"配置已保存，服务可能仍在启动"。
  */
+// 读取 config.toml；缺失时先尝试自愈重建，再读一次。
+//
+// 卸载重装 / 覆盖安装后 config.toml 可能不存在（旧版把重建逻辑放在 deployBackend 末尾，
+// 而那之后有提前 return 的分支，配置就永远补不回来），用户会看到
+// "无法读取 ds-free-api 配置文件（路径 …）"（bug 报告 3）。
+// 这里在真正要用配置的三个入口统一兜一层，避免"配置没了 → 账号存不进去"的死局。
+async function readConfigOrRepair() {
+  const DS_CONFIG = dsConfigPath()
+  const raw = await readFile(DS_CONFIG)
+  if (raw !== null) return raw
+  appLog('[config] config.toml 缺失，尝试自愈重建')
+  const r = await ensureDsConfig()
+  if (!r.ok) return null
+  // 重建后必须重启后端，否则跑着的进程仍持旧 api_key
+  await restartDsFreeApi()
+  return await readFile(DS_CONFIG)
+}
+
+/**
+ * 更新本机 ds-free-api 的登录账号并重启服务。
+ * 流程：读取 config.toml → JS 改写 [[accounts]] 段 → 写回（经临时文件 cp）→ 重启 → 轮询验证 /health。
+ * 返回 { ok, message }。写入即视为成功（配置已落盘），health 探活失败也不回滚用户输入，
+ * 只提示"配置已保存，服务可能仍在启动"。
+ */
 export async function updateDsFreeApiAccount(user, pass) {
   const cleanUser = sanitizeCred(user)
   const cleanPass = sanitizeCred(pass)
   if (!cleanUser || !cleanPass) return makeErr(10001, '账号和密码不能为空')
   const DS_CONFIG = dsConfigPath()
   try {
-    const raw = await readFile(DS_CONFIG)
+    const raw = await readConfigOrRepair()
     if (raw === null) return makeErr(10201, '无法读取 ds-free-api 配置文件（路径：' + DS_CONFIG + '）')
     const next = replaceAccount(raw, cleanUser, cleanPass)
     if (next === null) return makeErr(10203, 'config.toml 中未找到 [[accounts]] 段')
@@ -512,7 +536,7 @@ export async function updateDsFreeApiAccount(user, pass) {
 export async function clearDsFreeApiAccount() {
   const DS_CONFIG = dsConfigPath()
   try {
-    const raw = await readFile(DS_CONFIG)
+    const raw = await readConfigOrRepair()
     if (raw === null) return makeErr(10201, '无法读取 ds-free-api 配置文件（路径：' + DS_CONFIG + '）')
     const next = replaceAccount(raw, '', '')
     if (next === null) return makeErr(10203, 'config.toml 中未找到 [[accounts]] 段')
@@ -631,7 +655,7 @@ export async function updateDsFreeApiProxy(url) {
   if (invalid) return makeErr(10001, '代理地址' + invalid)
   const DS_CONFIG = dsConfigPath()
   try {
-    const raw = await readFile(DS_CONFIG)
+    const raw = await readConfigOrRepair()
     if (raw === null) return makeErr(10201, '无法读取 ds-free-api 配置文件（路径：' + DS_CONFIG + '）')
     const next = replaceProxySection(raw, clean)
     if (next === raw) return { ok: true, message: clean ? '代理未变化' : '本就未配置代理' }
@@ -687,18 +711,30 @@ async function restartDsFreeApi() {
   const logFile = dsRuntimeLogPath()
   const pidFile = joinDataDir('ds-pid.txt')
   await writeFile(resultFile, '')
-  // 先读上次记录的 PID（若存在）逐个 kill -9，再 pkill -9 兜底，确保不会残留孤儿进程。
-  // 之前只 pkill -9 可能因 execShell 异步时序没杀干净，导致新旧两个进程同时存在
-  // （一个绑 22217 一个切 22218，应用连上旧进程 → "连接已断开"）。
+
+  // 清理旧后端进程。三条路子叠加，因为单靠任何一条都会漏（真机实测）：
+  //  1) 记录的 PID（精确，但卸载重装后 PID 文件已随目录被清掉）；
+  //  2) **fuser -k 按端口杀** —— 这是关键且唯一可靠的兜底：pkill 匹配的是进程名，
+  //     实测 `pkill -9 -x ds-free-api` 在本机返回 1（v1.34.1 busybox 的 -x 与进程名
+  //     匹配不上），进程根本杀不掉；而 fuser 直接问内核"谁占着这个端口"，无需名字匹配。
+  //     僵尸后端的 cwd 已被删除、名字也可能变化，只有按端口才能找到它。
+  //  3) pkill（不带 -x，宽匹配）兜底，覆盖还占着非标准端口的游离进程。
   const oldPid = String(await readFile(pidFile) || '').trim()
   const killOld = oldPid && /^\d+$/.test(oldPid)
     ? 'kill -9 ' + shq(oldPid) + ' 2>/dev/null; '
     : ''
+  const killByPort = DS_PORTS
+    .map((p) => 'fuser -k -9 ' + p + '/tcp 2>/dev/null; ')
+    .join('')
   const command =
     killOld +
     'pkill -9 -x ds-free-api 2>/dev/null; ' +
+    killByPort +
+    'pkill -9 ds-free-api 2>/dev/null; ' +
+    // 等端口真正释放：按端口 fuser 判定比 ss 可靠（本机无 ss，netstat 是 busybox 精简版
+    // 且不支持 -p，只能列出状态不能定位进程）。最多等 10 秒。
     'for i in 1 2 3 4 5 6 7 8 9 10; do ' +
-    'if ! (ss -tln 2>/dev/null | grep -q ":22217 " || netstat -tln 2>/dev/null | grep -q ":22217 "); then break; fi; ' +
+    'if ! (fuser ' + DS_PORTS[0] + '/tcp >/dev/null 2>&1); then break; fi; ' +
     'sleep 1; done; ' +
     'cd ' + shq(DS_FREE_API_DIR) + ' && ' +
     '(DS_DATA_DIR=' + shq(DS_FREE_API_DIR) + ' nohup ./ds-free-api >> ' + shq(logFile) + ' 2>&1 & echo $! > ' + shq(pidFile) + ') && ' +
@@ -828,6 +864,112 @@ async function deployedBackendMatches() {
   }
 }
 
+// 确保 config.toml 存在并修正常见问题。
+//
+// 必须在 deployBackend 的"快速路径"提前返回**之前**调用：二进制与摘要都匹配、
+// 但 config.toml 丢失时（覆盖安装、迁移异常、用户手删），旧实现直接 return，
+// 配置文件永远不会重建 → 后续 updateDsFreeApiAccount / loadAccountList 报
+// "无法读取 ds-free-api 配置文件（路径 …）"，账号也存不进去。
+//
+// 返回 { ok, existed, changed }：existed=false 表示本次新建；changed=true 表示写盘了
+// （新建或被修正），调用方据此决定要不要重启后端让新配置生效。
+async function ensureDsConfig() {
+  const DS_CONFIG = dsConfigPath()
+
+  if (await exists(DS_CONFIG)) {
+    const before = String(await readFile(DS_CONFIG) || '')
+    let raw = before
+    // 指纹修复无条件跑：除了替换旧值，还要补齐新增字段（旧的 indexOf 判断会漏掉这类配置）
+    const fixed = fixFingerprint(raw)
+    if (fixed && fixed !== raw) {
+      raw = fixed
+      debugLog('DS | 已修复 config.toml 指纹字段（UA/version/platform/bundle_id/timezone）')
+    }
+    const fixedTypes = fixModelTypes(raw)
+    if (fixedTypes && fixedTypes !== raw) {
+      raw = fixedTypes
+      debugLog('DS | 已把 config.toml model_types 收敛为合并后的 ["default"]')
+    }
+    if (raw !== before) {
+      await writeFile(DS_CONFIG, raw)
+      appLog('[deploy] config.toml 已自动修复')
+      return { ok: true, existed: true, changed: true }
+    }
+    return { ok: true, existed: true, changed: false }
+  }
+
+  // 缺失：先确保目录存在。SDK 的 fs.writeFile 不会自动建目录，
+  // 而 migrateLegacyDir 的 mkdir 是异步 execShell，不保证已完成——目录真缺时
+  // 直接 writeFile 会静默失败，配置依旧补不回来。
+  const mkdirResult = joinDataDir('ds-mkdir-result.txt')
+  await writeFile(mkdirResult, '')
+  execShell('mkdir -p ' + shq(dsHomeDir()) + ' ' + shq(joinPath(dsHomeDir(), 'logs')) + '; printf ok > ' + shq(mkdirResult))
+  const mkdirOut = String(await waitForFile(mkdirResult, 8000) || '').trim()
+  execShell('rm -f ' + shq(mkdirResult) + ' 2>/dev/null || true')
+  appLog('[deploy] config.toml 缺失，mkdir=' + (mkdirOut || '(未确认)'))
+
+  // 写入最小 config.toml（供后续 updateDsFreeApiAccount 改写 [[accounts]]）。
+  // model_types 只有 "default"：官方 2026-09-12 合并了快速/专家/识图，
+  // expert 与 vision 已 enabled:false，default 自带图片理解（file_feature.vision=true）。
+  // 浏览器指纹统一 Linux aarch64 Chrome 136（与后端 Emulation::Chrome136 的
+  // TLS 指纹同大版本，且与词典笔真实硬件平台一致）。
+  const minConfig = [
+    '[server]',
+    'port = 22217',
+    'host = "127.0.0.1"',
+    '',
+    '[deepseek]',
+    'api_base = "https://chat.deepseek.com/api/v0"',
+    'wasm_url = "https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm"',
+    'user_agent = "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"',
+    'client_version = "2.5.0"',
+    'client_platform = "web"',
+    'client_locale = "zh_CN"',
+    'client_bundle_id = "com.deepseek.chat"',
+    'client_timezone_offset = 28800',
+    'model_types = ["default"]',
+    // 实测 input_character_limit = 2621440；旧模板写 4096 会把长上下文提前截断
+    'max_input_tokens = [1048576]',
+    'max_output_tokens = [384000]',
+    // 每账号每小时请求上限（上游实测 ~215 次/小时会触发禁言；0 = 不限制）
+    'hourly_request_quota = 60',
+    '',
+    '[[accounts]]',
+    'email = ""',
+    'mobile = ""',
+    'area_code = "+86"',
+    'password = ""',
+    ''
+  ].join('\n')
+  const configOk = await writeFile(DS_CONFIG, minConfig)
+  appLog('[deploy] config.toml 缺失，已重建最小配置 ok=' + configOk)
+  return { ok: !!configOk, existed: false, changed: !!configOk }
+}
+
+// 检测占着后端端口的"僵尸"后端：覆盖安装 / 卸载重装后，旧后端进程仍在运行，
+// 但它的工作目录已被替换（readlink /proc/PID/cwd 含 "(deleted)"）。
+//
+// 后果很隐蔽：僵尸进程一直用着**旧配置里的旧 api_key** 占住 22217，新进程只能退到
+// 22218；而应用健康检查按端口顺序优先命中 22217 → 拿新 key 请求旧进程 →
+// 必然 401「未认证」。所以重启前必须把这类进程清掉。
+// 返回形如 "1234:22217 5678:22218" 的描述串，空串表示没有僵尸。
+async function detectStaleBackend() {
+  const resultFile = joinDataDir('ds-stale-check.txt')
+  await writeFile(resultFile, '')
+  const cmd =
+    'if command -v fuser >/dev/null 2>&1; then ' +
+    'for p in ' + DS_PORTS.join(' ') + '; do ' +
+    'for pid in $(fuser $p/tcp 2>/dev/null); do ' +
+    'cwd=$(readlink /proc/$pid/cwd 2>/dev/null); ' +
+    'case "$cwd" in *deleted*) printf "%s:%s " "$pid" "$p" >> ' + shq(resultFile) + ';; esac; ' +
+    'done; done; fi; ' +
+    'printf done >> ' + shq(resultFile)
+  execShell(cmd)
+  const out = String(await waitForFile(resultFile, 6000) || '')
+  execShell('rm -f ' + shq(resultFile) + ' 2>/dev/null || true')
+  return out.replace(/done\s*$/, '').trim()
+}
+
 // 本二进制支持的 CPU 架构。BACKEND_ARCH 形如 "linux-aarch64-gnu"，取中段比较 uname -m。
 // 当前仅用于日志/诊断展示，不参与部署阻断（部署成败由 healthCheck 判定）。
 function supportedArch() {
@@ -843,6 +985,13 @@ export async function deployBackend() {
 
   // 一次性迁移旧目录里的 config.toml（幂等，见 migrateLegacyDir 注释）
   await migrateLegacyDir()
+
+  // config.toml 的保障必须放在**快速路径之前**：二进制与摘要匹配但配置丢失时，
+  // 快速路径会直接 return，配置就永远补不回来（bug 报告 3 的成因）。
+  const cfgResult = await ensureDsConfig()
+  if (!cfgResult.ok) return makeErr(ERR.CONFIG_WRITE_FAILED, '写入配置文件失败')
+  // 配置本次新建或被修正 → 必须让后端重启一次，否则跑着的进程仍持旧 api_key/账号
+  const configNeedsRestart = cfgResult.changed
 
   // 快速路径：设备上已有二进制，且其摘要与本次内嵌的一致时才能跳过
   // 6MB base64 写盘 + 解码（同一安装内每次启动都做这些很慢）。
@@ -860,7 +1009,12 @@ export async function deployBackend() {
       const result = String(await waitForFile(resultFile, 5000) || '').trim()
       execShell('rm -f ' + shq(resultFile) + ' 2>/dev/null || true')
       if (result === 'unchanged') {
-        return { ok: true, updated: false, message: '后端已是最新版本' }
+        return {
+          ok: true,
+          updated: false,
+          configRepaired: configNeedsRestart,
+          message: configNeedsRestart ? '已重建后端配置' : '后端已是最新版本'
+        }
       }
       // chmod/写结果失败则继续走全量部署
       appLog('[deploy] 快速路径失败 result=' + (result || '(空)') + '，走全量')
@@ -918,74 +1072,17 @@ export async function deployBackend() {
     execShell('rm -f ' + shq(tmpB64) + ' ' + shq(tmpBin) + ' ' + shq(stagedBin) + ' ' + shq(resultFile) + ' 2>/dev/null || true')
   }
 
-  // 仅首次部署写入最小 config.toml，保留用户已有配置。
-  // 存量配置修复（均行级替换，保留用户其余配置）：
-  // 1) 指纹修复：旧版 Chrome/151 + Edg/151（与 TLS Chrome136 不匹配）、client_version 落后，
-  //    并补齐新增的 client_bundle_id / client_timezone_offset；
-  // 2) 模型修复：官方已合并模型，把 model_types 收敛为 ["default"]，
-  //    否则应用继续请求已下线的 expert/vision。
-  const DS_CONFIG = dsConfigPath()
-  if (await exists(DS_CONFIG)) {
-    let raw = String(await readFile(DS_CONFIG) || '')
-    // 指纹修复无条件跑：除了替换旧值，还要补齐新增字段（旧的 indexOf 判断会漏掉这类配置）
-    const fixed = fixFingerprint(raw)
-    if (fixed && fixed !== raw) {
-      raw = fixed
-      debugLog('DS | 已修复 config.toml 指纹字段（UA/version/platform/bundle_id/timezone）')
-    }
-    const fixedTypes = fixModelTypes(raw)
-    if (fixedTypes && fixedTypes !== raw) {
-      raw = fixedTypes
-      debugLog('DS | 已把 config.toml model_types 收敛为合并后的 ["default"]')
-    }
-    if (raw !== String(await readFile(DS_CONFIG) || '')) {
-      await writeFile(DS_CONFIG, raw)
-      appLog('[deploy] config.toml 已自动修复')
-    }
-    return {
-      ok: true,
-      updated: !!backendUpdated,
-      message: backendUpdated ? '后端已更新' : '后端已是最新版本'
-    }
+  // config.toml 已在本函数开头由 ensureDsConfig() 统一保障（新建 / 修正 / 指纹与模型收敛），
+  // 这里只负责汇报结果。旧实现在这里才做配置处理，快速路径提前 return 时整段被跳过，
+  // 导致配置丢失后永远补不回来。
+  return {
+    ok: true,
+    updated: !!backendUpdated,
+    configRepaired: configNeedsRestart,
+    message: backendUpdated
+      ? '后端已更新'
+      : (configNeedsRestart ? '已重建后端配置' : '后端已是最新版本')
   }
-
-  // 写入最小 config.toml（供后续 updateDsFreeApiAccount 改写 [[accounts]]）。
-  // model_types 只有 "default"：官方 2026-09-12 合并了快速/专家/识图，
-  // expert 与 vision 已 enabled:false，default 自带图片理解（file_feature.vision=true）。
-  // 浏览器指纹统一 Linux aarch64 Chrome 136（与后端 Emulation::Chrome136 的
-  // TLS 指纹同大版本，且与词典笔真实硬件平台一致）。
-  const minConfig = [
-    '[server]',
-    'port = 22217',
-    'host = "127.0.0.1"',
-    '',
-    '[deepseek]',
-    'api_base = "https://chat.deepseek.com/api/v0"',
-    'wasm_url = "https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm"',
-    'user_agent = "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"',
-    'client_version = "2.5.0"',
-    'client_platform = "web"',
-    'client_locale = "zh_CN"',
-    'client_bundle_id = "com.deepseek.chat"',
-    'client_timezone_offset = 28800',
-    'model_types = ["default"]',
-    // 实测 input_character_limit = 2621440；旧模板写 4096 会把长上下文提前截断
-    'max_input_tokens = [1048576]',
-    'max_output_tokens = [384000]',
-    // 每账号每小时请求上限（上游实测 ~215 次/小时会触发禁言；0 = 不限制）
-    'hourly_request_quota = 60',
-    '',
-    '[[accounts]]',
-    'email = ""',
-    'mobile = ""',
-    'area_code = "+86"',
-    'password = ""',
-    ''
-  ].join('\n')
-  const configOk = await writeFile(DS_CONFIG, minConfig)
-  if (!configOk) return makeErr(ERR.CONFIG_WRITE_FAILED, '写入配置文件失败')
-
-  return { ok: true, message: '后端部署成功，请填写账号密码' }
 }
 
 // 全局互斥：startup 页和 index 页可能同时调用 ensureBackendRunning，
@@ -1000,6 +1097,21 @@ export async function ensureBackendRunning() {
 
 async function doEnsureBackend() {
   appLog('[ensure] start')
+
+  // 先识别"僵尸后端"：覆盖安装 / 卸载重装后旧进程仍占着端口，且用的是已删除目录里的
+  // 旧 config（旧 api_key）。它会让 curl /health 照样返回 ok，于是后续
+  // `!(await healthCheck())` 判定为 false → 以为后端正常、不重启 → 应用带着 config 里的
+  // 新 key 去请求僵尸进程 → 401「未认证」。这正是 bug 报告 1 的成因。
+  //
+  // 这里只**检测**不立即重启：此刻新二进制可能还没部署（卸载重装后 data 目录是空的），
+  // restartDsFreeApi 会因"二进制不存在"直接失败。真正的清理交给下面确定要重启时执行
+  // （restartDsFreeApi 内部已按端口 fuser -k 强杀），这里用一个标记把"必须重启"钉死。
+  const stale = await detectStaleBackend()
+  const staleFound = !!stale
+  if (staleFound) {
+    appLog('[ensure] 发现僵尸后端（占端口且工作目录已删除）: ' + stale + '，将强制重启清理')
+  }
+
   const deployResult = await deployBackend()
   appLog('[ensure] deploy ok=' + deployResult.ok + ' msg=' + (deployResult.message || '') + ' code=' + (deployResult.code || ''))
   truncateRuntimeLog()
@@ -1015,8 +1127,14 @@ async function doEnsureBackend() {
     debugLog('DS | 部署失败但存在旧二进制，尝试直接启动: ' + deployResult.message)
   }
 
-  const needRestart = deployResult.updated || !(await healthCheck())
-  appLog('[ensure] needRestart=' + needRestart)
+  // 三种情况都必须重启后端：
+  //  - updated：二进制刚换新，得跑新版本；
+  //  - configRepaired：配置刚重建/修正，跑着的进程仍持旧 api_key、旧账号；
+  //  - staleFound：有僵尸占着端口，不杀它就会一直被健康检查"误判为正常"。
+  // 注意 staleFound 必须在 healthCheck 之前参与判断（用 || 短路），
+  // 否则僵尸的 /health 应答会让最后一条件为 false 而漏掉重启。
+  const needRestart = staleFound || deployResult.updated || deployResult.configRepaired || !(await healthCheck())
+  appLog('[ensure] needRestart=' + needRestart + ' stale=' + staleFound + ' updated=' + !!deployResult.updated + ' configRepaired=' + !!deployResult.configRepaired)
   if (needRestart) {
     const restartResult = await restartDsFreeApi()
     appLog('[ensure] restart ok=' + restartResult.ok + ' msg=' + (restartResult.message || '') + ' code=' + (restartResult.code || ''))

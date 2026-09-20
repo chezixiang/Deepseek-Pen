@@ -347,6 +347,11 @@ export async function loadAccountList() {
   let fromConfig = []
   try {
     const raw = stripTomlComments(await readFile(dsConfigPath()))
+    if (!raw) {
+      // 配置读不到时列表会静默为空、界面显示"未登录"，用户看不到原因。
+      // 记一条日志便于定位（真正的重建由 native.ensureDsConfig 负责）。
+      appLog('[store] 账号列表为空：config.toml 缺失或不可读（' + dsConfigPath() + '）')
+    }
     fromConfig = parseAllAccounts(raw)
   } catch (e) { /* 忽略 */ }
 

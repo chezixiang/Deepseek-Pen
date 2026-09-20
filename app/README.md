@@ -60,6 +60,23 @@ app/
 > **卸载会清空 `$dataDir`**：`miniapp_cli uninstall` 删掉整个应用包目录，
 > 账号与设置一并丢失，重装后需重新登录。同版本 `install` 覆盖安装则保留 `data/`。
 
+## 升级后 401 / 配置丢失（v0.1.2 修复）
+
+覆盖安装或重装后如果出现「同步对话 HTTP 401」「未认证」或
+「无法读取 ds-free-api 配置文件（路径 …）」，成因是两个后端生命周期问题：
+
+1. **僵尸后端占端口**：覆盖安装/重装后旧 `ds-free-api` 进程仍在运行，它的工作目录
+   已被替换（`readlink /proc/PID/cwd` 带 `(deleted)`），却仍用**旧 config 的旧 api_key**
+   占着 22217。应用健康检查按端口优先命中它 → 拿 config 里的新 key 请求旧进程 → 401。
+   旧代码用 `pkill -9 -x ds-free-api` 清理，但实测本机 busybox 的 `-x` 匹配不上进程名
+   （返回 1，进程杀不掉）。现在改用 `fuser -k -9 <port>/tcp` 按端口杀（向内核查谁占端口，
+   不依赖进程名），并在 `ensureBackendRunning` 开头先检测僵尸、把"必须重启"钉死。
+2. **config.toml 不会重建**：重建逻辑原本放在 `deployBackend()` 末尾，而该函数前面的
+   快速路径（二进制摘要匹配即 return）会跳过整段 —— 配置一旦丢失就永远补不回来。
+   现在 `ensureDsConfig()` 提到快速路径**之前**执行，且 `updateDsFreeApiAccount` /
+   `clearDsFreeApiAccount` / `updateDsFreeApiProxy` 三个入口都经过 `readConfigOrRepair()`
+   兜底自愈。
+
 ## 构建
 
 ```bash
