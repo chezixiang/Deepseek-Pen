@@ -402,6 +402,9 @@ pub struct ChatCompletionsResponse {
     /// DeepSeek 自动生成的会话标题（透传，见 ChatCompletionsResponseChunk::ds_title）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ds_title: Option<String>,
+    /// 本对话的云端会话 id（持久会话才有，见 ChatCompletionsResponseChunk::ds_session_id）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ds_session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -450,6 +453,11 @@ pub struct ChatCompletionsResponseChunk {
     /// 随 finish chunk 透传给客户端，用于应用侧自动命名会话
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ds_title: Option<String>,
+    /// 本对话的云端会话 id（持久会话才有），随流末尾的尾随 chunk 下发。
+    /// 应用侧记录它，与云端会话列表（/v1/cloud-sessions）按 id 对上号，
+    /// 同步时不会把同一条对话重复导入。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ds_session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

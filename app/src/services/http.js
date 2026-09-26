@@ -100,7 +100,14 @@ export async function httpRequest({ url, method = 'GET', headers = {}, data, tim
   })
 
   try {
-    const resp = await Promise.race([http.request(opt), timeoutPromise])
+    // 给设备侧的原始 promise 挂一个空 catch 再 race：超时赢得竞争后，
+    // 原始 promise 若稍后 reject 会变成 unhandled rejection（QuickJS 上
+    // 轻则刷日志，重则被框架判为致命错误）。
+    const devicePromise = http.request(opt)
+    if (devicePromise && typeof devicePromise.catch === 'function') {
+      devicePromise.catch(() => {})
+    }
+    const resp = await Promise.race([devicePromise, timeoutPromise])
     if (timer) clearTimeout(timer)
     if (resp && resp.error) {
       return { statusCode: 0, data: null, error: resp.error }

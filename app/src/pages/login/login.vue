@@ -1,9 +1,10 @@
 <template>
     <div :class="dc('login-page')">
-        <!-- 顶栏：仅在已配置账号（从主页/设置进来）时给「返回」，未配置时本页就是根页面 -->
+        <!-- 顶栏：已配置账号（从主页/设置进来）时给「返回」；未配置时本页就是根页面，
+             给「退出」并提示右滑也能退出 -->
         <div :class="dc('topbar')">
             <text v-if="canGoBack" :class="dc('back-btn')" @click="back">返回</text>
-            <text v-else :class="dc('topbar-spacer')"></text>
+            <text v-else :class="dc('back-btn')" @click="exitApp">退出</text>
             <text :class="dc('settings-btn')" @click="goSettings">设置</text>
         </div>
 
@@ -88,13 +89,16 @@
             </div>
         </div>
 
-        <!-- 退出登录确认：清空本机后端账号是破坏性操作，先确认 -->
-        <div v-if="showRemoveConfirm" :class="dc('mask')">
-            <div :class="dc('modal')">
+        <!-- 退出登录确认：清空本机后端账号是破坏性操作，先确认。
+             touch 事件在整个遮罩/弹窗上都消费掉：Weex 里未绑定点击的容器不拦截触摸，
+             否则点弹窗外或点弹窗空白处会穿透到下层的"退出登录"按钮上 ——
+             用户本意是取消，结果账号被清空（表现成"进账号页就掉登录"，bug 2）。 -->
+        <div v-if="showRemoveConfirm" :class="dc('mask')" @click="noop">
+            <div :class="dc('modal')" @click="noop">
                 <text :class="dc('modal-title')">退出登录？</text>
                 <text :class="dc('modal-msg')">将清空本机后端配置的账号（{{ accounts.length ? accounts[0].display : '' }}），回到未登录状态。</text>
-                <div :class="dc('modal-btns')">
-                    <text :class="dc('modal-btn-ghost')" @click="showRemoveConfirm = false">取消</text>
+                <div :class="dc('modal-btns')" @click="noop">
+                    <text :class="dc('modal-btn-ghost')" @click="cancelRemove">取消</text>
                     <text :class="dc('modal-btn-danger')" @click="doRemove">退出登录</text>
                 </div>
             </div>
@@ -157,26 +161,68 @@ export default {
         }
     },
     created() {
-        // 登录页禁用左滑返回：本页是应用的入口页，横滑退出会让用户莫名回到
-        // 启动页（未配置账号时启动页又会立刻跳回来，形成来回弹跳）。
-        // 返回改由顶栏「返回」按钮显式触发，且只在已配置账号（有上一页）时出现。
-        this.disableSwipeBack()
+        // 登录页是应用入口页：右滑（系统返回手势 / 返回键）应当**退出应用**，
+        // 而不是被禁用。旧实现调用 npage.setDisableLeftSwipeBack(true)，把入口页的
+        // 退出手势整个吃掉 —— 用户被关在登录页里出不去（bug 1）。
+        //
+        // 正确做法：开启返回事件（$npage.setSupportBack(true)），在 backpressed 里
+        // 自己决定行为：作为根页面时退出应用；从主页/设置进来时按普通返回。
+        this.enableBackExit()
         this.$page.on('show', this.onShow)
         this.init()
     },
     destroyed() {
         try { this.$page.off('show', this.onShow) } catch (e) { /* 忽略 */ }
+        try { this.$page.off('backpressed', this.onBackPressed) } catch (e) { /* 忽略 */ }
+        if (this._npBackBound) {
+            try { this.$page.$npage.off('backpressed', this.onBackPressed) } catch (e) { /* 忽略 */ }
+        }
     },
     methods: {
         // 深色模式类名（引擎仅支持单类选择器，故浅/深各一套）
         dc(cls) {
             return this.isDark ? (cls + '-dark') : cls
         },
-        disableSwipeBack() {
+        enableBackExit() {
+            // 两套事件 API 都注册：框架把 backpressed 既可能从 $falcon 全局事件派发
+            // （$page.on），也可能从 npage 页面实例派发（$npage.on）。两处都挂上，
+            // 用 _backHandling 去重，避免同一个返回被处理两次（会连退两页）。
+            let bound = false
             try {
                 const np = this.$page && this.$page.$npage
-                if (np && np.setDisableLeftSwipeBack) np.setDisableLeftSwipeBack(true)
-            } catch (e) { /* 引擎不支持时忽略，页面本身仍可用 */ }
+                if (np && np.setSupportBack) {
+                    np.setSupportBack(true)
+                    if (np.on) {
+                        np.on('backpressed', this.onBackPressed)
+                        this._npBackBound = true
+                    }
+                    this.$page.on('backpressed', this.onBackPressed)
+                    bound = true
+                }
+            } catch (e) { /* 引擎不支持时走下方兜底 */ }
+            if (bound) return
+            // 老框架没有 setSupportBack：至少不要禁用滑动返回，让系统手势自己处理
+            try {
+                const np2 = this.$page && this.$page.$npage
+                if (np2 && np2.setDisableLeftSwipeBack) np2.setDisableLeftSwipeBack(false)
+            } catch (e) { /* 忽略 */ }
+        },
+        // 系统返回（返回键 / 右滑手势）：已配置账号时本页是二级页 → 回上一页；
+        // 否则是应用入口 → 退出应用
+        onBackPressed() {
+            if (this._backHandling) return
+            this._backHandling = true
+            setTimeout(() => { this._backHandling = false }, 400)
+            if (this.canGoBack) {
+                this.back()
+                return
+            }
+            this.exitApp()
+        },
+        exitApp() {
+            try { $falcon.closeApp() } catch (e) {
+                try { $falcon.$app.finish() } catch (e2) { /* 忽略 */ }
+            }
         },
         mask(s) {
             const v = String(s || '')
@@ -288,6 +334,13 @@ export default {
             this.isErr = true
             this.$forceUpdate()
         },
+        // 空消费点击：在 Weex 里"绑定过点击"的容器才会拦截触摸，这是挡住事件
+        // 穿透到下层按钮的手段（同 index.vue 抽屉的 noopDrawer）
+        noop() {},
+        cancelRemove() {
+            this.showRemoveConfirm = false
+            this.$forceUpdate()
+        },
         // 退出登录：清空本机后端 config.toml 的账号（真源），再清显示名缓存。
         // 旧实现只删缓存条目，后端账号池仍在用旧凭据登录 —— 「移除」名不副实。
         confirmRemove() {
@@ -345,9 +398,13 @@ export default {
             } catch (e) { /* 忽略 */ }
         },
         back() {
-            if (this.$page && this.$page.finish) {
+            // 二级页（从主页/设置进来）→ 关闭本页；根页面（首次启动）→ 退出应用，
+            // 与系统返回手势（onBackPressed）保持同一套语义
+            if (this.canGoBack && this.$page && this.$page.finish) {
                 this.$page.finish()
+                return
             }
+            this.exitApp()
         }
     }
 }
@@ -358,7 +415,6 @@ export default {
 .login-page { width: 100vw; height: 100vh; backgroundColor: #f5f6f8; flex-direction: column; }
 .topbar { flex-direction: row; align-items: center; justify-content: space-between; padding: 6px 12px; }
 .back-btn { fontSize: 20px; color: #1a73e8; padding: 4px 10px; }
-.topbar-spacer { fontSize: 20px; color: #f5f6f8; padding: 4px 10px; }
 .settings-btn { fontSize: 20px; color: #1a73e8; padding: 4px 10px; }
 
 .body { flex: 1; flex-direction: row; paddingLeft: 24px; paddingRight: 24px; paddingBottom: 16px; }
@@ -415,7 +471,6 @@ export default {
 .login-page-dark { width: 100vw; height: 100vh; backgroundColor: #0c1014; flex-direction: column; }
 .topbar-dark { flex-direction: row; align-items: center; justify-content: space-between; padding: 6px 12px; }
 .back-btn-dark { fontSize: 20px; color: #6ba8ff; padding: 4px 10px; }
-.topbar-spacer-dark { fontSize: 20px; color: #0c1014; padding: 4px 10px; }
 .settings-btn-dark { fontSize: 20px; color: #6ba8ff; padding: 4px 10px; }
 .body-dark { flex: 1; flex-direction: row; paddingLeft: 24px; paddingRight: 24px; paddingBottom: 16px; }
 .brand-dark { width: 240px; justifyContent: center; alignItems: center; paddingRight: 20px; }

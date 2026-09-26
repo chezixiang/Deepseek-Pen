@@ -271,25 +271,20 @@ impl Stats {
                     )
                 })
                 .collect();
-            let key_stats: HashMap<String, super::store::KeyStatsData> = self
-                .key_stats
-                .iter()
-                .map(|r| {
-                    let masked = if r.key().len() > 8 {
-                        format!("{}***", &r.key()[..8])
-                    } else {
-                        "***".to_string()
-                    };
-                    (
-                        masked,
-                        super::store::KeyStatsData {
-                            prompt_tokens: r.value().prompt_tokens.load(Ordering::Relaxed),
-                            completion_tokens: r.value().completion_tokens.load(Ordering::Relaxed),
-                            requests: r.value().requests.load(Ordering::Relaxed),
-                        },
-                    )
-                })
-                .collect();
+            // 按 8 字符前缀脱敏后可能撞键（两个 key 前缀相同），直接 collect
+            // 会让后者覆盖前者、丢一份用量；这里聚合相加而不是覆盖。
+            let mut key_stats: HashMap<String, super::store::KeyStatsData> = HashMap::new();
+            for r in self.key_stats.iter() {
+                let masked = super::mask_prefix(r.key(), 8);
+                let e = key_stats.entry(masked).or_insert(super::store::KeyStatsData {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    requests: 0,
+                });
+                e.prompt_tokens += r.value().prompt_tokens.load(Ordering::Relaxed);
+                e.completion_tokens += r.value().completion_tokens.load(Ordering::Relaxed);
+                e.requests += r.value().requests.load(Ordering::Relaxed);
+            }
             let logs = {
                 let guard = self.request_logs.lock().unwrap();
                 guard
@@ -364,25 +359,20 @@ impl Stats {
 
     /// 生成 API Key 维度统计快照
     pub fn key_stats_snapshot(&self) -> HashMap<String, KeyUsageSnapshot> {
-        self.key_stats
-            .iter()
-            .map(|r| {
-                // 脱敏：只显示前 8 位
-                let masked = if r.key().len() > 8 {
-                    format!("{}***", &r.key()[..8])
-                } else {
-                    "***".to_string()
-                };
-                (
-                    masked,
-                    KeyUsageSnapshot {
-                        prompt_tokens: r.value().prompt_tokens.load(Ordering::Relaxed),
-                        completion_tokens: r.value().completion_tokens.load(Ordering::Relaxed),
-                        requests: r.value().requests.load(Ordering::Relaxed),
-                    },
-                )
-            })
-            .collect()
+        // 脱敏：只显示前 8 个字符；前缀撞键的 key 聚合相加而非覆盖
+        let mut out: HashMap<String, KeyUsageSnapshot> = HashMap::new();
+        for r in self.key_stats.iter() {
+            let masked = super::mask_prefix(r.key(), 8);
+            let e = out.entry(masked).or_insert(KeyUsageSnapshot {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                requests: 0,
+            });
+            e.prompt_tokens += r.value().prompt_tokens.load(Ordering::Relaxed);
+            e.completion_tokens += r.value().completion_tokens.load(Ordering::Relaxed);
+            e.requests += r.value().requests.load(Ordering::Relaxed);
+        }
+        out
     }
 }
 
@@ -453,5 +443,34 @@ impl RequestTimer {
         let latency = self.start.elapsed().as_millis() as u64;
         self.stats.record_request(false, latency);
         self.marked = true;
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归：按 8 字符前缀脱敏后两个 key 撞键，旧版直接 collect 会让
+    /// 后者覆盖前者、永久丢一份用量（stats.json 与管理面板同时失真）。
+    /// 现在聚合相加。
+    #[test]
+    fn key_stats_snapshot_aggregates_prefix_collisions() {
+        let stats = Stats::new_with_store(None);
+        stats.record_tokens_for_model_and_key("m", Some("abcdefghCUSTOM1"), 10, 5);
+        stats.record_tokens_for_model_and_key("m", Some("abcdefghCUSTOM2"), 20, 7);
+        let snap = stats.key_stats_snapshot();
+        let v = snap.get("abcdefgh***").expect("脱敏键应存在");
+        assert_eq!(v.requests, 2, "撞键必须聚合而非覆盖");
+        assert_eq!(v.prompt_tokens, 30);
+        assert_eq!(v.completion_tokens, 12);
+    }
+
+    /// 非 ASCII key：旧版 &k[..8] 按字节切片会 panic
+    #[test]
+    fn key_stats_snapshot_handles_multibyte_keys() {
+        let stats = Stats::new_with_store(None);
+        stats.record_tokens_for_model_and_key("m", Some("密钥钥钥钥钥钥钥钥钥"), 1, 1);
+        let snap = stats.key_stats_snapshot();
+        // 10 个中文字符 > 8：脱敏取前 8 个字符（不是整体 ***），且不 panic
+        assert_eq!(snap.get("密钥钥钥钥钥钥钥***").map(|v| v.requests), Some(1));
     }
 }

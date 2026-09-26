@@ -88,3 +88,32 @@ export async function backendLogClear() {
   try { await fs.writeFile(BACKEND_LOG_FILE(0), '') } catch (e) { /* 忽略 */ }
   try { await fs.writeFile(BACKEND_LOG_FILE(1), '') } catch (e) { /* 忽略 */ }
 }
+
+// ---------- 网络抓取（ds-free-api net-capture.jsonl） ----------
+// 「启用调试日志」开关联动抓取的上游报文（后端 net_capture.rs 落盘，JSONL
+// 每行一个事件）。行内容是大 JSON，展示层按 600 字符截断——完整内容
+// 以文件为准（$dataDir/ds-free-api/logs/net-capture.jsonl，可经 miniapp_cli 拉取）。
+// gen 与后端轮转对齐：0=当前，1=.1（后端超 5MB 顺移）。
+const NET_CAPTURE_FILE = (gen = 0) =>
+  String($dataDir || '/tmp/').replace(/\/+$/, '') +
+  '/ds-free-api/logs/net-capture.jsonl' + (gen === 1 ? '.1' : gen === 2 ? '.2' : '')
+
+export async function netCaptureTail(n = 20, gen = 0) {
+  try {
+    const raw = String(await fs.readFile(NET_CAPTURE_FILE(gen)) || '')
+    return raw
+      .split('\n')
+      .filter(Boolean)
+      .slice(-n)
+      .map((l) => (l.length > 600 ? l.slice(0, 600) + '…(' + l.length + '字符)' : l))
+      .join('\n')
+  } catch (e) {
+    return ''
+  }
+}
+
+export async function netCaptureClear() {
+  for (const gen of [0, 1, 2]) {
+    try { await fs.writeFile(NET_CAPTURE_FILE(gen), '') } catch (e) { /* 忽略 */ }
+  }
+}

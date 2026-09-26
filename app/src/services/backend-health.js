@@ -43,6 +43,8 @@ async function requestHealth(timeout = 3000) {
  * @param {Object} options 配置选项
  * @param {number} options.maxAttempts 最大尝试次数，默认30次
  * @param {number} options.interval 每次尝试间隔（毫秒），默认1000ms
+ * @param {boolean} options.waitForReady 等待"完全启动"（ready=true，即账号
+ *   登录完成）才返回成功；false 时只要求端口/服务可达（旧行为）。
  * @param {Function} options.onProgress 进度回调 (attempt, total) => void
  * @returns {Promise<{success: boolean, error?: string, code?: string, data?: any}>}
  */
@@ -50,7 +52,8 @@ export async function checkBackendHealth(options = {}) {
     const {
         maxAttempts = 30,
         interval = 1000,
-        onProgress = null
+        onProgress = null,
+        waitForReady = false
     } = options
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -67,6 +70,21 @@ export async function checkBackendHealth(options = {}) {
 
             // 检查响应
             if (result.statusCode === 200 && result.data) {
+                // 新后端（早绑定模式）以 ready 标记"账号登录完成"；
+                // 旧后端无 ready 字段，视为已就绪（向后兼容）。
+                const ready = result.data.ready === undefined ? true : !!result.data.ready
+                if (!ready) {
+                    // 还在登录账号，继续等
+                    if (attempt < maxAttempts) {
+                        await sleep(interval)
+                        continue
+                    }
+                    return {
+                        success: false,
+                        error: '后端已启动但账号登录未完成（超时）',
+                        code: 'BACKEND_NOT_READY'
+                    }
+                }
                 // 检查账号状态
                 const accounts = result.data.accounts
                 if (accounts && accounts.total > 0) {

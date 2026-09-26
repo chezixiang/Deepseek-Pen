@@ -2,17 +2,17 @@
 //!
 //! 1 account = 1 session = 1 concurrency。多并发需横向扩展账号数。
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
 use dashmap::DashMap;
-use futures::TryStreamExt;
 use log::{debug, error, info, warn};
 use tokio::sync::RwLock;
 
 use crate::config::Account as AccountConfig;
-use crate::ds_core::client::{ClientError, CompletionPayload, DsClient, LoginPayload};
+use crate::ds_core::client::{ClientError, DsClient, LoginPayload};
 use crate::ds_core::pow::{PowError, PowSolver};
 
 /// 账号状态枚举
@@ -60,6 +60,10 @@ pub struct AccountStatus {
     pub used_this_hour: u64,
     /// 本窗口是否已用尽配额（0 配额 = 不限制，恒为 false）
     pub quota_exhausted: bool,
+    /// 上游已确认的禁言状态；与普通登录/网络错误分开呈现。
+    pub is_muted: bool,
+    /// 已知解禁时间（Unix 秒）；未知时为 null，不臆测三天期限。
+    pub mute_until: Option<i64>,
 }
 
 pub struct Account {
@@ -71,8 +75,17 @@ pub struct Account {
     last_released: AtomicI64,
     /// 连续登录失败次数
     error_count: AtomicU8,
-    /// 禁言到期 Unix 秒（0=未知）；登录响应 chat.mute_until 实测值
+    /// 禁言到期 Unix 秒：0=未记录，-1=已确认禁言但到期时间未知。
     mute_until: AtomicI64,
+    /// 上游限流冷却到期 Unix 秒（0=未限流）。
+    ///
+    /// 与 mute_until 的区别：mute_until 是上游判定的禁言（账号级，等它自己到期）；
+    /// 这里是**本服务主动退避**——收到 rate_limit/reached 之类的信号后，在一段时间内
+    /// 不再拿这个账号发任何上游请求。没有它的话，客户端每重试一次就新建一个 session
+    /// 再撞一次限流，放大无效请求；它是否导致后续禁言仍需上游证据。
+    cooldown_until: AtomicI64,
+    /// 连续被限流的次数（阶梯退避的档位），成功一次即清零
+    cooldown_level: AtomicU8,
     /// 原始凭据（用于重新登录）
     creds: AccountConfig,
     /// 滑动窗口内的请求计数（用于每小时配额）
@@ -82,21 +95,19 @@ pub struct Account {
 /// 连续登录失败上限，达到后标记为 Invalid
 const MAX_ERROR_COUNT: u8 = 3;
 
-/// 一小时窗口请求计数器
-///
-/// 上游实测同一账号累计约 215 次请求后会被禁言（biz_code=5），且禁言是
-/// **延迟判定**的（跑完才封）。实现为「固定起点 + 一小时」的简单窗口：
-/// 达到上限后该账号本窗口内不可用，窗口过期自动恢复。精度足够且纯原子
-/// 操作、不加锁。
+/// 限流退避阶梯（秒）：连续被限流时逐级加长，最长 30 分钟。
+/// 取指数增长是为了让"用户一直点重试"这种情形快速把请求量压下来——
+/// 这里约束本地重试频率，不代表已知的上游风控阈值。
+const COOLDOWN_LADDER_SECS: [i64; 5] = [60, 180, 600, 1200, 1800];
+
+/// 最近一小时的分配记录。固定窗口允许边界两侧突发两倍配额，不能兑现
+/// 「每小时上限」。这是本地流量约束，并不代表任何已知的上游免封阈值。
 struct RequestWindow {
-    /// 窗口起点（Unix 秒）
-    started_at: AtomicI64,
-    /// 窗口内累计请求数
-    count: AtomicU64,
+    requests: Mutex<VecDeque<Instant>>,
 }
 
 /// 配额窗口长度：1 小时
-const WINDOW_SECS: i64 = 3600;
+const WINDOW_SECS: u64 = 3600;
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -108,32 +119,38 @@ fn now_secs() -> i64 {
 impl RequestWindow {
     fn new() -> Self {
         Self {
-            started_at: AtomicI64::new(now_secs()),
-            count: AtomicU64::new(0),
+            requests: Mutex::new(VecDeque::new()),
         }
     }
 
-    /// 记一次请求并返回窗口内的累计值；跨窗口时自动重置
-    fn record(&self) -> u64 {
-        let now = now_secs();
-        let start = self.started_at.load(Ordering::Relaxed);
-        if now - start >= WINDOW_SECS
-            && self
-                .started_at
-                .compare_exchange(start, now, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
-            self.count.store(0, Ordering::Relaxed);
+    fn record(&self, limit: u64) -> Option<u64> {
+        let mut requests = self.requests.lock().unwrap();
+        let now = Instant::now();
+        Self::prune(&mut requests, now);
+        if limit > 0 && requests.len() as u64 >= limit {
+            return None;
         }
-        self.count.fetch_add(1, Ordering::Relaxed) + 1
+        requests.push_back(now);
+        Some(requests.len() as u64)
     }
 
-    /// 当前窗口内已用请求数（不修改状态；过期窗口视作 0）
     fn used(&self) -> u64 {
-        if now_secs() - self.started_at.load(Ordering::Relaxed) >= WINDOW_SECS {
-            0
-        } else {
-            self.count.load(Ordering::Relaxed)
+        self.count_at(Instant::now(), false)
+    }
+
+    fn count_at(&self, now: Instant, record: bool) -> u64 {
+        let mut requests = self.requests.lock().unwrap();
+        Self::prune(&mut requests, now);
+        if record {
+            requests.push_back(now);
+        }
+        requests.len() as u64
+    }
+
+    fn prune(requests: &mut VecDeque<Instant>, now: Instant) {
+        while requests.front().is_some_and(|t| now.saturating_duration_since(*t)
+            >= Duration::from_secs(WINDOW_SECS)) {
+            requests.pop_front();
         }
     }
 }
@@ -161,10 +178,15 @@ impl Account {
     }
 
     pub fn is_available(&self) -> bool {
-        self.state() == AccountState::Idle
+        self.state() == AccountState::Idle && !self.is_muted()
     }
 
-    /// 禁言到期 Unix 秒（0=未知）
+    pub fn is_muted(&self) -> bool {
+        let until = self.mute_until();
+        until < 0 || until > now_secs()
+    }
+
+    /// 禁言到期 Unix 秒：0=未记录，-1=已确认但期限未知。
     pub fn mute_until(&self) -> i64 {
         self.mute_until.load(Ordering::Relaxed)
     }
@@ -173,26 +195,69 @@ impl Account {
         self.mute_until.store(secs, Ordering::Relaxed);
     }
 
+    /// 登录成功只更新身份，不代表聊天权限恢复。
+    fn apply_login(&self, new_account: &Account) {
+        *self.token.write().unwrap() = new_account.token.read().unwrap().clone();
+        self.set_mute_until(new_account.mute_until());
+        self.clear_cooldown();
+        self.state.store(new_account.state() as u8, Ordering::Relaxed);
+        self.error_count.store(0, Ordering::Relaxed);
+    }
+
+    /// 限流冷却到期 Unix 秒（0=未限流）
+    pub fn cooldown_until(&self) -> i64 {
+        self.cooldown_until.load(Ordering::Relaxed)
+    }
+
+    /// 剩下的冷却秒数（0=不在冷却中）
+    pub fn cooldown_remaining(&self) -> i64 {
+        (self.cooldown_until() - now_secs()).max(0)
+    }
+
+    /// 是否正处于限流退避窗口内
+    pub fn in_cooldown(&self) -> bool {
+        self.cooldown_remaining() > 0
+    }
+
+    /// 进入限流退避。`level` 为连续被限流的次数（从 1 开始），按阶梯取退避时长。
+    /// 返回实际设置的剩余秒数。
+    pub fn enter_cooldown(&self, level: usize) -> i64 {
+        let idx = level.clamp(1, COOLDOWN_LADDER_SECS.len()) - 1;
+        let secs = COOLDOWN_LADDER_SECS[idx];
+        self.cooldown_until.store(now_secs() + secs, Ordering::Relaxed);
+        secs
+    }
+
+    /// 清空限流退避（重登成功 / 手动恢复时调用）
+    pub fn clear_cooldown(&self) {
+        self.cooldown_until.store(0, Ordering::Relaxed);
+        self.cooldown_level.store(0, Ordering::Relaxed);
+    }
+
     /// 该账号在本配额窗口内是否还能继续使用（`limit == 0` 表示不限制）
     fn within_quota(&self, limit: u64) -> bool {
         limit == 0 || self.window.used() < limit
     }
 
     /// 记一次请求用量；达到配额时打一次告警
-    fn record_request(&self, limit: u64) {
-        let used = self.window.record();
+    fn record_request(&self, limit: u64) -> bool {
+        let Some(used) = self.window.record(limit) else { return false };
         if limit > 0 && used == limit {
             warn!(
                 target: "ds_core::accounts",
-                "账号 {} 已达到每小时请求配额（{}），本窗口内不再分配；上游在账号累计数百次请求后会禁言，请增加账号数而不是抬高配额",
+                "账号 {} 已达到最近一小时请求配额（{}），等待窗口释放后再试",
                 self.display_id(), limit
             );
         }
+        true
     }
 }
 
 /// 禁言到期时间格式化（本地时区）
 pub(crate) fn format_mute_time(secs: i64) -> String {
+    if secs <= 0 {
+        return "未知（上游未返回）".into();
+    }
     use chrono::TimeZone;
     match chrono::Local.timestamp_opt(secs, 0).single() {
         Some(t) => t.format("%Y-%m-%d %H:%M").to_string(),
@@ -294,6 +359,11 @@ impl AccountPool {
         self.accounts.is_empty()
     }
 
+    /// 账号数量（用于"逐个账号尝试"这类有限轮询的循环上界）
+    pub fn account_count(&self) -> usize {
+        self.accounts.len()
+    }
+
     pub async fn init(
         &self,
         creds: Vec<AccountConfig>,
@@ -306,41 +376,32 @@ impl AccountPool {
 
         warn_on_shared_device_ids(&creds);
 
-        use futures::future::join_all;
-        use std::sync::Arc;
-        use tokio::sync::Semaphore;
-
-        // 限制并发初始化数，避免对 DeepSeek 端和本地连接池造成压力
-        let semaphore = Arc::new(Semaphore::new(13));
-        let futures: Vec<_> = creds
-            .into_iter()
-            .map(|creds| {
-                let client = client.clone();
-                let solver = solver.clone();
-                let sem = semaphore.clone();
-                async move {
-                    let _permit = sem.acquire().await.expect("信号量未关闭");
-                    let display_id = if creds.mobile.is_empty() {
-                        creds.email.clone()
-                    } else {
-                        creds.mobile.clone()
-                    };
-                    match init_account(&creds, &client, &solver).await {
-                        Ok(account) => {
-                            info!(target: "ds_core::accounts", "账号 {} 初始化成功", display_id);
-                            Some((display_id, Arc::new(account)))
-                        }
-                        Err(e) => {
-                            warn!(target: "ds_core::accounts", "账号 {} 初始化失败: {}", display_id, e);
-                            None
-                        }
-                    }
+        // 串行初始化 + 账号间随机抖动（风控差异 #3）：旧实现 13 账号并发登录，
+        // "同一 IP 同一分钟出现 N 个新设备注册 + N 次登录"是典型批量特征。
+        // 词典笔场景账号数少（1-3），串行总耗时可控；多账号池每账号间隔 5-15s。
+        let mut initialized: Vec<(String, Arc<Account>)> = Vec::new();
+        let total = creds.len();
+        for (idx, creds) in creds.into_iter().enumerate() {
+            if idx > 0 {
+                let gap = rand_ms(5000, 15000);
+                info!(target: "ds_core::accounts", "账号初始化间隔抖动 {}ms ({}/{})", gap, idx + 1, total);
+                tokio::time::sleep(tokio::time::Duration::from_millis(gap)).await;
+            }
+            let display_id = if creds.mobile.is_empty() {
+                creds.email.clone()
+            } else {
+                creds.mobile.clone()
+            };
+            match init_account(&creds, client, solver).await {
+                Ok(account) => {
+                    info!(target: "ds_core::accounts", "账号 {} 初始化成功", display_id);
+                    initialized.push((display_id, Arc::new(account)));
                 }
-            })
-            .collect();
-
-        let results = join_all(futures).await;
-        let initialized: Vec<(String, Arc<Account>)> = results.into_iter().flatten().collect();
+                Err(e) => {
+                    warn!(target: "ds_core::accounts", "账号 {} 初始化失败: {}", display_id, e);
+                }
+            }
+        }
 
         if initialized.is_empty() {
             warn!(target: "ds_core::accounts", "所有账号初始化失败，服务将以降级模式运行（可通过管理面板动态添加账号）");
@@ -408,6 +469,11 @@ impl AccountPool {
             if let Some(g) = self.get_account() {
                 return Some(g);
             }
+            // 全部账号都在限流退避中：等待没有意义（退避最短 60s > 这里的等待窗口），
+            // 提前返回让调用方尽快把"上游限流"告诉用户，而不是白等 30 秒（bug 1）
+            if self.all_in_cooldown() {
+                return None;
+            }
             if tokio::time::Instant::now() >= deadline {
                 return None;
             }
@@ -424,52 +490,76 @@ impl AccountPool {
             return None;
         }
 
-        let now_ms = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        // CAS 失败说明并发请求恰好抢走了同一个"最空闲"账号：重新选下一个，
+        // 而不是直接返回 None（明明有空闲账号却报 Overloaded）。有限次重试即可，
+        // 打满重试次数说明竞争极端激烈，返回 None 触发上层限流更合适。
+        for _ in 0..4 {
+            let now_ms = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
 
-        let mut best: Option<Arc<Account>> = None;
-        let mut best_idle = i64::MIN;
+            let mut best: Option<Arc<Account>> = None;
+            let mut best_idle = i64::MIN;
 
-        for entry in self.accounts.iter() {
-            let account = entry.value();
-            if !account.is_available() {
-                continue;
+            for entry in self.accounts.iter() {
+                let account = entry.value();
+                if !account.is_available() {
+                    continue;
+                }
+                // 限流退避中的账号不分配：继续拿它发请求只会把请求洪峰续上，
+                // 上游正是据此判定"异常客户端"并禁言（bug 1）
+                if account.in_cooldown() {
+                    continue;
+                }
+                // 超出每小时配额的账号本窗口内不再分配（0 = 不限制）
+                if !account.within_quota(self.hourly_quota) {
+                    continue;
+                }
+                let idle = now_ms - account.last_released.load(Ordering::Relaxed);
+                if idle > best_idle {
+                    best_idle = idle;
+                    best = Some(Arc::clone(account));
+                }
             }
-            // 超出每小时配额的账号本窗口内不再分配（0 = 不限制）
-            if !account.within_quota(self.hourly_quota) {
-                continue;
-            }
-            let idle = now_ms - account.last_released.load(Ordering::Relaxed);
-            if idle > best_idle {
-                best_idle = idle;
-                best = Some(Arc::clone(account));
+
+            let account = best?;
+            if account
+                .state
+                .compare_exchange(
+                    AccountState::Idle as u8,
+                    AccountState::Busy as u8,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                if !account.record_request(self.hourly_quota) {
+                    drop(AccountGuard { account });
+                    return None;
+                }
+                return Some(AccountGuard { account });
             }
         }
-
-        let account = best?;
-        account
-            .state
-            .compare_exchange(
-                AccountState::Idle as u8,
-                AccountState::Busy as u8,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            )
-            .ok()?;
-        account.record_request(self.hourly_quota);
-        Some(AccountGuard { account })
+        None
     }
 
     /// 获取指定账号（会话复用：续聊/重答必须用创建会话的同一账号），空闲时立即返回
     ///
-    /// 会话亲和优先于配额：续聊中的请求即使账号配额已满也放行（否则对话中断），
-    /// 但用量照常计数。
+    /// 续聊同样遵守配额，不能用会话亲和绕过本地请求上限。
     pub fn get_account_by_id(&self, email_or_mobile: &str) -> Option<AccountGuard> {
         let entry = self.accounts.get(email_or_mobile)?;
         let account = entry.value();
         if !account.is_available() {
+            return None;
+        }
+        // 限流退避优先级高于会话亲和：命中退避时**不能**放行，否则"用户一直点
+        // 重试"会沿同一条会话持续冲击上游（bug 1）。复用路径拿到 None 会退化为
+        // 冷启动/换号，最终以"服务繁忙"结束，不会变成禁言。
+        if account.in_cooldown() {
+            return None;
+        }
+        if !account.within_quota(self.hourly_quota) {
             return None;
         }
         account
@@ -481,7 +571,10 @@ impl AccountPool {
                 Ordering::Relaxed,
             )
             .ok()?;
-        account.record_request(self.hourly_quota);
+        if !account.record_request(self.hourly_quota) {
+            drop(AccountGuard { account: Arc::clone(account) });
+            return None;
+        }
         Some(AccountGuard {
             account: Arc::clone(account),
         })
@@ -507,6 +600,8 @@ impl AccountPool {
                     error_count: a.error_count.load(Ordering::Relaxed),
                     used_this_hour: a.window.used(),
                     quota_exhausted: !a.within_quota(self.hourly_quota),
+                    is_muted: a.is_muted(),
+                    mute_until: (a.mute_until() > 0).then(|| a.mute_until()),
                 }
             })
             .collect()
@@ -539,8 +634,113 @@ impl AccountPool {
         }
     }
 
+    /// 记录明确的上游禁言；未知期限暂停自动恢复，不猜测服务端封禁时长。
+    pub fn mark_muted(&self, email_or_mobile: &str, until: Option<i64>) {
+        if let Some(entry) = self.accounts.get(email_or_mobile) {
+            let a = entry.value();
+            let until = until.filter(|t| *t > now_secs())
+                .or_else(|| (a.mute_until() > now_secs()).then(|| a.mute_until()))
+                .unwrap_or(-1);
+            a.set_mute_until(until);
+            a.state.store(AccountState::Error as u8, Ordering::Relaxed);
+            warn!(target: "ds_core::accounts",
+                "账号 {} 上游确认禁言，mute_until={}，暂停请求与自动重登", a.display_id(), until);
+        }
+    }
+
+    pub fn account_mute_notice(&self, id: &str) -> Option<String> {
+        let entry = self.accounts.get(id)?;
+        let account = entry.value();
+        if !account.is_muted() {
+            return None;
+        }
+        Some(if account.mute_until() > 0 {
+            format!("账号已被禁言至 {}，请等待解禁", format_mute_time(account.mute_until()))
+        } else {
+            "账号已被禁言，服务端未返回解禁时间；自动恢复已暂停，可在确认解禁后手动重登".into()
+        })
+    }
+
+    pub fn all_muted_notice(&self) -> Option<String> {
+        if self.accounts.is_empty() || self.accounts.iter().any(|e| !e.value().is_muted()) {
+            return None;
+        }
+        let id = self.accounts.iter().next()?.key().clone();
+        self.account_mute_notice(&id)
+    }
+
+    pub fn account_quota_exhausted(&self, id: &str) -> bool {
+        self.accounts.get(id).is_some_and(|a| !a.within_quota(self.hourly_quota))
+    }
+
+    /// 记录一次上游限流并让该账号进入退避窗口（**不**标记 Error）。
+    ///
+    /// 为什么不能复用 mark_error：Error 会触发后台恢复任务去**重新登录**，
+    /// 而登录本身也是一次上游请求。被限流时反复重登 + 每次用户重试都新建 session，
+    /// 会在短时间内堆出额外请求；当前证据不能认定这是首次禁言的原因。
+    /// 退避只是等，不产生任何新请求。
+    /// 返回退避秒数；账号不存在时返回 0。
+    pub fn mark_rate_limited(&self, email_or_mobile: &str) -> i64 {
+        let Some(entry) = self.accounts.get(email_or_mobile) else {
+            return 0;
+        };
+        let account = entry.value();
+        let level = account
+            .cooldown_level
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1) as usize;
+        let secs = account.enter_cooldown(level);
+        warn!(
+            target: "ds_core::accounts",
+            "账号 {} 触发上游限流，进入退避 {}s（档位 {}，不重登以避免请求洪峰）",
+            account.display_id(), secs, level
+        );
+        secs
+    }
+
+    /// 是否所有账号都在限流退避中（用于给出"稍后再试"而非"没有账号"的提示）
+    pub fn all_in_cooldown(&self) -> bool {
+        if self.accounts.is_empty() {
+            return false;
+        }
+        let mut any_cooling = false;
+        for entry in self.accounts.iter() {
+            let account = entry.value();
+            // 有账号此刻就能用 → 不算"全在限流"
+            if account.is_available() && !account.in_cooldown() {
+                return false;
+            }
+            if account.in_cooldown() {
+                any_cooling = true;
+            }
+        }
+        any_cooling
+    }
+
+    /// 全池最长的剩余退避秒数（0=没有任何账号在退避）
+    pub fn max_cooldown_remaining(&self) -> i64 {
+        self.accounts
+            .iter()
+            .map(|e| e.value().cooldown_remaining())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// 指定账号的剩余退避秒数（0 = 不在退避中或账号不存在）。
+    ///
+    /// 会话复用路径用它区分两种"拿不到目标账号"：
+    ///   - 正在退避（> 0）：上游在限这条链路，**必须直接以限流返回**——
+    ///     换号重建会话等于把上一次的洪峰续上（bug 1）；
+    ///   - 其它原因（账号已失效/被移除）：允许调用方降级冷启动。
+    pub fn account_cooldown_remaining(&self, email_or_mobile: &str) -> i64 {
+        self.accounts
+            .get(email_or_mobile)
+            .map(|e| e.value().cooldown_remaining())
+            .unwrap_or(0)
+    }
+
     /// 手动重新登录指定账号（管理员触发）
-    /// 成功 → Idle，失败 → error_count++，≥3 则 Invalid
+    /// 登录成功后保留上游聊天状态；登录失败 → error_count++，≥3 则 Invalid。
     pub async fn re_login_single(&self, email_or_mobile: &str) -> Result<(), String> {
         let client_opt = self.client.read().await.clone();
         let solver_opt = self.solver.read().await.clone();
@@ -564,7 +764,7 @@ impl AccountPool {
             ));
         }
 
-        Self::re_login_account(account, &client, &solver).await;
+        Self::re_login_account(account, &client, &solver, true).await;
 
         // 检查重登后状态
         let new_state = account.state();
@@ -576,21 +776,30 @@ impl AccountPool {
     }
 
     /// 尝试重新登录 Error 状态的账号
-    /// 成功 → Idle，失败 → error_count++，≥3 则 Invalid
-    async fn re_login_account(account: &Account, client: &DsClient, solver: &PowSolver) {
+    /// 登录成功后保留上游聊天状态；登录失败 → error_count++，≥3 则 Invalid。
+    async fn re_login_account(account: &Account, client: &DsClient, solver: &PowSolver, manual: bool) {
         let display_id = account.display_id().to_string();
-        // 重登不做完整 health_check（do_health_check=false），仅验证登录+create_session 成功，
-        // 避免恢复流程每次发真实 completion 加重风控压力
-        match try_init_account(&account.creds, client, solver, false).await {
+        // 禁言未到期的账号跳过重登（风控差异 #4）：禁言 → mark_error → 每 5 分钟
+        // 恢复任务 re_login 会形成无效登录循环。
+        // 禁言是独立的账号状态，登录成功不代表聊天限制解除。
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        if account.mute_until() > now || (!manual && account.mute_until() < 0) {
+            debug!(
+                target: "ds_core::accounts",
+                "账号 {} 禁言至 {}，跳过本轮重登",
+                display_id,
+                format_mute_time(account.mute_until())
+            );
+            return;
+        }
+        match try_init_account(&account.creds, client, solver).await {
             Ok(new_account) => {
-                // 更新 token 与禁言状态
-                *account.token.write().unwrap() = new_account.token.read().unwrap().clone();
-                account.set_mute_until(new_account.mute_until());
-                account
-                    .state
-                    .store(AccountState::Idle as u8, Ordering::Relaxed);
-                account.error_count.store(0, Ordering::Relaxed);
-                info!(target: "ds_core::accounts", "账号 {} 重新登录成功", display_id);
+                account.apply_login(&new_account);
+                info!(target: "ds_core::accounts", "账号 {} 登录响应已更新，聊天状态={}",
+                    display_id, account.state().as_str());
             }
             Err(e) => {
                 let count = account.error_count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -608,7 +817,7 @@ impl AccountPool {
 
     /// 启动后台恢复任务：每 5 分钟扫描 Error 账号并尝试重新登录。
     /// 旧版每 60 秒扫描一次，且每次重登都发真实 completion（health_check），
-    /// 多个 Error 账号会周期性放大请求量，是触发风控/禁言的重要来源。改为 5 分钟 + 轻量验证。
+    /// 多个 Error 账号会周期性放大请求量。当前使用 5 分钟间隔及轻量验证。
     pub fn start_recovery_task(self: &Arc<Self>) {
         const RECOVERY_INTERVAL_SECS: u64 = 300;
         let pool = Arc::clone(self);
@@ -623,11 +832,16 @@ impl AccountPool {
                     _ => continue,
                 };
 
-                for entry in pool.accounts.iter() {
-                    let account = entry.value();
-                    if account.state() == AccountState::Error {
-                        Self::re_login_account(account, &client, &solver).await;
-                    }
+                // 先收集再处理：DashMap 的 iter() 持有分片读锁，直接在循环里
+                // await 网络重登会让 get_account/add_account 在这些分片上阻塞数秒
+                let error_accounts: Vec<Arc<Account>> = pool
+                    .accounts
+                    .iter()
+                    .filter(|e| e.value().state() == AccountState::Error)
+                    .map(|e| Arc::clone(e.value()))
+                    .collect();
+                for account in error_accounts {
+                    Self::re_login_account(&account, &client, &solver, false).await;
                 }
             }
         });
@@ -660,9 +874,11 @@ async fn init_account(
     let mut last_error = None;
 
     for attempt in 1..=3 {
-        // 首次登录做完整 health_check（发一次 test completion 验证账号可用）；
-        // 后续重试跳过，避免登录阶段反复发 completion
-        match try_init_account(creds, client, solver, attempt == 1).await {
+        // 不再发"健康检查 completion"（bug 2 延迟封号缓解）：每次冷启动对每个
+        // 账号发一次真实对话请求，是纯增量的上游暴露面——登录响应里已带禁言
+        // 状态（mute_until），账号可用性由首次真实请求自然验证，失败走既有的
+        // Error→重登路径。create_session/delete_session 保留（验证 token 有效）。
+        match try_init_account(creds, client, solver).await {
             Ok(account) => return Ok(account),
             // 设备风控拒绝（伪造/无效 device_id）：重试无意义，直接返回明确指引
             Err(e @ PoolError::RiskDeviceDetected { .. }) => return Err(e),
@@ -713,8 +929,9 @@ fn warn_on_shared_device_ids(creds: &[AccountConfig]) {
 async fn try_init_account(
     creds: &AccountConfig,
     client: &DsClient,
-    solver: &PowSolver,
-    do_health_check: bool,
+    // 登录不再做 completion 健康检查（bug 2），solver 仅为保持调用链形状，
+    // 将来若需恢复可选校验可直接使用。
+    _solver: &PowSolver,
 ) -> Result<Account, PoolError> {
     // 验证：email 和 mobile 至少一个非空
     if creds.email.is_empty() && creds.mobile.is_empty() {
@@ -760,13 +977,16 @@ async fn try_init_account(
             // 透传数美验证码：生成会话页面，等待用户手动完成验证后重试一次。
             let detail: serde_json::Value =
                 serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body.clone()));
-            let (id, rx) = crate::server::captcha_bridge::global().create(detail);
+            let captcha_store = crate::server::captcha_bridge::global();
+            let (id, rx) = captcha_store.create(detail);
             warn!(
                 target: "ds_core::accounts",
                 "登录触发人机验证，请打开 http://127.0.0.1:22217/captcha/{} 完成验证，超时 10 分钟",
                 id
             );
             let _result = crate::server::captcha_bridge::wait_for_solution(rx, 600).await;
+            // 无论成败都清理会话条目（成功路径 submit 里已清，这里兜底超时/放弃）
+            captcha_store.remove(&id);
             // 用户完成验证后重试登录（若 DeepSeek 需要把验证结果带回，可在此扩展登录参数）
             client.login(&login_payload).await?
         }
@@ -810,13 +1030,8 @@ async fn try_init_account(
     };
 
     // 禁言状态（登录响应实测字段）：登录不受禁言影响，但 completion 会被拒
-    let mute_until = login_data
-        .user
-        .chat
-        .as_ref()
-        .map(|c| c.mute_until as i64)
-        .unwrap_or(0);
-    if login_data.user.chat.as_ref().is_some_and(|c| c.is_muted != 0) {
+    let (initial_state, mute_until) = login_chat_state(login_data.user.chat.as_ref(), now_secs());
+    if initial_state == AccountState::Error {
         warn!(
             target: "ds_core::accounts",
             "账号 {} 已被禁言至 {}（登录正常，completion 将被拒绝，user_is_muted）",
@@ -825,76 +1040,120 @@ async fn try_init_account(
         );
     }
 
-    // 健康检查：创建临时 session → 发送 test completion → 删除 session。
-    // 仅首次登录执行完整 health_check；重登/恢复只验证 create_session 成功即返回，
-    // 避免每次重登都发一次真实 completion，加重风控压力（禁言根因之一）。
-    let session_id = client.create_session(&token).await?;
-    if do_health_check {
-        if let Err(e) = health_check(&token, &session_id, client, solver, "default", display_id).await {
-            // 即使健康检查失败也要清理 session
-            let _ = client.delete_session(&token, &session_id).await;
-            return Err(e);
-        }
+    // 不做 create/delete 会话验证（风控差异 #1）：官方 79MB 抓包里 delete
+    // 只出现 1 次（用户手动删会话），"登录后立刻 create+delete 一对孤儿会话"
+    // 是最容易聚类的自动化签名。账号可用性由登录响应的 mute 状态与首次真实
+    // 请求自然验证，坏 token 走既有 Error→重登路径。
+    // 拟真开屏（风控差异 #2）：官方 web 登录后是 settings → 会话列表的浏览
+    // 行为，我们补发同构的开屏序列（结果忽略），消除"登录即对话"指纹。
+    if initial_state == AccountState::Idle {
+        mimic_opening_sequence(client, &token, &login_payload.device_id).await;
     }
-    let _ = client.delete_session(&token, &session_id).await;
 
     Ok(Account {
         token: std::sync::RwLock::new(token.into()),
         email: creds.email.clone(),
         mobile: creds.mobile.clone(),
-        state: AtomicU8::new(AccountState::Idle as u8),
+        state: AtomicU8::new(initial_state as u8),
         last_released: AtomicI64::new(0),
         error_count: AtomicU8::new(0),
         mute_until: AtomicI64::new(mute_until),
+        cooldown_until: AtomicI64::new(0),
+        cooldown_level: AtomicU8::new(0),
         creds: creds.clone(),
         window: RequestWindow::new(),
     })
 }
 
-async fn health_check(
-    token: &str,
-    session_id: &str,
-    client: &DsClient,
-    solver: &PowSolver,
-    model_type: &str,
-    display_id: &str,
-) -> Result<(), PoolError> {
-    let start = std::time::Instant::now();
-    let challenge = client
-        .create_pow_challenge(token, "/api/v0/chat/completion")
-        .await?;
-
-    let result = solver.solve(&challenge)?;
-    let pow_header = result.to_header();
-
-    let payload = CompletionPayload {
-        chat_session_id: session_id.to_string(),
-        parent_message_id: None,
-        model_type: model_type.to_string(),
-        prompt: "只回复`Hello, world!`".to_string(),
-        ref_file_ids: vec![],
-        thinking_enabled: false,
-        search_enabled: false,
-        preempt: false,
-    };
-
-    let mut stream = client.completion(token, &pow_header, &payload).await?;
-    // 消费流确保消息写入
-    while let Some(chunk) = stream.try_next().await? {
-        let _ = chunk;
+/// is_muted 与未来的 mute_until 都能说明当前受限；不将登录成功当成解禁。
+fn login_chat_state(chat: Option<&crate::ds_core::client::ChatMute>, now: i64) -> (AccountState, i64) {
+    let Some(chat) = chat else { return (AccountState::Idle, 0) };
+    let until = if chat.mute_until.is_finite() { chat.mute_until.ceil() as i64 } else { 0 };
+    if chat.is_muted != 0 || until > now {
+        (AccountState::Error, if until > now { until } else { -1 })
+    } else {
+        (AccountState::Idle, 0)
     }
+}
 
-    debug!(
-        target: "ds_core::accounts",
-        "health_check 完成 model_type={} account={} elapsed={:?}",
-        model_type, display_id, start.elapsed()
-    );
-    Ok(())
+/// 拟真开屏序列（风控差异 #2）：官方 web 登录成功后是
+/// settings（带持久 did）→（间隔秒级）→ 会话列表 fetch_page 的浏览行为；
+/// 旧实现登录后 0 静默请求直奔 completion，"登录即对话"是非人指纹。
+/// 这里登录成功后串行补发 settings → fetch_page（结果忽略），间隔随机 1-3s。
+/// did 由账号 device_id 派生（稳定，每账号不同，形状与浏览器 localStorage UUID 一致）。
+async fn mimic_opening_sequence(client: &DsClient, token: &str, device_id: &str) {
+    let did = stable_did_from(device_id);
+    // 登录响应本身已间隔了网络往返；这里再歇 1-3s 模拟开屏渲染时间
+    tokio::time::sleep(tokio::time::Duration::from_millis(rand_ms(1000, 3000))).await;
+    client.fetch_client_settings(token, &did).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(rand_ms(800, 2000))).await;
+    let _ = client.fetch_session_page(token, None).await;
+}
+
+/// 从 device_id 派生稳定的 UUID v4 形状字符串（作 client/settings 的 did）。
+/// 官方 did 是浏览器 localStorage 的持久 UUID；用 device_id 哈希保证
+/// "每账号稳定且不同"，避免每次登录换 did（又一种不稳定指纹）。
+fn stable_did_from(device_id: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    // 两个不同 salt 的哈希拼 32 hex（Fowler 风格足够分散，无需引入 md5 依赖）
+    let mut h1 = DefaultHasher::new();
+    device_id.hash(&mut h1);
+    let a = h1.finish();
+    let mut h2 = DefaultHasher::new();
+    format!("{}|did-salt", device_id).hash(&mut h2);
+    let b = h2.finish();
+    format!(
+        "{:016x}{:016x}",
+        a.swap_bytes(), b
+    )
+    .chars()
+    .enumerate()
+    .fold(String::with_capacity(36), |mut acc, (i, c)| {
+        if i == 8 || i == 12 || i == 16 || i == 20 {
+            acc.push('-');
+        }
+        acc.push(c);
+        acc
+    })
+}
+
+/// [lo, hi) 毫秒随机数（std 库内实现，避免引 rand 到此模块）
+fn rand_ms(lo: u64, hi: u64) -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64;
+    lo + nanos % (hi - lo).max(1)
+}
+
+/// completion 链路步骤间的人速间隔（300-1200ms），pub(crate) 供编排层使用
+pub(crate) fn human_delay_ms() -> u64 {
+    rand_ms(300, 1200)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// did 派生：UUID 形状 + 同输入稳定 + 不同输入分散
+    #[test]
+    fn stable_did_is_uuid_shaped_and_deterministic() {
+        let d1 = stable_did_from("BjrONyKUq74lx67PbD6L2lvsbT3");
+        let d2 = stable_did_from("BjrONyKUq74lx67PbD6L2lvsbT3");
+        let d3 = stable_did_from("other-device");
+        assert_eq!(d1, d2, "同 device_id 派生的 did 必须稳定");
+        assert_ne!(d1, d3);
+        assert_eq!(d1.len(), 36, "UUID 形状: {}", d1);
+        for (i, c) in d1.chars().enumerate() {
+            if i == 8 || i == 13 || i == 18 || i == 23 {
+                assert_eq!(c, '-', "位置 {} 应为连字符", i);
+            } else {
+                assert!(c.is_ascii_hexdigit(), "位置 {} 应为 hex: {}", i, c);
+            }
+        }
+    }
 
     fn account(email: &str, device_id: &str) -> AccountConfig {
         AccountConfig {
@@ -916,6 +1175,8 @@ mod tests {
             last_released: AtomicI64::new(0),
             error_count: AtomicU8::new(0),
             mute_until: AtomicI64::new(0),
+            cooldown_until: AtomicI64::new(0),
+            cooldown_level: AtomicU8::new(0),
             creds: account(email, "dev"),
             window: RequestWindow::new(),
         })
@@ -925,8 +1186,8 @@ mod tests {
     fn window_counts_and_reports_usage() {
         let w = RequestWindow::new();
         assert_eq!(w.used(), 0);
-        assert_eq!(w.record(), 1);
-        assert_eq!(w.record(), 2);
+        assert_eq!(w.record(0), Some(1));
+        assert_eq!(w.record(0), Some(2));
         assert_eq!(w.used(), 2);
     }
 
@@ -952,17 +1213,150 @@ mod tests {
     }
 
     #[test]
+    fn cooldown_ladder_escalates_and_clears() {
+        // 限流退避：连续触发时逐级加长（bug 1 —— 退避不够长等于没退避）
+        let a = idle_account("a@example.com");
+        assert!(!a.in_cooldown(), "初始不在退避中");
+        assert_eq!(a.cooldown_remaining(), 0);
+
+        assert_eq!(a.enter_cooldown(1), COOLDOWN_LADDER_SECS[0]);
+        assert!(a.in_cooldown());
+        assert!(a.cooldown_remaining() > 0 && a.cooldown_remaining() <= COOLDOWN_LADDER_SECS[0]);
+
+        assert_eq!(a.enter_cooldown(3), COOLDOWN_LADDER_SECS[2]);
+        // 档位超出阶梯长度时取最后一档，不越界
+        assert_eq!(
+            a.enter_cooldown(99),
+            COOLDOWN_LADDER_SECS[COOLDOWN_LADDER_SECS.len() - 1]
+        );
+
+        a.clear_cooldown();
+        assert!(!a.in_cooldown(), "重登成功后必须清掉退避");
+        assert_eq!(a.cooldown_remaining(), 0);
+    }
+
+    #[test]
+    fn cooldown_account_is_not_allocated() {
+        // 退避中的账号不得被分配：否则用户连点发送会持续冲击上游
+        let pool = AccountPool::new(0);
+        let a = idle_account("a@example.com");
+        pool.accounts.insert("a@example.com".to_string(), a.clone());
+
+        assert!(pool.get_account().is_some(), "未退避时可分配");
+        a.enter_cooldown(1);
+        assert!(pool.get_account().is_none(), "退避中不应被分配");
+        // 会话亲和（get_account_by_id）同样不得绕过退避
+        assert!(
+            pool.get_account_by_id("a@example.com").is_none(),
+            "退避优先级高于会话亲和"
+        );
+        assert!(pool.max_cooldown_remaining() > 0);
+    }
+
+    #[test]
+    fn account_cooldown_remaining_targets_one_account() {
+        // 会话复用路径拿不到目标账号时，用它区分"在退避"（必须直接报限流，
+        // 不能降级冷启动换号）与"账号已失效"（允许降级）。
+        let pool = AccountPool::new(0);
+        let a = idle_account("a@example.com");
+        let b = idle_account("b@example.com");
+        pool.accounts.insert("a@example.com".to_string(), a.clone());
+        pool.accounts.insert("b@example.com".to_string(), b.clone());
+
+        assert_eq!(pool.account_cooldown_remaining("a@example.com"), 0);
+        a.enter_cooldown(1);
+        assert!(
+            pool.account_cooldown_remaining("a@example.com") > 0,
+            "退避中的账号应报出剩余秒数"
+        );
+        assert_eq!(
+            pool.account_cooldown_remaining("b@example.com"),
+            0,
+            "未退避的账号不应被牵连"
+        );
+        assert_eq!(
+            pool.account_cooldown_remaining("missing@example.com"),
+            0,
+            "账号不存在时按 0 处理（调用方走冷启动）"
+        );
+    }
+
+    #[test]
     fn expired_window_resets_usage() {
         let w = RequestWindow::new();
-        for _ in 0..5 {
-            w.record();
-        }
-        assert_eq!(w.used(), 5);
-        // 把窗口起点拨回过去，模拟窗口过期
-        w.started_at
-            .store(now_secs() - WINDOW_SECS - 1, Ordering::Relaxed);
-        assert_eq!(w.used(), 0, "窗口过期后用量应视作 0");
-        assert_eq!(w.record(), 1, "过期后重新计数应从 1 开始");
+        let start = Instant::now();
+        assert_eq!(w.count_at(start, true), 1);
+        assert_eq!(w.count_at(start + Duration::from_secs(3599), true), 2);
+        // 只淘汰最早的请求，窗口边界前一秒的请求仍需计数。
+        assert_eq!(w.count_at(start + Duration::from_secs(3600), false), 1);
+        assert_eq!(w.count_at(start + Duration::from_secs(3600), true), 2);
+        assert_eq!(w.count_at(start + Duration::from_secs(7200), false), 0);
+    }
+
+    #[test]
+    fn quota_applies_to_reused_conversations() {
+        let pool = AccountPool::new(1);
+        let a = idle_account("a@example.com");
+        pool.accounts.insert("a@example.com".into(), a.clone());
+        let guard = pool.get_account_by_id("a@example.com").unwrap();
+        drop(guard);
+        assert!(pool.account_quota_exhausted("a@example.com"));
+        assert!(pool.get_account_by_id("a@example.com").is_none());
+        assert!(pool.get_account().is_none());
+        assert_eq!(a.window.used(), 1);
+    }
+
+    #[test]
+    fn quota_reservation_is_atomic() {
+        let window = Arc::new(RequestWindow::new());
+        let workers: Vec<_> = (0..16).map(|_| {
+            let window = window.clone();
+            std::thread::spawn(move || window.record(3).is_some())
+        }).collect();
+        let accepted = workers.into_iter().filter_map(|t| t.join().ok()).filter(|v| *v).count();
+        assert_eq!(accepted, 3);
+        assert_eq!(window.used(), 3);
+    }
+
+    #[test]
+    fn muted_login_is_not_a_healthy_account() {
+        use crate::ds_core::client::ChatMute;
+        let chat = ChatMute { is_muted: 1, mute_until: 2000.25 };
+        assert_eq!(login_chat_state(Some(&chat), 1000), (AccountState::Error, 2001));
+        let unknown = ChatMute { is_muted: 1, mute_until: 0.0 };
+        assert_eq!(login_chat_state(Some(&unknown), 1000), (AccountState::Error, -1));
+        let clear = ChatMute { is_muted: 0, mute_until: 999.0 };
+        assert_eq!(login_chat_state(Some(&clear), 1000), (AccountState::Idle, 0));
+    }
+
+    #[test]
+    fn relogin_does_not_clear_a_confirmed_mute() {
+        let account = idle_account("a@example.com");
+        let fresh_login = idle_account("a@example.com");
+        fresh_login.set_mute_until(now_secs() + 3600);
+        fresh_login.state.store(AccountState::Error as u8, Ordering::Relaxed);
+        account.apply_login(&fresh_login);
+        assert_eq!(account.state(), AccountState::Error);
+        assert!(!account.is_available());
+        assert!(account.is_muted());
+    }
+
+    #[test]
+    fn confirmed_mute_survives_guard_release() {
+        let pool = AccountPool::new(0);
+        let a = idle_account("a@example.com");
+        pool.accounts.insert("a@example.com".into(), a.clone());
+        let guard = pool.get_account().unwrap();
+        pool.mark_muted("a@example.com", None);
+        drop(guard);
+        assert_eq!(a.state(), AccountState::Error);
+        assert_eq!(a.mute_until(), -1);
+        assert!(pool.get_account().is_none());
+        assert!(pool.get_account_by_id("a@example.com").is_none());
+        assert!(pool.all_muted_notice().is_some());
+        let status = pool.account_statuses();
+        assert!(status[0].is_muted);
+        assert_eq!(status[0].mute_until, None);
     }
 
     #[test]

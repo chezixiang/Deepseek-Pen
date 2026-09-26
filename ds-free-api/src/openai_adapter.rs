@@ -192,6 +192,13 @@ impl OpenAIAdapter {
 
         let chat_resp = self.try_chat(chat_req, request_id).await?;
         let account_id = chat_resp.account_id;
+        // 持久会话（会话复用路径）才有稳定的云端会话 id：临时会话收尾即删除，
+        // 透传出去只会让应用记下一个随即失效的 id。
+        let ds_session_id = if chat_resp.persistent {
+            Some(chat_resp.session_id.clone())
+        } else {
+            None
+        };
 
         // 为修复模型准备工具定义信息
         let tool_defs = req.tools.as_ref().map(|tools| {
@@ -221,6 +228,7 @@ impl OpenAIAdapter {
                     prompt_tokens,
                     repair_fn: Some(repair_fn),
                     tag_config: self.tag_config.read().await.clone(),
+                    session_id: ds_session_id.clone(),
                 },
             );
             Ok(ChatResult {
@@ -240,6 +248,8 @@ impl OpenAIAdapter {
                     prompt_tokens,
                     repair_fn: Some(repair_fn),
                     tag_config: self.tag_config.read().await.clone(),
+                    // 非流式：会话 id 随聚合结果一并返回
+                    session_id: None,
                 },
             )
             .await?;
@@ -254,6 +264,9 @@ impl OpenAIAdapter {
     /// 内部辅助：对 `Overloaded` 进行退避重试（v0_chat 内部已做换号重试，此处为号池级兜底）。
     /// MAX_RETRIES 从 2 降到 1：v0_chat 内部最多 3 次 + 此处 2 次 = 单请求最多 6 次 session
     /// 尝试，是触发风控/禁言的重要放大因素；降到 1 后最多 4 次，平衡可用性与风控风险。
+    ///
+    /// `RateLimited` **永不重试**：上游已在限流，每次重试都要新建 session 再撞一次，
+    /// 是账号被升级为禁言的主因（bug 1）。直接透传给调用方，由应用侧把"稍后再试"给用户。
     pub(crate) async fn try_chat(
         &self,
         req: crate::ds_core::ChatRequest,
@@ -269,6 +282,13 @@ impl OpenAIAdapter {
                         log::info!(target: "adapter", "req={} 第 {} 次重试成功", request_id, attempt);
                     }
                     return Ok(resp);
+                }
+                Err(CoreError::RateLimited(msg)) => {
+                    log::warn!(
+                        target: "adapter",
+                        "req={} 上游限流，不做任何重试: {}", request_id, msg
+                    );
+                    return Err(CoreError::RateLimited(msg));
                 }
                 Err(CoreError::Overloaded) if attempt + 1 < MAX_RETRIES => {
                     let delay = BASE_DELAY_MS * (1 << attempt);
@@ -528,6 +548,11 @@ impl OpenAIAdapter {
         self.ds_core.list_cloud_session_messages(session_id).await
     }
 
+    /// 删除云端会话（应用侧删除本地对话时同步调用，bug 3）
+    pub async fn delete_cloud_session(&self, session_id: &str) -> Result<String, CoreError> {
+        self.ds_core.delete_cloud_session(session_id).await
+    }
+
     /// 会话复用：根据缓存判定续聊/编辑重答计划。
     /// None = 缓存未命中或不可复用（调用方退回冷启动路径并按 key 回写缓存）。
     async fn plan_conversation(
@@ -546,7 +571,20 @@ impl OpenAIAdapter {
         let text_norm = if text.is_empty() { "[图片]".to_string() } else { text };
         // 编辑重答（edit_message）不能携带新文件；带文件时退回冷路径
         let files = request::files::extract_last_message(req);
-        let regenerate = cached.last_user_text != text_norm;
+        // 续聊 vs 编辑重答的判据是「上下文里最后一条 user 消息」与缓存记录的对比，
+        // 不是「本轮新消息」与缓存的对比：
+        //   查找键 = 除最后一条 user 外的上下文哈希，缓存条目上的 last_user_text 是
+        //   该上下文之后那条 user 消息的文本。因此
+        //   - 续聊：上下文里已有那条消息（文本相等）→ Append 新轮次；
+        //   - 编辑：用户改掉了那条消息，它已不在上下文里（文本不等）→ Regenerate。
+        //   上下文里没有任何 user 消息（编辑/重试首条）时一律 Regenerate。
+        // 旧实现拿 text_norm（本轮新消息）去比，导致**每一轮续聊都被判成编辑**：
+        // edit_message 会重写上一条 user 消息并截断其后内容，表现为"同一对话里
+        // 上下文丢失"（模型只看得到最新一条消息）。
+        let regenerate = match context_last_user_text(req) {
+            Some(ctx_text) => ctx_text != cached.last_user_text,
+            None => true,
+        };
         if regenerate && !files.files.is_empty() {
             return None;
         }
@@ -597,6 +635,24 @@ fn message_plain_text(msg: &crate::openai_adapter::types::Message) -> String {
             .join("\n"),
         _ => String::new(),
     }
+}
+
+/// 上下文（最后一条 user 之前的所有消息）里最后一条 user 消息的纯文本。
+/// 编辑重答时这条消息已被用户改掉——它不在上下文里，与缓存记录的 last_user_text
+/// 不再一致，据此把"续聊"与"编辑重答"区分开（见 plan_conversation）。
+fn context_last_user_text(req: &ChatCompletionsRequest) -> Option<String> {
+    let msgs = &req.messages;
+    if msgs.len() < 2 {
+        return None;
+    }
+    msgs[..msgs.len() - 1]
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| {
+            let t = message_plain_text(m);
+            if t.is_empty() { "[图片]".to_string() } else { t }
+        })
 }
 
 /// 消息携带的图片/文件数量（键成分：区分"纯文本重复"与"带图消息"）
@@ -735,6 +791,11 @@ pub enum OpenAIAdapterError {
     #[error("provider error: {0}")]
     ProviderError(String),
 
+    /// 上游限流（账号已进入退避窗口）。与 Overloaded 分开：应用侧据此**停止自动续发**
+    /// 而不是重试，避免把限流升级成禁言（bug 1）。
+    #[error("rate limited: {0}")]
+    RateLimited(String),
+
     /// 内部错误（序列化、流转换等）
     #[error("internal error: {0}")]
     Internal(String),
@@ -749,6 +810,10 @@ impl From<CoreError> for OpenAIAdapterError {
         match e {
             CoreError::NoAccounts => Self::NoAccounts,
             CoreError::Overloaded => Self::Overloaded,
+            CoreError::RateLimited(msg) => Self::RateLimited(msg),
+            // 确定性拒绝（禁言/输入超长）走 ProviderError 的对外形态（502 + 原文），
+            // 但**不会被内部重试**——它的不同只在重试语义上（见 CoreError::Rejected）
+            CoreError::Rejected(msg) => Self::ProviderError(msg),
             CoreError::ProofOfWorkFailed(err) => {
                 Self::Internal(format!("proof of work failed: {}", err))
             }
@@ -772,6 +837,9 @@ impl OpenAIAdapterError {
             // 未配置账号用 503（服务不可用），与 429 限流区分
             Self::NoAccounts => 503,
             Self::Overloaded => 429,
+            // 上游限流同样用 429，但错误码不同（rate_limited vs rate_limit_error），
+            // 应用侧据此区分"等一会自己会好"与"停止续发，否则会被禁言"
+            Self::RateLimited(_) => 429,
             Self::ProviderError(_) => 502,
             Self::Internal(_) => 500,
             Self::ToolCallRepairNeeded(_) => 500,
@@ -781,7 +849,7 @@ impl OpenAIAdapterError {
 
 #[cfg(test)]
 mod reuse_tests {
-    use super::{conversation_context_key, message_plain_text};
+    use super::{context_last_user_text, conversation_context_key, message_plain_text};
     use crate::openai_adapter::types::{ChatCompletionsRequest, MessageContent, Message};
 
     fn parse(v: serde_json::Value) -> ChatCompletionsRequest {
@@ -876,6 +944,53 @@ mod reuse_tests {
             ]
         }));
         assert!(conversation_context_key(&req, "default").is_none());
+    }
+
+    #[test]
+    fn context_last_user_text_tracks_context_tail() {
+        // 续聊第二轮：上下文尾部仍是 u1 → 命中缓存里的 u1 ⇒ 不是编辑
+        let req = parse(serde_json::json!({
+            "model": "deepseek-default",
+            "user": "conv-a",
+            "messages": [
+                { "role": "user", "content": "u1" },
+                { "role": "assistant", "content": "a1" },
+                { "role": "user", "content": "u2" }
+            ]
+        }));
+        assert_eq!(context_last_user_text(&req).as_deref(), Some("u1"));
+
+        // 编辑 u2：u2改 成为最后一条，上下文尾部回到 u1 —— 与缓存里的 u2 不等 ⇒ 编辑
+        let edited = parse(serde_json::json!({
+            "model": "deepseek-default",
+            "user": "conv-a",
+            "messages": [
+                { "role": "user", "content": "u1" },
+                { "role": "assistant", "content": "a1" },
+                { "role": "user", "content": "u2 改" }
+            ]
+        }));
+        assert_eq!(context_last_user_text(&edited).as_deref(), Some("u1"));
+
+        // 编辑首条消息：上下文里没有 user ⇒ None（一律 Regenerate）
+        let first = parse(serde_json::json!({
+            "model": "deepseek-default",
+            "user": "conv-a",
+            "messages": [{ "role": "user", "content": "u1 改" }]
+        }));
+        assert_eq!(context_last_user_text(&first), None);
+
+        // 纯图片的上下文消息与缓存写入口径一致（占位符 [图片]）
+        let img_ctx = parse(serde_json::json!({
+            "model": "deepseek-default",
+            "user": "conv-a",
+            "messages": [
+                { "role": "user", "content": [{ "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } }] },
+                { "role": "assistant", "content": "a1" },
+                { "role": "user", "content": "这是什么" }
+            ]
+        }));
+        assert_eq!(context_last_user_text(&img_ctx).as_deref(), Some("[图片]"));
     }
 
     #[test]

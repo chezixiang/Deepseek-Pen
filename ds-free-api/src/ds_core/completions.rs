@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio::time::Sleep;
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -16,8 +18,10 @@ use pin_project_lite::pin_project;
 use crate::ds_core::CoreError;
 use crate::ds_core::accounts::{AccountGuard, AccountPool};
 use crate::ds_core::accounts::format_mute_time;
+use crate::ds_core::accounts::human_delay_ms;
 use crate::ds_core::client::{CompletionPayload, DsClient, EditMessagePayload, StopStreamPayload};
 use crate::ds_core::pow::PowSolver;
+use super::floor_utf8_end;
 
 pub(crate) struct ActiveSession {
     pub(crate) token: String,
@@ -132,6 +136,12 @@ pub struct ChatRequest {
 pub struct ChatResponse {
     pub stream: Pin<Box<dyn Stream<Item = Result<Bytes, CoreError>> + Send>>,
     pub account_id: String,
+    /// 本次对话所在的云端会话 id（chat_session.id，即 fetch_page 侧栏里的那条）。
+    /// 应用侧据此把本地会话与云端会话对上号，同步时不会重复导入（bug 3）。
+    /// 临时会话（非持久，流的收尾会 delete_session）也为 Some，调用方自行决定是否透传。
+    pub session_id: String,
+    /// 持久会话（会话复用路径）：缓存管理其生命周期，应用侧可安全记录 session_id
+    pub persistent: bool,
 }
 
 pin_project! {
@@ -236,6 +246,46 @@ where
     }
 }
 
+/// 读空闲超时包装：上游连接半开（TCP 黑洞、代理挂死）时，`idle` 内没有任何
+/// 字节到达就报 Stream 错误结束请求。没有它，挂死的连接会让账号永远停在
+/// Busy、客户端请求永不返回。所有字段均 Unpin，无需 pin 投影。
+pub(crate) struct IdleTimeoutStream {
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, CoreError>> + Send>>,
+    idle: Duration,
+    deadline: Option<Pin<Box<Sleep>>>,
+}
+
+impl Stream for IdleTimeoutStream {
+    type Item = Result<Bytes, CoreError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(item) => {
+                // 任何产出（含错误/结束）都解除超时器，避免悬挂的 Sleep 拖延 shutdown
+                this.deadline = None;
+                Poll::Ready(item)
+            }
+            Poll::Pending => {
+                let idle = this.idle;
+                let sleep = this
+                    .deadline
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(idle)));
+                match sleep.as_mut().poll(cx) {
+                    Poll::Ready(()) => Poll::Ready(Some(Err(CoreError::Stream(format!(
+                        "读空闲超时（{} 秒内上游无任何数据）",
+                        idle.as_secs()
+                    ))))),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+}
+
+/// SSE 读空闲上限：正常流式输出（含服务端保活与混淆填充）远不会静默这么久
+const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+
 pub struct Completions {
     client: RwLock<DsClient>,
     solver: RwLock<PowSolver>,
@@ -262,6 +312,43 @@ pub struct CachedConversation {
 
 const CONVO_CACHE_CAP: usize = 128;
 const CONVO_TTL_MS: u64 = 6 * 60 * 60 * 1000;
+
+/// 会话缓存的纯写入逻辑（与账号池解耦，便于单测）：
+/// 把同一个条目写到所有键上——**已存在的键同样覆盖**，未存在的键新增；
+/// 随后按 `last_used_ms` 淘汰超容量的最旧条目，返回它们供调用方删除服务端会话。
+fn apply_conversation_insert(
+    map: &mut HashMap<String, CachedConversation>,
+    keys: Vec<String>,
+    entry: CachedConversation,
+) -> Vec<CachedConversation> {
+    let mut unique: Vec<String> = Vec::with_capacity(keys.len());
+    for k in keys {
+        if !unique.contains(&k) {
+            unique.push(k);
+        }
+    }
+    // 覆盖写：条目代表「该上下文之后最近一次发出的 user 消息与消息锚点」，
+    // 同一上下文被再次使用（续聊/编辑）时必须更新，否则适配器读到陈旧值。
+    for k in &unique {
+        map.insert(k.clone(), entry.clone());
+    }
+
+    let mut victims = Vec::new();
+    if map.len() > CONVO_CACHE_CAP {
+        let mut by_age: Vec<(String, u64)> = map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.last_used_ms))
+            .collect();
+        by_age.sort_by_key(|(_, ms)| *ms);
+        let overflow = map.len() - CONVO_CACHE_CAP;
+        for (victim_key, _) in by_age.into_iter().take(overflow) {
+            if let Some(victim) = map.remove(&victim_key) {
+                victims.push(victim);
+            }
+        }
+    }
+    victims
+}
 
 impl Completions {
     pub async fn new(client: DsClient, solver: PowSolver, pool: AccountPool) -> Self {
@@ -293,35 +380,20 @@ impl Completions {
         Some(entry)
     }
 
-    /// 同一会话写入多个键（查找键 + 下一轮预期键），LRU 淘汰按条目数计
-    pub(crate) fn insert_conversation_multi(
-        &self,
-        keys: Vec<String>,
-        entry: CachedConversation,
-    ) {
-        let mut map = self.conversations.lock().unwrap();
-        let fresh: Vec<String> = keys
-            .into_iter()
-            .filter(|k| !map.contains_key(k))
-            .collect();
-        if map.len() + fresh.len() > CONVO_CACHE_CAP {
-            // LRU：淘汰 last_used_ms 最小的条目（异步删服务端会话，尽力而为）
-            let mut by_age: Vec<(String, u64)> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), v.last_used_ms))
-                .collect();
-            by_age.sort_by_key(|(_, ms)| *ms);
-            let overflow = map.len() + fresh.len() - CONVO_CACHE_CAP;
-            let victim_keys: Vec<String> =
-                by_age.into_iter().take(overflow).map(|(k, _)| k).collect();
-            for victim_key in victim_keys {
-                if let Some(victim) = map.remove(&victim_key) {
-                    self.spawn_delete_session(&victim.account_id, &victim.session_id);
-                }
-            }
-        }
-        for k in fresh {
-            map.insert(k, entry.clone());
+    /// 同一会话写入多个键（查找键 + 下一轮预期键），LRU 淘汰按条目数计。
+    ///
+    /// 已存在的键**必须覆盖**：缓存条目上的 `last_user_text` 是「该上下文之后那条
+    /// user 消息」，适配器据此判断续聊 / 编辑重答。旧实现把已存在的键直接跳过，
+    /// 于是条目一直保留最早的 `last_user_text`（以及过期的消息锚点）——
+    /// 下一轮拿上下文尾部来比会命中一个陈旧值，编辑被误判成续聊（反之亦然），
+    /// 这正是"同一对话上下文丢失"的另一个成因（bug 1）。
+    pub(crate) fn insert_conversation_multi(&self, keys: Vec<String>, entry: CachedConversation) {
+        let victims = {
+            let mut map = self.conversations.lock().unwrap();
+            apply_conversation_insert(&mut map, keys, entry)
+        };
+        for victim in victims {
+            self.spawn_delete_session(&victim.account_id, &victim.session_id);
         }
     }
 
@@ -352,12 +424,23 @@ impl Completions {
         req: ChatRequest,
         request_id: &str,
     ) -> Result<ChatResponse, CoreError> {
+        if let Some(notice) = self.pool.all_muted_notice() {
+            return Err(CoreError::Rejected(notice));
+        }
         // 会话复用优先：命中缓存则续聊/重答（历史由服务端持有，不再上传历史文件）
         if let Some(plan) = &req.conversation {
             if let Some(target) = &plan.reuse {
                 match self.v0_chat_reuse(&req, plan, target, request_id).await {
                     Ok(resp) => return Ok(resp),
                     Err(CoreError::NoAccounts) => return Err(CoreError::NoAccounts),
+                    // 限流**绝不降级冷启动**：降级会新建一个 session（还可能换到别的
+                    // 账号）再撞一次上游，把限流的洪峰续上——用户点一次「重试」就多
+                    // 一轮请求；是否导致禁言尚无因果证据。
+                    // 原样上抛，由适配层返回 429 并由应用侧劝阻等待。
+                    Err(e @ CoreError::RateLimited(_)) => return Err(e),
+                    // 账号禁言/确定性拒绝不能通过换号或重建会话恢复这一请求。
+                    Err(e @ CoreError::Rejected(_)) => return Err(e),
+                    Err(CoreError::Overloaded) => return Err(CoreError::Overloaded),
                     Err(e) => {
                         log::warn!(
                             target: "ds_core::accounts",
@@ -416,11 +499,29 @@ impl Completions {
                     // 账号池为空：重试也不会变多，直接返回
                     return Err(CoreError::NoAccounts);
                 }
+                Err(CoreError::RateLimited(msg)) => {
+                    // 上游限流**绝不重试**：每次重试都要新建 session + 再次冲击上游，
+                    // 这会放大无效流量。让调用方把"稍后再试"带给用户。
+                    log::warn!(
+                        target: "ds_core::accounts",
+                        "req={} 上游限流，停止重试: {}", request_id, msg
+                    );
+                    return Err(CoreError::RateLimited(msg));
+                }
                 Err(CoreError::Overloaded) => {
                     if attempt + 1 >= MAX_ATTEMPTS {
                         return Err(CoreError::Overloaded);
                     }
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                }
+                Err(e @ CoreError::Rejected(_)) => {
+                    // 上游对本次请求的确定性拒绝（输入超长/账号禁言）：重试不会改变
+                    // 结果，却要再建 session、再传一遍文件——直接上抛（bug 1）
+                    log::warn!(
+                        target: "ds_core::accounts",
+                        "req={} 上游拒绝请求，停止重试: {}", request_id, e
+                    );
+                    return Err(e);
                 }
                 Err(e) => {
                     log::warn!(
@@ -455,6 +556,29 @@ impl Completions {
                 }
                 if self.pool.is_empty() {
                     return Err(CoreError::NoAccounts);
+                }
+                if let Some(notice) = self.pool.account_mute_notice(&target.account_id) {
+                    return Err(CoreError::Rejected(notice));
+                }
+                if self.pool.account_quota_exhausted(&target.account_id) {
+                    return Err(CoreError::RateLimited(
+                        "当前账号已达到本地最近一小时请求上限，请等待配额恢复".into(),
+                    ));
+                }
+                // 目标账号正在限流退避：这里必须直接报限制，而不是等到超时后
+                // 降级冷启动——冷启动会换账号新建 session，等于用户每点一次重试
+                // 就多一轮上游请求，正是"限流升级成禁言"的路径（bug 1）。
+                let cooldown = self.pool.account_cooldown_remaining(&target.account_id);
+                if cooldown > 0 {
+                    log::warn!(
+                        target: "ds_core::accounts",
+                        "req={} 会话账号 {} 在限流退避中（剩余 {}s），不降级冷启动",
+                        request_id, target.account_id, cooldown
+                    );
+                    return Err(CoreError::RateLimited(format!(
+                        "上游限流中，请 {} 秒后再试（当前继续发送会被判定为异常客户端并可能被禁言）",
+                        cooldown
+                    )));
                 }
                 if tokio::time::Instant::now() >= deadline {
                     return Err(CoreError::Overloaded);
@@ -518,6 +642,7 @@ impl Completions {
             let payload = CompletionPayload {
                 chat_session_id: target.session_id.clone(),
                 parent_message_id: Some(target.last_response_msg_id),
+                action: None,
                 model_type: req.model_type.clone(),
                 prompt: req.prompt.clone(),
                 ref_file_ids,
@@ -550,29 +675,31 @@ impl Completions {
                     // 残留字节里可能就是禁言提示（禁言账号常只下发 hint 即断流）；
                     // 登录时已记录 mute_until，能给出精确到期时间
                     if let Some(notice) = extract_mute_notice(&buf) {
-                        self.pool.mark_error(&account_id);
+                        self.pool.mark_muted(&account_id, extract_mute_until(&buf));
                         let mute_until = account.mute_until();
-                        let msg = if notice.contains("user_is_muted") && mute_until > 0 {
+                        // 禁言 → Rejected（不重试、不做换号重发）：每次重试都要
+                        // 新建 session 再撞一次上游，是延迟封号后的请求放大器（bug 2）。
+                        let msg = if mute_until > 0 {
                             format!(
-                                "空 SSE 流：账号已被禁言至 {}（user_is_muted），到期前请更换账号",
+                                "账号已被禁言至 {}（user is muted），到期前请更换账号或等待解禁",
                                 format_mute_time(mute_until)
                             )
                         } else {
-                            format!("空 SSE 流：{}", notice)
+                            format!("账号已被禁言（user is muted）：{}", notice)
                         };
-                        return CoreError::Stream(msg);
+                        return CoreError::Rejected(msg);
                     }
                     if buf.is_empty() {
                         self.pool.mark_error(&account_id);
                         let mute_until = account.mute_until();
                         if mute_until > 0 {
-                            return CoreError::Stream(format!(
-                                "空 SSE 流：账号已被禁言至 {}（user_is_muted），到期前请更换账号",
+                            return CoreError::Rejected(format!(
+                                "账号已被禁言至 {}（user is muted），到期前请更换账号或等待解禁",
                                 format_mute_time(mute_until)
                             ));
                         }
-                        CoreError::Stream(
-                            "空 SSE 流：服务端未返回任何数据，当前账号可能已被限制或禁言".to_string(),
+                        CoreError::Rejected(
+                            "服务端未返回任何数据，当前账号可能已被限制或禁言；请更换账号".to_string(),
                         )
                     } else {
                         CoreError::Stream(format!("空 SSE 流 (已收到 {} 字节)", buf.len()))
@@ -588,16 +715,20 @@ impl Completions {
 
         let (req_msg_id, stop_id) = parse_ready_message_ids(ready_block.as_bytes());
 
-        if let Some(err) = check_hint(&second_block) {
-            if let CoreError::Overloaded = &err {
-                self.pool.mark_error(&account_id);
+        if let Some((hint_block, err)) = initial_hint_error(&ready_block, &second_block) {
+            if matches!(err, CoreError::RateLimited(_)) {
+                // 同上（冷路径）：限流让账号退避，不标记 Error、不触发重登
+                let secs = self.pool.mark_rate_limited(&account_id);
+                log::warn!(
+                    target: "ds_core::accounts",
+                    "req={} 复用请求限流，账号退避 {}s", request_id, secs
+                );
             } else if err.to_string().contains("禁言") {
-                // 禁言是账号级状态，标记 Error 避免同账号反复建会话
-                self.pool.mark_error(&account_id);
+                self.pool.mark_muted(&account_id, extract_mute_until(hint_block.as_bytes()));
                 // 登录时记录了 mute_until，把精确到期时间补进提示
                 // （复用路径为持久会话：禁言不使其失效，无需 delete）
-                if err.to_string().contains("user_is_muted") && account.mute_until() > 0 {
-                    let enriched = CoreError::ProviderError(format!(
+                if account.mute_until() > 0 {
+                    let enriched = CoreError::Rejected(format!(
                         "禁言提示：账号已被禁言至 {}（user_is_muted），到期前请更换账号",
                         format_mute_time(account.mute_until())
                     ));
@@ -643,6 +774,8 @@ impl Completions {
                 self.active_sessions.clone(),
             )),
             account_id,
+            session_id: target.session_id.clone(),
+            persistent: true,
         })
     }
 
@@ -669,6 +802,18 @@ impl Completions {
                     "req={} 账号池为空（未配置账号）", request_id
                 );
                 CoreError::NoAccounts
+            } else if self.pool.all_in_cooldown() {
+                // 全部账号都在限流退避中：这是"上游在限你"，不是"账号不够用"。
+                // 报 RateLimited 让上层与应用侧停止重试，等退避窗口过去（bug 1）。
+                let secs = self.pool.max_cooldown_remaining();
+                log::warn!(
+                    target: "ds_core::accounts",
+                    "req={} 所有账号均在限流退避中，剩余最长 {}s", request_id, secs
+                );
+                CoreError::RateLimited(format!(
+                    "上游限流中，请 {} 秒后再试（当前继续发送会被判定为异常客户端并可能被禁言）",
+                    secs
+                ))
             } else {
                 log::warn!(
                     target: "ds_core::accounts",
@@ -703,6 +848,9 @@ impl Completions {
             target: "ds_core::accounts",
             "req={} 创建 session: id={}", request_id, session_id
         );
+        // 人速抖动（风控差异 #7）：官方前端从建会话到发 completion 之间有
+        // 秒级人类间隔（输入/渲染），我们机器速连发。每步间随机 300-1200ms。
+        tokio::time::sleep(tokio::time::Duration::from_millis(human_delay_ms())).await;
 
         // 4. 上传文件：先历史文件，再外部文件（对话阅读顺序）
         let mut ref_file_ids: Vec<String> = Vec::new();
@@ -724,6 +872,18 @@ impl Completions {
             {
                 Ok(file_id) => ref_file_ids.push(file_id),
                 Err(e) => {
+                    let msg = e.to_string();
+                    // 上传接口对禁言账号返回 biz_code=14（biz_data 是 mute 信息、
+                    // 无文件 id）：标记账号并立即失败，别退回内联发送打同一账号
+                    if msg.contains("user is muted") {
+                        let until = extract_mute_until(msg.as_bytes()).unwrap_or(0);
+                        self.pool.mark_muted(&account_id, (until > 0).then_some(until));
+                        log::warn!(
+                            target: "ds_core::accounts",
+                            "req={} 历史文件上传时发现账号被禁言（until={:?}）", request_id, until
+                        );
+                        return Err(upload_mute_rejected(until));
+                    }
                     log::warn!(
                         target: "ds_core::accounts",
                         "req={} 历史文件上传失败，退回内联发送: {}", request_id, e
@@ -748,6 +908,16 @@ impl Completions {
             {
                 Ok(file_id) => ref_file_ids.push(file_id),
                 Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("user is muted") {
+                        let until = extract_mute_until(msg.as_bytes()).unwrap_or(0);
+                        self.pool.mark_muted(&account_id, (until > 0).then_some(until));
+                        log::warn!(
+                            target: "ds_core::accounts",
+                            "req={} 外部文件上传时发现账号被禁言（until={:?}）", request_id, until
+                        );
+                        return Err(upload_mute_rejected(until));
+                    }
                     log::warn!(
                         target: "ds_core::accounts",
                         "req={} 外部文件上传失败 ({}): {}", request_id, file.filename, e
@@ -804,6 +974,7 @@ impl Completions {
         let payload = CompletionPayload {
             chat_session_id: session_id.clone(),
             parent_message_id: None,
+            action: None,
             model_type: req.model_type.clone(),
             prompt: completion_prompt,
             ref_file_ids,
@@ -836,17 +1007,18 @@ impl Completions {
                     // 残留字节里可能就是禁言提示（禁言账号常只下发 hint 即断流）；
                     // 登录时已记录 mute_until，能给出精确到期时间
                     if let Some(notice) = extract_mute_notice(&buf) {
-                        self.pool.mark_error(&account_id);
+                        self.pool.mark_muted(&account_id, extract_mute_until(&buf));
                         let mute_until = account.mute_until();
-                        let msg = if notice.contains("user_is_muted") && mute_until > 0 {
+                        // 禁言 → Rejected（不重试，bug 2 放大器修复）
+                        let msg = if mute_until > 0 {
                             format!(
-                                "空 SSE 流：账号已被禁言至 {}（user_is_muted），到期前请更换账号",
+                                "账号已被禁言至 {}（user is muted），到期前请更换账号或等待解禁",
                                 format_mute_time(mute_until)
                             )
                         } else {
-                            format!("空 SSE 流：{}", notice)
+                            format!("账号已被禁言（user is muted）：{}", notice)
                         };
-                        return CoreError::Stream(msg);
+                        return CoreError::Rejected(msg);
                     }
                     // 零字节空流绝大多数是账号被限制/禁言/登录态失效（非网络抖动），
                     // 标记 Error 触发换号重试，并把可能原因写进错误消息直达用户。
@@ -854,13 +1026,13 @@ impl Completions {
                         self.pool.mark_error(&account_id);
                         let mute_until = account.mute_until();
                         if mute_until > 0 {
-                            return CoreError::Stream(format!(
-                                "空 SSE 流：账号已被禁言至 {}（user_is_muted），到期前请更换账号",
+                            return CoreError::Rejected(format!(
+                                "账号已被禁言至 {}（user is muted），到期前请更换账号或等待解禁",
                                 format_mute_time(mute_until)
                             ));
                         }
-                        CoreError::Stream(
-                            "空 SSE 流：服务端未返回任何数据，当前账号可能已被限制或禁言".to_string(),
+                        CoreError::Rejected(
+                            "服务端未返回任何数据，当前账号可能已被限制或禁言；请更换账号".to_string(),
                         )
                     } else {
                         CoreError::Stream(format!("空 SSE 流 (已收到 {} 字节)", buf.len()))
@@ -882,30 +1054,32 @@ impl Completions {
         let (req_msg_id, stop_id) = parse_ready_message_ids(ready_block.as_bytes());
 
         // 8. 检查 hint 事件（rate_limit / input_exceeds_limit）
-        if let Some(err) = check_hint(&second_block) {
-            if let CoreError::Overloaded = &err {
+        if let Some((hint_block, err)) = initial_hint_error(&ready_block, &second_block) {
+            if matches!(err, CoreError::RateLimited(_)) {
+                // 限流**不是**账号故障：标记 Error 会让后台恢复任务 5 分钟后去重新登录，
+                // 而重登本身也是上游请求；用户继续点发送时又会新建 session 再撞一次——
+                // 这两股流量叠加正是账号被禁言的直接原因（bug 1）。
+                // 这里改为"让账号退避一段时间"：不重登、不再分配，等窗口自己过去。
+                let secs = self.pool.mark_rate_limited(&account_id);
                 log::warn!(
                     target: "ds_core::accounts",
-                    "req={} hint 限流: rate_limit_reached", request_id
+                    "req={} hint 限流: rate_limit_reached，账号退避 {}s", request_id, secs
                 );
-                // rate_limit 是账号级限流，标记 Error 触发换号重试
-                self.pool.mark_error(&account_id);
-            } else {
-                if err.to_string().contains("禁言") {
-                    // 禁言是账号级状态，标记 Error 避免同账号反复建会话
-                    self.pool.mark_error(&account_id);
-                    // 登录时记录了 mute_until，把精确到期时间补进提示
-                    if err.to_string().contains("user_is_muted") && account.mute_until() > 0 {
-                        let enriched = CoreError::ProviderError(format!(
-                            "禁言提示：账号已被禁言至 {}（user_is_muted），到期前请更换账号",
-                            format_mute_time(account.mute_until())
-                        ));
-                        log::warn!(target: "ds_core::accounts", "req={} hint 禁言: {}", request_id, enriched);
-                        let _ = client.delete_session(&token, &session_id).await;
-                        session_guard.disarm();
-                        return Err(enriched);
-                    }
+            } else if err.to_string().contains("禁言") {
+                // 保留明确的账号限制，不换号重试本次请求。
+                self.pool.mark_muted(&account_id, extract_mute_until(hint_block.as_bytes()));
+                // 同步本次响应的 mute_until，把精确到期时间补进提示
+                if account.mute_until() > 0 {
+                    let enriched = CoreError::Rejected(format!(
+                        "禁言提示：账号已被禁言至 {}（user_is_muted），到期前请更换账号",
+                        format_mute_time(account.mute_until())
+                    ));
+                    log::warn!(target: "ds_core::accounts", "req={} hint 禁言: {}", request_id, enriched);
+                    let _ = client.delete_session(&token, &session_id).await;
+                    session_guard.disarm();
+                    return Err(enriched);
                 }
+            } else {
                 let hint_detail = second_block
                     .lines()
                     .find_map(|l| l.strip_prefix("data: "))
@@ -982,17 +1156,24 @@ impl Completions {
         session_guard.disarm();
 
         Ok(ChatResponse {
-            stream: Box::pin(GuardedStream::new(
-                Box::pin(stream),
-                guard,
-                client.clone(),
-                token,
-                session_id,
-                stop_id,
-                persistent,
-                self.active_sessions.clone(),
-            )),
+            // 外层再包读空闲超时：连接半开时不会永远 Pending
+            stream: Box::pin(IdleTimeoutStream {
+                inner: Box::pin(GuardedStream::new(
+                    Box::pin(stream),
+                    guard,
+                    client.clone(),
+                    token,
+                    session_id.clone(),
+                    stop_id,
+                    persistent,
+                    self.active_sessions.clone(),
+                )),
+                idle: SSE_IDLE_TIMEOUT,
+                deadline: None,
+            }),
             account_id,
+            session_id,
+            persistent,
         })
     }
 
@@ -1187,6 +1368,61 @@ impl Completions {
             .map_err(CoreError::from)?;
         drop(guard);
         Ok(messages)
+    }
+
+    /// 删除云端会话（本地删除对话时同步调用，bug 3）。
+    ///
+    /// 依次用每个空闲账号尝试：会话是**账号作用域**的，应用侧记录的 cloudId
+    /// 未必属于当前空闲的那个账号（多账号池下账号轮换过）。逐个试到成功为止，
+    /// 全部失败才报错——这样"删了本地、云端还在，下次同步又冒出来"不再发生。
+    ///
+    /// 返回实际删除所用的账号 id。
+    pub async fn delete_cloud_session(&self, session_id: &str) -> Result<String, CoreError> {
+        if self.pool.is_empty() {
+            return Err(CoreError::NoAccounts);
+        }
+        // 先清掉本地复用缓存里指向这个会话的条目（避免下次续聊撞到已删除会话）
+        self.conversations
+            .lock()
+            .unwrap()
+            .retain(|_, v| v.session_id != session_id);
+
+        let client = self.client.read().await.clone();
+        let mut tried = 0usize;
+        let mut last_err: Option<CoreError> = None;
+        // 上游尝试上限（bug 2 延迟封号缓解）：删除是"本地删了顺手同步"的操作，
+        // 不值得为它把整个账号池都打一遍（多账号机器一次删除 = 全池上游请求）。
+        const MAX_DELETE_ATTEMPTS: usize = 3;
+
+        for _ in 0..self.pool.account_count().min(MAX_DELETE_ATTEMPTS) {
+            let Some(guard) = self.pool.get_account() else {
+                break;
+            };
+            let account_id = guard.account().display_id().to_string();
+            let token = guard.account().token().to_string();
+            tried += 1;
+            match client.delete_session(&token, session_id).await {
+                Ok(()) => {
+                    log::info!(
+                        target: "ds_core::accounts",
+                        "云端会话已删除: id={} account={}", session_id, account_id
+                    );
+                    return Ok(account_id);
+                }
+                Err(e) => {
+                    log::warn!(
+                        target: "ds_core::accounts",
+                        "账号 {} 删除云端会话失败（换账号重试）: {}", account_id, e
+                    );
+                    last_err = Some(CoreError::from(e));
+                }
+            }
+        }
+        if tried == 0 {
+            return Err(CoreError::Overloaded);
+        }
+        // 所有账号都失败：把最后一次错误抛出（多为会话不属于任何账号 / 已删除）
+        Err(last_err.unwrap_or_else(|| CoreError::ProviderError("删除云端会话失败".into())))
     }
 
     /// 标记账号为 Error 状态
@@ -1459,24 +1695,73 @@ fn now_ms_u64() -> u64 {
 /// 禁言账号的 completion 可能只下发一条 hint 即关闭流（应用侧表现为"空 SSE 流"），
 /// 提示就在残留字节里——提取出来直达用户，替代笼统的空流报错。
 fn extract_mute_notice(raw: &[u8]) -> Option<String> {
+    parse_mute_response(raw).map(|(notice, _)| notice)
+}
+
+fn extract_mute_until(raw: &[u8]) -> Option<i64> {
+    parse_mute_response(raw).and_then(|(_, until)| until)
+}
+
+/// 上传环节发现禁言：统一用户可读文案（带到期时间）。
+/// Rejected 不触发换号重试，账号已被 mark_muted 标记。
+fn upload_mute_rejected(until: i64) -> CoreError {
+    CoreError::Rejected(format!(
+        "账号已被禁言（user is muted），上传文件被拒绝，请更换账号或等待解禁{}",
+        if until > 0 {
+            format!("（至 {}）", format_mute_time(until))
+        } else {
+            String::new()
+        }
+    ))
+}
+
+/// 仅从业务错误或 hint 事件读取账号状态。普通回答提及「禁言」不等于账号禁言，
+/// biz_code=50 也不能被字符串前缀 biz_code=5 误判。
+fn parse_mute_response(raw: &[u8]) -> Option<(String, Option<i64>)> {
     let text = String::from_utf8_lossy(raw);
-    if let Some(idx) = text.find("由于违反").or_else(|| text.find("禁言")) {
-        let rest = &text[idx..];
-        let end = match rest.find('。') {
-            Some(i) => idx + i + '。'.len_utf8(),
-            None => (idx + 200).min(text.len()),
-        };
-        let snippet = text[idx..end].trim();
-        if !snippet.is_empty() {
-            return Some(snippet.to_string());
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+        return mute_from_value(&value, false);
+    }
+    // 兼容上游直接返回的纯文本拒绝；不扫描正常 SSE 回答里的任意关键词。
+    if text.trim_start().starts_with("由于违反用户使用规范") && text.contains("禁言") {
+        let message = text.trim();
+        return Some((message[..floor_utf8_end(message, 240)].to_string(), None));
+    }
+    let normalized = text.replace("\r\n", "\n");
+    for block in normalized.split("\n\n") {
+        let event = block.lines().find_map(|line| line.trim().strip_prefix("event:"))
+            .map(str::trim);
+        if event.is_some_and(|name| name != "hint") { continue; }
+        let data = block.lines().filter_map(|line| line.trim().strip_prefix("data:"))
+            .map(str::trim).collect::<Vec<_>>().join("\n");
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&data)
+            && (event == Some("hint") || value.get("type").and_then(|v| v.as_str()) == Some("error"))
+            && let Some(mute) = mute_from_value(&value, true) {
+            return Some(mute);
         }
     }
-    if text.contains("user_is_muted") {
-        return Some(
-            "账号已被禁言（user_is_muted）：到期时间请在网页端登录查看，到期前请更换账号".to_string(),
-        );
-    }
     None
+}
+
+fn mute_from_value(value: &serde_json::Value, hint: bool) -> Option<(String, Option<i64>)> {
+    let data = value.get("data").filter(|v| v.is_object()).unwrap_or(value);
+    let biz = data.get("biz_data").unwrap_or(data);
+    let message = data.get("biz_msg").or_else(|| if hint { data.get("content") } else { None })
+        .and_then(|v| v.as_str()).unwrap_or("");
+    let muted = data.get("biz_code").and_then(|v| v.as_i64()) == Some(5)
+        || biz.get("is_muted").and_then(|v| v.as_i64()).is_some_and(|v| v != 0)
+        || matches!(message, "user is muted" | "user_is_muted")
+        || (hint && message.contains("禁言"));
+    if !muted { return None; }
+    let until = biz.get("mute_until").or_else(|| data.get("mute_until"))
+        .and_then(|v| v.as_f64()).filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| v.ceil() as i64);
+    let notice = if message.contains("禁言") {
+        message[..floor_utf8_end(message, 240)].to_string()
+    } else {
+        "账号已被禁言（user is muted），请等待解禁".into()
+    };
+    Some((notice, until))
 }
 
 /// 从字符串中提取前两个完整 SSE 事件块
@@ -1488,8 +1773,17 @@ fn split_two_events(buf: &str) -> Option<(&str, &str)> {
     Some((parts[0], parts[1]))
 }
 
-/// 检查 hint 事件，返回错误（禁言 → 携带原文含到期时间；rate_limit → Overloaded；超长 → ProviderError）
+/// 检查 hint 事件，返回错误（禁言 → 携带原文含到期时间；rate_limit → RateLimited；超长 → Rejected）
+fn initial_hint_error<'a>(first: &'a str, second: &'a str) -> Option<(&'a str, CoreError)> {
+    // 拒绝响应不保证先发送 ready：hint + close 也必须在交付流之前拒绝。
+    check_hint(first).map(|err| (first, err))
+        .or_else(|| check_hint(second).map(|err| (second, err)))
+}
+
 fn check_hint(event_block: &str) -> Option<CoreError> {
+    if let Some(notice) = extract_mute_notice(event_block.as_bytes()) {
+        return Some(CoreError::Rejected(format!("禁言提示：{}", notice)));
+    }
     let is_hint = event_block.lines().any(|l| {
         l.trim()
             .strip_prefix("event:")
@@ -1498,19 +1792,16 @@ fn check_hint(event_block: &str) -> Option<CoreError> {
     if !is_hint {
         return None;
     }
-    // 禁言提示（中文原文或 user_is_muted 错误码）优先：直达用户而非笼统报错
-    if event_block.contains("禁言") || event_block.contains("user_is_muted") {
-        let notice = extract_mute_notice(event_block.as_bytes())
-            .unwrap_or_else(|| "账号已被禁言（违反用户使用规范）".into());
-        return Some(CoreError::ProviderError(format!("禁言提示：{}", notice)));
-    }
     if event_block.contains("rate_limit") {
-        return Some(CoreError::Overloaded);
+        // 限流用独立错误类型：调用方据此让账号退避而不是标记 Error 后换号重试
+        return Some(CoreError::RateLimited(
+            "上游触发限流（rate_limit_reached），请稍后再试".into(),
+        ));
     }
     if event_block.contains("input_exceeds_limit") {
-        return Some(CoreError::ProviderError(
-            "输入内容超长，请缩短后重试".into(),
-        ));
+        // 输入超长是**请求级**的确定性拒绝：重试不会让输入变短，
+        // 每次重试却要新建 session、重传文件——用 Rejected 让重试循环直接上抛（bug 1）
+        return Some(CoreError::Rejected("输入内容超长，请缩短后重试".into()));
     }
     None
 }
@@ -1541,6 +1832,92 @@ fn parse_ready_message_ids(chunk: &[u8]) -> (i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(account: &str, session: &str, last_user_text: &str, last_used_ms: u64) -> CachedConversation {        CachedConversation {
+            account_id: account.to_string(),
+            session_id: session.to_string(),
+            last_request_msg_id: 1,
+            last_response_msg_id: 2,
+            last_user_text: last_user_text.to_string(),
+            model_type: "default".to_string(),
+            last_used_ms,
+        }
+    }
+
+    #[test]
+    fn check_hint_classifies_rate_limit_separately() {
+        // 限流必须是独立的 RateLimited（而不是 Overloaded）：
+        // Overloaded 会被上层换号/退避重试，反复新建 session 是禁言的直接诱因（bug 1）。
+        let rate = "event: hint\ndata: {\"content\":\"rate_limit_reached\"}\n";
+        match check_hint(rate) {
+            Some(CoreError::RateLimited(_)) => {}
+            other => panic!("限流应返回 RateLimited，实际 {:?}", other),
+        }
+
+        // 禁言与 JSON 拒绝采用同一分类，不能因返回 SSE 就触发换号重试。
+        let muted = "event: hint\ndata: {\"content\":\"user_is_muted\"}\n";
+        match check_hint(muted) {
+            Some(CoreError::Rejected(m)) => assert!(m.contains("禁言")),
+            other => panic!("禁言应返回 Rejected，实际 {:?}", other),
+        }
+
+        // 超长输入是 Rejected（请求级确定性拒绝）：重试不会让输入变短，
+        // 每次重试却要新建 session + 重传文件，正是要避免的放大（bug 1）
+        let too_long = "event: hint\ndata: {\"content\":\"input_exceeds_limit\"}\n";
+        match check_hint(too_long) {
+            Some(CoreError::Rejected(m)) => assert!(m.contains("超长")),
+            other => panic!("超长应返回 Rejected，实际 {:?}", other),
+        }
+
+        // 非 hint 事件不报错
+        let normal = "event: update_session\ndata: {}\n";
+        assert!(check_hint(normal).is_none());
+    }
+
+    #[test]
+    fn conversation_insert_overwrites_existing_keys() {
+        // 已存在的键必须被覆盖：否则适配器会一直读到最早的 last_user_text，
+        // 把编辑误判成续聊（bug 1 的第二个成因）。
+        let mut map: HashMap<String, CachedConversation> = HashMap::new();
+        apply_conversation_insert(&mut map, vec!["k1".into()], entry("a", "s1", "u1", 100));
+        assert_eq!(map.get("k1").unwrap().last_user_text, "u1");
+
+        // 同一键再次写入（同一上下文、新一轮 user 消息）→ 条目被刷新
+        let victims = apply_conversation_insert(
+            &mut map,
+            vec!["k1".into(), "k2".into()],
+            entry("a", "s1", "u2", 200),
+        );
+        assert!(victims.is_empty());
+        assert_eq!(map.get("k1").unwrap().last_user_text, "u2");
+        assert_eq!(map.get("k1").unwrap().last_used_ms, 200);
+        assert_eq!(map.get("k2").unwrap().last_user_text, "u2");
+    }
+
+    #[test]
+    fn conversation_insert_evicts_oldest_over_cap() {
+        let mut map: HashMap<String, CachedConversation> = HashMap::new();
+        for i in 0..CONVO_CACHE_CAP {
+            apply_conversation_insert(
+                &mut map,
+                vec![format!("k{}", i)],
+                entry("a", &format!("s{}", i), "u", i as u64),
+            );
+        }
+        assert_eq!(map.len(), CONVO_CACHE_CAP);
+
+        // 再插两个新键 → 超容量，淘汰最旧的两个（k0/k1）
+        let victims = apply_conversation_insert(
+            &mut map,
+            vec!["new1".into(), "new2".into()],
+            entry("a", "s-new", "u", 10_000),
+        );
+        assert_eq!(map.len(), CONVO_CACHE_CAP);
+        let mut evicted: Vec<String> = victims.iter().map(|v| v.session_id.clone()).collect();
+        evicted.sort();
+        assert_eq!(evicted, vec!["s0".to_string(), "s1".to_string()]);
+        assert!(map.contains_key("new1") && map.contains_key("new2"));
+    }
 
     #[test]
     fn sanitize_history_removes_native_tags() {
@@ -1593,7 +1970,13 @@ mod tests {
         // 形态 2（用户情报实测）：SSE 只含 user_is_muted 错误码，无中文
         let sse_code = "event: hint\ndata: {\"type\":\"error\",\"content\":\"user_is_muted\",\"finish_reason\":\"user_is_muted\"}\n\n";
         let notice = extract_mute_notice(sse_code.as_bytes()).unwrap();
-        assert!(notice.contains("user_is_muted"), "应识别错误码: {}", notice);
+        assert!(notice.contains("禁言"), "应识别错误码并给中文文案: {}", notice);
+        // 形态 3（本机真机实测 2026-09-24）：禁言时 completion 直接返回 JSON 空流
+        // {"code":0,"data":{"biz_code":5,"biz_msg":"user is muted",...}}——
+        // 空格形态 + biz_code 5，旧实现漏检导致被重试 3 次（bug 2 放大器）。
+        let biz_json = br#"{"code":0,"msg":"","data":{"biz_code":5,"biz_msg":"user is muted","biz_data":{"is_muted":1,"mute_until":1790440554.409}}}"#;
+        let notice = extract_mute_notice(biz_json).expect("biz_code=5/user is muted 必须识别");
+        assert!(notice.contains("禁言"), "应识别真实禁言响应: {}", notice);
         // 形态 1：中文原文（含到期时间）
         let sse_cn = "data: {\"type\":\"error\",\"content\":\"由于违反用户使用规范，你的账号已被禁言至 2026 年 9 月 9 日 14:44，如有疑问请联系我们。\"}\n\n";
         let notice = extract_mute_notice(sse_cn.as_bytes()).unwrap();
@@ -1602,5 +1985,54 @@ mod tests {
         assert!(notice.ends_with('。'), "应到句号为止: {}", notice);
         // 无禁言内容 → None
         assert!(extract_mute_notice(b"event: ready\ndata: {}\n\n").is_none());
+    }
+
+    /// 回归：中文提示无句号且 >200 字节时，旧版 (idx+200) 直接按字节截断，
+    /// 中文（3 字节/字符）必然切在字符中间 → panic（panic=abort 下杀掉整个进程）。
+    #[test]
+    fn extract_mute_notice_cjk_without_period_does_not_panic() {
+        let mut raw = String::from("由于违反用户使用规范，你的账号已被禁言");
+        while raw.len() < 400 {
+            raw.push_str("，了解更多请联系管理员客服");
+        }
+        assert!(raw.len() > 400, "前置条件：buffer 必须远超 200 字节");
+        let notice = extract_mute_notice(raw.as_bytes());
+        assert!(notice.is_some(), "长中文无句号也应提取出禁言提示");
+        assert!(notice.unwrap().contains("禁言"));
+    }
+
+    /// 回归：is_muted 带空格的形态（"is_muted": 1）也要命中
+    #[test]
+    fn extract_mute_notice_detects_spaced_is_muted() {
+        assert!(extract_mute_notice(br#"{"biz_msg":"user is muted","biz_data":{"is_muted": 1}}"#).is_some());
+        assert!(extract_mute_notice(br#"{"biz_code": 5}"#).is_some());
+    }
+
+    #[test]
+    fn mute_deadline_is_read_from_business_response_and_hint() {
+        let response = br#"{"code":0,"data":{"biz_code":5,"biz_msg":"user is muted","biz_data":{"is_muted":1,"mute_until":1790440554.409}}}"#;
+        assert_eq!(extract_mute_until(response), Some(1790440555));
+        let hint = b"event:hint\r\ndata:{\"content\":\"user_is_muted\",\"mute_until\":1790440554.409}\r\n\r\n";
+        assert_eq!(extract_mute_until(hint), Some(1790440555));
+        assert!(matches!(check_hint(std::str::from_utf8(hint).unwrap()), Some(CoreError::Rejected(_))));
+    }
+
+    #[test]
+    fn ordinary_content_and_other_business_codes_are_not_mutes() {
+        assert!(extract_mute_notice(br#"{"data":{"biz_code":50,"biz_msg":"other error"}}"#).is_none());
+        assert!(extract_mute_notice(br#"{"data":{"biz_code":0,"biz_data":{"is_muted":0,"mute_until":null}}}"#).is_none());
+        let content = "event: update\ndata: {\"content\":\"user_is_muted 表示账号禁言\"}\n\n";
+        assert!(extract_mute_notice(content.as_bytes()).is_none());
+        let answer = br#"{"content":"user_is_muted"}"#;
+        assert!(extract_mute_notice(answer).is_none());
+    }
+
+    #[test]
+    fn mute_hint_is_recognized_without_a_ready_event() {
+        let hint = "event: hint\ndata: {\"content\":\"user_is_muted\"}";
+        assert!(matches!(initial_hint_error(hint, "event: close\ndata: {}"),
+            Some((_, CoreError::Rejected(_)))));
+        assert!(matches!(initial_hint_error("event: ready\ndata: {}", hint),
+            Some((_, CoreError::Rejected(_)))));
     }
 }

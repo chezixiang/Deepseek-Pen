@@ -14,11 +14,15 @@ name: CI
 #      backend job 的 aarch64 二进制。
 #
 # 另外两处本仓库特有的坑，下面 job 里已绕开：
-#   - ds-free-api/.cargo/config.toml 把默认 target 钉成 aarch64（交叉编译），
-#     所以宿主单元测试必须显式 --target x86_64-unknown-linux-gnu 并覆盖 CC/CXX/AR。
-#   - app/package.json 里 @dictpen/* 写的是绝对路径 file:D:/codes/youdao/sdk/...，
-#     这是 STRUCTURE_CHANGELOG 里明确「暂不修改」的项，CI 在检出后按 SDK 的
-#     new-app.sh 约定改写成相对路径，不动仓库里的文件。
+#   - ds-free-api/.cargo/config.toml（已被 git 跟踪）把默认 target 钉成 aarch64
+#     （交叉编译），所以宿主单元测试必须显式 --target x86_64-unknown-linux-gnu
+#     并覆盖 CC/CXX/AR；backend job 还额外设置了 aarch64 linker 环境变量兜底，
+#     即使有人误删 cargo 配置，aarch64 产物路径也不会再跑偏。
+#   - app/package.json 与 package-lock.json 里 @dictpen/* 写的是绝对路径
+#     file:D:/codes/youdao/sdk/...（STRUCTURE_CHANGELOG 里明确「暂不修改」），
+#     CI 在检出后按 SDK 的 new-app.sh 约定改写成相对路径，不动仓库里的文件。
+#     package-lock.json 的 packages[""] 根条目必须与 package.json 一起改写，
+#     否则旧版 npm（node 18 自带）的 npm ci 会报 lock 不同步。
 
 on:
   push:
@@ -76,6 +80,14 @@ jobs:
     needs: [web]
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      # aarch64 交叉工具链兜底：正常情况下 ds-free-api/.cargo/config.toml（已提交）
+      # 提供同名配置；这里再显式声明一遍，保证 release 产物一定落在
+      # target/aarch64-unknown-linux-gnu/release/ 供上传与 miniapp 内嵌。
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+      CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+      AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
     steps:
       - uses: actions/checkout@v4
 
@@ -116,30 +128,31 @@ jobs:
 
       # 宿主 target 单元测试：.cargo/config.toml 的 [build].target 与 [env] 都指向
       # aarch64 交叉编译，而 aarch64 测试二进制无法在 x86_64 上执行，
-      # 故按仓库自带的 build-deploy.sh 显式指定宿主 target 并覆盖 CC/CXX/AR、
-      # 清空 [build].target。（本地验证：ds-free-api 171 passed；CAPTCHA 4 passed）
+      # 故按仓库自带的 run-host-tests.sh 显式指定宿主 target 并覆盖 CC/CXX/AR、
+      # 清空 [build].target。
       #
-      # 只跑 --lib：CAPTCHA/tests/ 下的集成测试是调试辅助脚本，不是回归测试 ——
-      # decrypt_ip / decrypt_fields 需要 IP_B64 / FIELDS_JSON 才有意义，
-      # verify_bc 的 des_roundtrip 在本仓库当前就是失败的（断言的期望值与实现不符）。
-      # 用 --lib 明确只做单元测试门禁，避免把已知失败的调试脚本当成 CI 阻断项。
-      - name: CAPTCHA 单元测试（宿主 target）
+      # CAPTCHA 用完整 cargo test：tests/ 下的解密调试脚本已用 #[ignore] 标注
+      # （decrypt_ip / decrypt_fields 需要 IP_B64 / FIELDS_JSON 环境变量才有意义），
+      # verify_bc 的 des_roundtrip 已修复为真正的回归测试，会正常执行。
+      - name: CAPTCHA 测试（宿主 target）
         working-directory: CAPTCHA
         run: |
-          cargo test --lib --target x86_64-unknown-linux-gnu \
+          cargo test --target x86_64-unknown-linux-gnu \
             --config 'env.CC="gcc"' --config 'env.CXX="g++"' --config 'env.AR="ar"' \
             --config 'build.target=""'
 
-      - name: ds-free-api 单元测试（宿主 target）
+      # --lib --tests：单元测试（src 内 #[cfg(test)]）+ 集成测试（tests/ 目录，
+      # 路由层鉴权/错误映射 + SSE 全管线，均为离线测试，不访问真实上游）。
+      - name: ds-free-api 测试（宿主 target）
         working-directory: ds-free-api
         run: |
-          cargo test --lib --target x86_64-unknown-linux-gnu \
+          cargo test --lib --tests --target x86_64-unknown-linux-gnu \
             --config 'env.CC="gcc"' --config 'env.CXX="g++"' --config 'env.AR="ar"' \
             --config 'build.target=""'
 
       - name: 构建 aarch64 release（词典笔用）
         working-directory: ds-free-api
-        run: cargo build --release
+        run: cargo build --release --target aarch64-unknown-linux-gnu
 
       # 本地构建脚本还会用 upx 压缩，CI 产物保持未压缩，供 miniapp job 内嵌。
       - name: 上传后端二进制
@@ -179,19 +192,30 @@ jobs:
           cache: npm
           cache-dependency-path: app/package-lock.json
 
-      # app/package.json 提交的是 Windows 绝对路径（file:D:/codes/youdao/sdk/...），
-      # 在 CI runner 上不存在。按 SDK 的 new-app.sh 约定统一成相对路径，
-      # 与 package-lock.json 中的 resolved 一致；仓库文件本身不动。
+      # app/package.json 与 package-lock.json 提交的都是 Windows 绝对路径
+      # （file:D:/codes/youdao/sdk/...），在 CI runner 上不存在。按 SDK 的
+      # new-app.sh 约定统一成相对路径，与 node_modules/@dictpen/* 链接条目的
+      # resolved 一致；仓库文件本身不动。package-lock.json 的 packages[""]
+      # 根条目必须一起改写，否则 node 18 自带 npm 的 npm ci 可能报 lock 不同步。
       - name: 改写 @dictpen 依赖为相对路径
         working-directory: app
         run: |
-          sed -i -E 's#"@dictpen/(core|types)": "file:[^"]*"#"@dictpen/\1": "file:../../sdk/packages/\1"#' package.json
-          cat package.json | grep '"@dictpen'
+          sed -i -E 's#"@dictpen/(core|types)": "file:[^"]*"#"@dictpen/\1": "file:../../sdk/packages/\1"#' package.json package-lock.json
           grep -q '"@dictpen/core": "file:../../sdk/packages/core"' package.json
+          grep -q '"@dictpen/types": "file:../../sdk/packages/types"' package.json
+          grep -q '"@dictpen/core": "file:../../sdk/packages/core"' package-lock.json
+          grep -q '"@dictpen/types": "file:../../sdk/packages/types"' package-lock.json
 
       - name: 安装依赖（npm ci，postinstall 会打 aiot-vue-cli 补丁）
         working-directory: app
         run: npm ci
+
+      # 纯函数回归用例（LaTeX / config.toml 解析 / markdown / emoji / 限流分类）。
+      # build:prod 里 build-wrapper 也会再跑一遍，这里提前单跑是为了让失败
+      # 信息直接落在测试步骤，而不是埋在十几分钟的打包日志里。
+      - name: 纯函数回归测试
+        working-directory: app
+        run: npm test
 
       - name: 类型检查（@dictpen/types）
         working-directory: app

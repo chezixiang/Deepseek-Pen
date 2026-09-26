@@ -190,11 +190,12 @@ fn write_json_file<T: Serialize>(path: &Path, data: &T) -> anyhow::Result<()> {
     let json = serde_json::to_string_pretty(data)?;
     fs::write(&tmp_path, &json)?;
     fs::rename(&tmp_path, path)?;
-    // 设置文件权限 0600（仅 owner 可读写）
+    // 0644：词典笔应用侧 fs.readFile 部分机型非 root，0600 会让应用读不到
+    // （stats.json 曾因此出现在旧目录；同 config.rs save 的修正）。
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o600);
+        let perms = fs::Permissions::from_mode(0o644);
         fs::set_permissions(path, perms)?;
     }
     Ok(())

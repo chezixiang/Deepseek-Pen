@@ -14,9 +14,12 @@ use wreq_util::Emulation;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use thiserror::Error;
+use crate::ds_core::floor_utf8_end;
+use crate::server::net_capture;
 
 // API 端点常量
 const ENDPOINT_USERS_LOGIN: &str = "/users/login";
+const ENDPOINT_CLIENT_SETTINGS: &str = "/client/settings";
 const ENDPOINT_CHAT_SESSION_CREATE: &str = "/chat_session/create";
 const ENDPOINT_CHAT_SESSION_DELETE: &str = "/chat_session/delete";
 const ENDPOINT_CHAT_SESSION_FETCH_PAGE: &str = "/chat_session/fetch_page";
@@ -177,12 +180,73 @@ struct CreateSessionWrapper {
 #[derive(Debug, Deserialize)]
 pub struct UploadFileData {
     pub id: String,
+    #[serde(default)]
     #[allow(dead_code)]
     pub status: String,
+    #[serde(default)]
     #[allow(dead_code)]
     pub file_name: String,
+    #[serde(default)]
     #[allow(dead_code)]
     pub file_size: i64,
+}
+
+/// 从任意 JSON 值里宽容提取文件上传结果（老格式结构漂移时的兜底）：
+/// 先按老信封的已知路径找，找不到再深度优先搜第一个带字符串 "id" 的对象。
+fn extract_upload_loose(v: &serde_json::Value) -> Option<UploadFileData> {
+    fn from_obj(v: &serde_json::Value) -> Option<UploadFileData> {
+        let obj = v.as_object()?;
+        let id = match obj.get("id") {
+            Some(serde_json::Value::String(s)) if !s.is_empty() => s.clone(),
+            Some(serde_json::Value::Number(n)) => n.to_string(),
+            _ => return None,
+        };
+        let s = |k: &str| {
+            obj.get(k)
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        Some(UploadFileData {
+            id,
+            status: s("status"),
+            file_name: s("file_name"),
+            file_size: obj.get("file_size").and_then(|x| x.as_i64()).unwrap_or(0),
+        })
+    }
+    fn walk(v: &serde_json::Value) -> Option<UploadFileData> {
+        if let Some(found) = from_obj(v) {
+            return Some(found);
+        }
+        if let serde_json::Value::Object(map) = v {
+            for (_, child) in map {
+                if let Some(found) = walk(child) {
+                    return Some(found);
+                }
+            }
+        } else if let serde_json::Value::Array(items) = v {
+            for item in items {
+                if let Some(found) = walk(item) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    for p in [
+        "/data/biz_data",
+        "/data/biz_data/file",
+        "/data/biz_data/attachment",
+        "/data",
+        "",
+    ] {
+        if let Some(node) = v.pointer(p) {
+            if let Some(found) = from_obj(node) {
+                return Some(found);
+            }
+        }
+    }
+    walk(v)
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,7 +286,12 @@ pub struct CloudSession {
     pub model_type: String,
 }
 
-/// 云端消息条目（history_messages 解析结果，fragments 已拼接）
+/// 云端消息条目（history_messages 解析结果，fragments 已拼接）。
+///
+/// 云端的编辑/重试构成一棵消息树：每个节点带 parent_id，同一父节点下有多个
+/// 子节点时，**数组顺序的最后一个**是当前活跃版本（官方前端只显示它）。
+/// 本结构只下发活跃链；被替换的兄弟版本放在 alt_texts（用户消息=编辑历史，
+/// assistant 消息=重试历史，按时间升序），应用侧映射为版本切换 UI。
 #[derive(Debug, Clone, Serialize)]
 pub struct CloudMessage {
     /// "user" | "assistant"
@@ -230,6 +299,28 @@ pub struct CloudMessage {
     pub content: String,
     /// THINK fragment 内容（assistant 消息可能有）
     pub reasoning: String,
+    /// 同层被替换的兄弟版本文本（升序，不含当前 content）
+    #[serde(default)]
+    pub alt_texts: Vec<String>,
+}
+
+/// 把 JSON 标量（数字/字符串）统一成 String：上游 message_id 是数字，
+/// parent_id 也是数字，实测字段类型不稳定，统一宽容处理。
+fn scalar_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// history_messages 的单个消息节点（剪枝前的原始形态）
+pub(crate) struct TreeNode {
+    pub role_raw: String,
+    pub content: String,
+    pub reasoning: String,
+    pub parent: Option<String>,
+    pub is_empty: bool,
 }
 
 /// 从 fetch_page 响应中宽容提取会话数组。
@@ -345,8 +436,12 @@ struct ChallengeWrapper {
 #[derive(Debug, Serialize)]
 pub struct CompletionPayload {
     pub chat_session_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// 官方 payload 里该键显式存在（首条消息为 null）；旧实现 skip 掉 None
+    /// 会少一个键，与官方 JSON 形状不一致（风控差异分析 #5）。
     pub parent_message_id: Option<i64>,
+    /// 官方 payload 恒有 "action": null。
+    #[serde(default)]
+    pub action: Option<()>,
     pub model_type: String,
     pub prompt: String,
     pub ref_file_ids: Vec<String>,
@@ -403,9 +498,72 @@ fn is_captcha_body(body: &str) -> bool {
             || lower.contains("captchauuid"))
 }
 
+/// SSE 流抓取包装：透传上游字节流的同时，把累计前 MAX_STREAM_BYTES 字节缓存，
+/// 流正常结束/出错/被丢弃时作为 response_body 事件落盘。禁言等业务失败常在
+/// SSE 的首帧 biz_code 里，即使上层提前断流（drop）也能留下已收到的部分。
+struct CaptureStream<S> {
+    inner: Pin<Box<S>>,
+    cid: u64,
+    buf: Vec<u8>,
+    truncated: bool,
+    done: bool,
+}
+
+impl<S> CaptureStream<S> {
+    fn finish(&mut self) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+        net_capture::body(self.cid, &self.buf, self.truncated);
+    }
+}
+
+impl<S: Stream<Item = Result<Bytes, ClientError>>> Stream for CaptureStream<S> {
+    type Item = Result<Bytes, ClientError>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.done {
+            return std::task::Poll::Ready(None);
+        }
+        match self.inner.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => {
+                if self.buf.len() < net_capture::MAX_STREAM_BYTES {
+                    let take = (net_capture::MAX_STREAM_BYTES - self.buf.len()).min(bytes.len());
+                    self.buf.extend_from_slice(&bytes[..take]);
+                    if take < bytes.len() {
+                        self.truncated = true;
+                    }
+                } else {
+                    self.truncated = true;
+                }
+                std::task::Poll::Ready(Some(Ok(bytes)))
+            }
+            std::task::Poll::Ready(Some(Err(e))) => {
+                self.finish();
+                std::task::Poll::Ready(Some(Err(e)))
+            }
+            std::task::Poll::Ready(None) => {
+                self.finish();
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl<S> Drop for CaptureStream<S> {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 /// Print a hint when WAF challenge is detected
 fn print_waf_hint() {
-    warn!(target: "ds_core::client", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    warn!(target: "ds_core::client", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     warn!(target: "ds_core::client", "  AWS WAF Challenge detected.");
     warn!(target: "ds_core::client", "  DeepSeek CloudFront WAF blocks US-based IPs.");
     warn!(target: "ds_core::client", "  Rust HTTP clients can't execute the JS challenge.");
@@ -520,6 +678,10 @@ impl DsClient {
             // 会发 "Macintosh; Intel Mac OS X" UA）。HIF token 拉取、wasm 下载等
             // 未逐请求覆盖 UA 的请求也必须与身份一致（Linux aarch64 Chrome 136）。
             .user_agent(user_agent.clone())
+            // 连接阶段超时：wreq 默认不设超时，上游 IP 黑洞/半开连接会让
+            // 请求永不返回，账号被占死在 Busy。只限 connect 阶段，不影响
+            // SSE 长流式读（读空闲由 completions 的 IdleTimeoutStream 兜底）。
+            .connect_timeout(std::time::Duration::from_secs(15))
             .redirect(wreq::redirect::Policy::limited(10))
             // 浏览器行为对齐（new.jsonl 抓包实证）：真实客户端带 Cookie 头——
             // HWWAFSESID/HWWAFSESTIME（华为云 WAF）、ds_session_id、smidV2（数美）
@@ -673,18 +835,79 @@ impl DsClient {
         self.hif.dliq().await
     }
 
+    /// 统一出站发送入口：net_capture 开启时把请求/响应头落盘 JSONL（请求体
+    /// 序列化产物原样记录）。`cid` 由调用方 `net_capture::begin()` 分配（未启用
+    /// 时为 0，内部全部 no-op）；响应体由调用方读取后用 `net_capture::body` 记录。
+    ///
+    /// 注意保持 `.headers(h)` 在 `.json(v)` 之前：RequestBuilder::headers 会整表
+    /// 替换，先 json 后 headers 会把 json() 补的 Content-Type 丢掉。
+    async fn send_traced(
+        &self,
+        cid: u64,
+        method: &str,
+        url: &str,
+        headers: wreq::header::HeaderMap,
+        body: Option<serde_json::Value>,
+        resp_stream: bool,
+    ) -> Result<wreq::Response, ClientError> {
+        let mut rec_headers = headers.clone();
+        if body.is_some() {
+            rec_headers.insert(
+                wreq::header::CONTENT_TYPE,
+                wreq::header::HeaderValue::from_static("application/json"),
+            );
+        }
+        net_capture::req(
+            cid,
+            method,
+            url,
+            &rec_headers,
+            body.as_ref().map(|v| serde_json::Value::String(v.to_string())),
+        );
+        let rb = if method == "GET" {
+            self.http.get(url)
+        } else {
+            self.http.post(url)
+        };
+        let rb = rb.headers(headers);
+        let rb = match &body {
+            Some(v) => rb.json(v),
+            None => rb,
+        };
+        let resp = rb.send().await;
+        match &resp {
+            Ok(r) => net_capture::resp(cid, r.status().as_u16(), r.headers(), resp_stream),
+            Err(e) => net_capture::err(cid, &e.to_string()),
+        }
+        resp.map_err(ClientError::from)
+    }
+
     async fn parse_envelope<T: serde::de::DeserializeOwned>(
+        cid: u64,
         resp: wreq::Response,
     ) -> Result<T, ClientError> {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            net_capture::body(cid, body.as_bytes(), false);
             return Err(ClientError::Status {
                 status: status.as_u16(),
                 body,
             });
         }
-        let envelope: Envelope<T> = resp.json().await?;
+        let body = resp.text().await?;
+        net_capture::body(cid, body.as_bytes(), false);
+        let envelope: Envelope<T> = serde_json::from_str(&body).map_err(|e| {
+            // 信封/载荷结构漂移时把原始体打进日志（截断），否则线上只有
+            // 一句 "missing field `id`" 无法定位服务端实际返回了什么
+            warn!(
+                target: "ds_core::client",
+                "响应信封解析失败（{}）: {}",
+                e,
+                &body[..body.len().min(1200)]
+            );
+            e
+        })?;
         envelope.into_result()
     }
 
@@ -696,34 +919,45 @@ impl DsClient {
             wreq::header::HeaderValue::from_str(&format!("{}/sign_in", self.web_origin))
                 .map_err(|e| ClientError::InvalidHeader(format!("Referer: {e}")))?,
         );
+        let cid = net_capture::begin();
         let resp = self
-            .http
-            .post(format!("{}{}", self.api_base, ENDPOINT_USERS_LOGIN))
-            .headers(h)
-            .json(payload)
-            .send()
+            .send_traced(
+                cid,
+                "POST",
+                &format!("{}{}", self.api_base, ENDPOINT_USERS_LOGIN),
+                h,
+                Some(serde_json::to_value(payload)?),
+                false,
+            )
             .await?;
 
         if is_waf_challenge(&resp) {
             print_waf_hint();
+            // WAF 挑战页本身是重要证据（JS challenge 形态与版本），一并落盘
+            let waf_body = resp.text().await.unwrap_or_default();
+            net_capture::body(cid, waf_body.as_bytes(), false);
             return Err(ClientError::Status {
                 status: 202,
                 body: "WAF Challenge: use a non-US proxy".into(),
             });
         }
 
-        Self::parse_envelope::<LoginData>(resp).await
+        Self::parse_envelope::<LoginData>(cid, resp).await
     }
 
     pub async fn create_session(&self, token: &str) -> Result<String, ClientError> {
+        let cid = net_capture::begin();
         let resp = self
-            .http
-            .post(format!("{}{}", self.api_base, ENDPOINT_CHAT_SESSION_CREATE))
-            .headers(self.auth_headers(token)?)
-            .json(&serde_json::json!({}))
-            .send()
+            .send_traced(
+                cid,
+                "POST",
+                &format!("{}{}", self.api_base, ENDPOINT_CHAT_SESSION_CREATE),
+                self.auth_headers(token)?,
+                Some(serde_json::json!({})),
+                false,
+            )
             .await?;
-        let wrapper: CreateSessionWrapper = Self::parse_envelope(resp).await?;
+        let wrapper: CreateSessionWrapper = Self::parse_envelope(cid, resp).await?;
         let session_id = wrapper.chat_session.id;
         if session_id.is_empty() {
             return Err(ClientError::Validation(
@@ -734,15 +968,55 @@ impl DsClient {
     }
 
     pub async fn delete_session(&self, token: &str, session_id: &str) -> Result<(), ClientError> {
+        let cid = net_capture::begin();
+        let resp = self
+            .send_traced(
+                cid,
+                "POST",
+                &format!("{}{}", self.api_base, ENDPOINT_CHAT_SESSION_DELETE),
+                self.auth_headers(token)?,
+                Some(serde_json::json!({ "chat_session_id": session_id })),
+                false,
+            )
+            .await?;
+        Self::parse_envelope::<Option<()>>(cid, resp).await?;
+        Ok(())
+    }
+
+    /// 拉取客户端设置（官方 web 开屏必发序列之一：FULL.har login → settings×3）。
+    /// GET /client/settings?did=<uuid>&scope=main/model/web_upgrade —— 仅鉴权。
+    /// 结果调用方忽略（拟真行为流用），错误也吞掉。
+    pub async fn fetch_client_settings(&self, token: &str, did: &str) {
+        let headers = match self.auth_headers(token) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let url = format!("{}{}", self.api_base, ENDPOINT_CLIENT_SETTINGS);
+        let cid = net_capture::begin();
+        // 抓取记录的 URL 手工补 query（实际发送仍走 .query()，行为不变）
+        net_capture::req(
+            cid,
+            "GET",
+            &format!(
+                "{}{}?did={}&scope=main/model/web_upgrade",
+                self.api_base, ENDPOINT_CLIENT_SETTINGS, did
+            ),
+            &headers,
+            None,
+        );
         let resp = self
             .http
-            .post(format!("{}{}", self.api_base, ENDPOINT_CHAT_SESSION_DELETE))
-            .headers(self.auth_headers(token)?)
-            .json(&serde_json::json!({ "chat_session_id": session_id }))
+            .get(url)
+            .headers(headers)
+            .query(&[("did", did), ("scope", "main/model/web_upgrade")])
             .send()
-            .await?;
-        Self::parse_envelope::<Option<()>>(resp).await?;
-        Ok(())
+            .await;
+        match &resp {
+            Ok(r) => net_capture::resp(cid, r.status().as_u16(), r.headers(), false),
+            Err(e) => net_capture::err(cid, &e.to_string()),
+        }
+        // 拟真流量：结果调用方忽略（响应体照旧不读取），抓取侧记说明闭环
+        net_capture::body_note(cid, "响应体未读取（拟真开屏流量，结果忽略）");
     }
 
     /// 拉取云端会话列表（Web 端"历史会话"侧栏数据源，full.har entry#53 实证）。
@@ -755,28 +1029,44 @@ impl DsClient {
         token: &str,
         before_updated_at: Option<f64>,
     ) -> Result<CloudSessionPage, ClientError> {
-        let url = format!(
+        let base = format!(
             "{}{}",
             self.api_base, ENDPOINT_CHAT_SESSION_FETCH_PAGE
         );
-        let mut req = self
+        let cid = net_capture::begin();
+        let headers = self.auth_headers(token)?;
+        let mut url_cap = format!("{}?lte_cursor.pinned=false", base);
+        if let Some(ts) = before_updated_at {
+            url_cap.push_str(&format!("&lte_cursor.updated_at={:.3}", ts));
+        }
+        net_capture::req(cid, "GET", &url_cap, &headers, None);
+        let mut rb = self
             .http
-            .get(url)
-            .headers(self.auth_headers(token)?)
+            .get(base)
+            .headers(headers)
             .query(&[("lte_cursor.pinned", "false")]);
         if let Some(ts) = before_updated_at {
-            req = req.query(&[("lte_cursor.updated_at", format!("{:.3}", ts))]);
+            rb = rb.query(&[("lte_cursor.updated_at", format!("{:.3}", ts))]);
         }
-        let resp = req.send().await?;
+        let resp = rb.send().await;
+        match &resp {
+            Ok(r) => net_capture::resp(cid, r.status().as_u16(), r.headers(), false),
+            Err(e) => net_capture::err(cid, &e.to_string()),
+        }
+        let resp = resp?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            net_capture::body(cid, body.as_bytes(), false);
             return Err(ClientError::Status {
                 status: status.as_u16(),
                 body,
             });
         }
-        let envelope: serde_json::Value = resp.json().await?;
+        // resp.json() 内部读体不可观测，改 text+parse 以落盘响应体
+        let text = resp.text().await?;
+        net_capture::body(cid, text.as_bytes(), false);
+        let envelope: serde_json::Value = serde_json::from_str(&text)?;
         let sessions = extract_cloud_sessions(&envelope);
         let has_more = envelope
             .pointer("/data/biz_data/has_more")
@@ -794,29 +1084,70 @@ impl DsClient {
         token: &str,
         session_id: &str,
     ) -> Result<Vec<CloudMessage>, ClientError> {
+        let cid = net_capture::begin();
+        let headers = self.auth_headers(token)?;
+        net_capture::req(
+            cid,
+            "GET",
+            &format!(
+                "{}{}?chat_session_id={}",
+                self.api_base, ENDPOINT_CHAT_HISTORY_MESSAGES, session_id
+            ),
+            &headers,
+            None,
+        );
         let resp = self
             .http
             .get(format!(
                 "{}{}",
                 self.api_base, ENDPOINT_CHAT_HISTORY_MESSAGES
             ))
-            .headers(self.auth_headers(token)?)
+            .headers(headers)
             .query(&[("chat_session_id", session_id)])
             .send()
-            .await?;
+            .await;
+        match &resp {
+            Ok(r) => net_capture::resp(cid, r.status().as_u16(), r.headers(), false),
+            Err(e) => net_capture::err(cid, &e.to_string()),
+        }
+        let resp = resp?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            net_capture::body(cid, body.as_bytes(), false);
             return Err(ClientError::Status {
                 status: status.as_u16(),
                 body,
             });
         }
-        let envelope: serde_json::Value = resp.json().await?;
+        // resp.json() 内部读体不可观测，改 text+parse 以落盘响应体
+        let text = resp.text().await?;
+        net_capture::body(cid, text.as_bytes(), false);
+        let envelope: serde_json::Value = serde_json::from_str(&text)?;
         let mut out = Vec::new();
         if let Some(arr) = envelope.pointer("/data/biz_data/chat_messages").and_then(|v| v.as_array()) {
+            // 云端把编辑/重试存成树：节点带 id + parent_id（根节点 parent_id
+            // 为 "0"/null）。同一父下多个子 = 多个版本，数组最后一个为活跃版。
+            // 老协议（无 parent_id 字段）则平铺，行为不变。
+            // 节点结构见模块级 TreeNode（prune_message_tree 用）
+
+            let mut nodes: Vec<(String, TreeNode)> = Vec::new();
+            let mut has_tree = false;
             for m in arr {
-                let role_raw = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                // 实测字段是 message_id（数值）+ parent_id（数值）；兼容旧猜测的 id/字符串形态
+                let id = m
+                    .get("message_id")
+                    .or_else(|| m.get("id"))
+                    .map(scalar_to_string)
+                    .unwrap_or_default();
+                let parent = m
+                    .get("parent_id")
+                    .or_else(|| m.get("parent_message_id"))
+                    .map(scalar_to_string);
+                if parent.is_some() {
+                    has_tree = true;
+                }
+                let role_raw = m.get("role").and_then(|r| r.as_str()).unwrap_or("").to_string();
                 let is_user = role_raw.eq_ignore_ascii_case("user");
                 let mut content = String::new();
                 let mut reasoning = String::new();
@@ -836,15 +1167,11 @@ impl DsClient {
                         }
                     }
                 }
-                if content.is_empty() && reasoning.is_empty() {
-                    continue;
-                }
-                out.push(CloudMessage {
-                    role: if is_user { "user".into() } else { "assistant".into() },
-                    content,
-                    reasoning,
-                });
+                let is_empty = content.is_empty() && reasoning.is_empty();
+                nodes.push((id, TreeNode { role_raw, content, reasoning, parent, is_empty }));
             }
+
+            out = prune_message_tree(nodes, has_tree);
         }
         Ok(out)
     }
@@ -854,17 +1181,21 @@ impl DsClient {
         token: &str,
         target_path: &str,
     ) -> Result<ChallengeData, ClientError> {
+        let cid = net_capture::begin();
         let resp = self
-            .http
-            .post(format!(
-                "{}{}",
-                self.api_base, ENDPOINT_CHAT_CREATE_POW_CHALLENGE
-            ))
-            .headers(self.auth_headers(token)?)
-            .json(&serde_json::json!({ "target_path": target_path }))
-            .send()
+            .send_traced(
+                cid,
+                "POST",
+                &format!(
+                    "{}{}",
+                    self.api_base, ENDPOINT_CHAT_CREATE_POW_CHALLENGE
+                ),
+                self.auth_headers(token)?,
+                Some(serde_json::json!({ "target_path": target_path })),
+                false,
+            )
             .await?;
-        let wrapper: ChallengeWrapper = Self::parse_envelope(resp).await?;
+        let wrapper: ChallengeWrapper = Self::parse_envelope(cid, resp).await?;
         let challenge = wrapper.challenge;
         Ok(challenge)
     }
@@ -876,6 +1207,14 @@ impl DsClient {
         payload: &CompletionPayload,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Bytes, ClientError>> + Send>>, ClientError> {
         let mut h = self.auth_headers_with_pow(token, pow_response)?;
+        // Referer 按会话定制（风控差异 #6）：官方在会话页发 completion，
+        // Referer 为 {origin}/a/chat/s/{session_id}；旧实现一律是 {origin}/。
+        if !payload.chat_session_id.is_empty() {
+            let referer = format!("{}/a/chat/s/{}", self.web_origin, payload.chat_session_id);
+            if let Ok(v) = wreq::header::HeaderValue::from_str(&referer) {
+                h.insert(wreq::header::REFERER, v);
+            }
+        }
         // HIF 头：new.jsonl 实测仅 /chat/completion 携带（login、create_session、
         // create_pow_challenge、upload_file 均无）。值为分发服务下发的动态凭据
         // （见 hif.rs），静态配置值优先，否则用后台拉取的当前值；都没有则不发
@@ -894,24 +1233,42 @@ impl DsClient {
                     .map_err(|e| ClientError::InvalidHeader(format!("x-hif-dliq: {e}")))?,
             );
         }
+        let cid = net_capture::begin();
         let resp = self
-            .http
-            .post(format!("{}{}", self.api_base, ENDPOINT_CHAT_COMPLETION))
-            .headers(h)
-            .json(payload)
-            .send()
+            .send_traced(
+                cid,
+                "POST",
+                &format!("{}{}", self.api_base, ENDPOINT_CHAT_COMPLETION),
+                h,
+                Some(serde_json::to_value(payload)?),
+                true,
+            )
             .await?;
 
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            net_capture::body(cid, body.as_bytes(), false);
             return Err(ClientError::Status {
                 status: status.as_u16(),
                 body,
             });
         }
 
-        Ok(Box::pin(resp.bytes_stream().map_err(ClientError::Http)))
+        let stream = resp.bytes_stream().map_err(ClientError::Http);
+        if net_capture::enabled() {
+            // 流内容累计落盘：禁言等业务失败常在 SSE 首帧 biz_code 里，
+            // 即使上层提前断流（CaptureStream drop）也能留下已收到的部分
+            Ok(Box::pin(CaptureStream {
+                inner: Box::pin(stream),
+                cid,
+                buf: Vec::new(),
+                truncated: false,
+                done: false,
+            }))
+        } else {
+            Ok(Box::pin(stream))
+        }
     }
 
     #[allow(dead_code)]
@@ -921,24 +1278,40 @@ impl DsClient {
         pow_response: &str,
         payload: &EditMessagePayload,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Bytes, ClientError>> + Send>>, ClientError> {
+        let cid = net_capture::begin();
         let resp = self
-            .http
-            .post(format!("{}{}", self.api_base, ENDPOINT_CHAT_EDIT_MESSAGE))
-            .headers(self.auth_headers_with_pow(token, pow_response)?)
-            .json(payload)
-            .send()
+            .send_traced(
+                cid,
+                "POST",
+                &format!("{}{}", self.api_base, ENDPOINT_CHAT_EDIT_MESSAGE),
+                self.auth_headers_with_pow(token, pow_response)?,
+                Some(serde_json::to_value(payload)?),
+                true,
+            )
             .await?;
 
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            net_capture::body(cid, body.as_bytes(), false);
             return Err(ClientError::Status {
                 status: status.as_u16(),
                 body,
             });
         }
 
-        Ok(Box::pin(resp.bytes_stream().map_err(ClientError::Http)))
+        let stream = resp.bytes_stream().map_err(ClientError::Http);
+        if net_capture::enabled() {
+            Ok(Box::pin(CaptureStream {
+                inner: Box::pin(stream),
+                cid,
+                buf: Vec::new(),
+                truncated: false,
+                done: false,
+            }))
+        } else {
+            Ok(Box::pin(stream))
+        }
     }
 
     #[allow(dead_code)]
@@ -947,17 +1320,21 @@ impl DsClient {
         token: &str,
         payload: &UpdateTitlePayload,
     ) -> Result<(), ClientError> {
+        let cid = net_capture::begin();
         let resp = self
-            .http
-            .post(format!(
-                "{}{}",
-                self.api_base, ENDPOINT_CHAT_SESSION_UPDATE_TITLE
-            ))
-            .headers(self.auth_headers(token)?)
-            .json(payload)
-            .send()
+            .send_traced(
+                cid,
+                "POST",
+                &format!(
+                    "{}{}",
+                    self.api_base, ENDPOINT_CHAT_SESSION_UPDATE_TITLE
+                ),
+                self.auth_headers(token)?,
+                Some(serde_json::to_value(payload)?),
+                false,
+            )
             .await?;
-        Self::parse_envelope::<serde::de::IgnoredAny>(resp).await?;
+        Self::parse_envelope::<serde::de::IgnoredAny>(cid, resp).await?;
         Ok(())
     }
 
@@ -967,14 +1344,18 @@ impl DsClient {
         token: &str,
         payload: &StopStreamPayload,
     ) -> Result<(), ClientError> {
+        let cid = net_capture::begin();
         let resp = self
-            .http
-            .post(format!("{}{}", self.api_base, ENDPOINT_CHAT_STOP_STREAM))
-            .headers(self.auth_headers(token)?)
-            .json(payload)
-            .send()
+            .send_traced(
+                cid,
+                "POST",
+                &format!("{}{}", self.api_base, ENDPOINT_CHAT_STOP_STREAM),
+                self.auth_headers(token)?,
+                Some(serde_json::to_value(payload)?),
+                false,
+            )
             .await?;
-        Self::parse_envelope::<Option<()>>(resp).await?;
+        Self::parse_envelope::<Option<()>>(cid, resp).await?;
         Ok(())
     }
 
@@ -1013,14 +1394,93 @@ impl DsClient {
             wreq::header::HeaderValue::from_static(if thinking_enabled { "1" } else { "0" }),
         );
 
+        let cid = net_capture::begin();
+        net_capture::req(
+            cid,
+            "POST",
+            &format!("{}{}", self.api_base, ENDPOINT_FILE_UPLOAD),
+            &h,
+            Some(serde_json::json!({
+                "_multipart": {
+                    "filename": filename,
+                    "content_type": content_type,
+                    "size": file_size,
+                    "note": "multipart 表单体不落盘",
+                }
+            })),
+        );
         let resp = self
             .http
             .post(format!("{}{}", self.api_base, ENDPOINT_FILE_UPLOAD))
             .headers(h)
             .multipart(form)
             .send()
-            .await?;
-        Self::parse_envelope::<UploadFileData>(resp).await
+            .await;
+        match &resp {
+            Ok(r) => net_capture::resp(cid, r.status().as_u16(), r.headers(), false),
+            Err(e) => net_capture::err(cid, &e.to_string()),
+        }
+        let resp = resp?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            net_capture::body(cid, body.as_bytes(), false);
+            return Err(ClientError::Status {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let body = resp.text().await?;
+        net_capture::body(cid, body.as_bytes(), false);
+        match serde_json::from_str::<Envelope<UploadFileData>>(&body) {
+            Ok(env) => env.into_result(),
+            Err(primary) => {
+                // 信封反序列化失败有两种可能，必须区分（2026-09-25 真机实证）：
+                // 1) 业务错误（如 biz_code=14 "user is muted"）：biz_data 是 mute
+                //    信息而非文件对象 → Envelope<UploadFileData> 反序列化必然失败，
+                //    但这不该走"格式漂移"兜底，应原样上报业务错误（上层换号）。
+                // 2) 服务端真改了 biz_data 结构 → 宽容搜索含 id 的对象。
+                let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+                    ClientError::Business {
+                        code: -1,
+                        msg: format!("upload_file 响应非 JSON（{}）: {}", e, &body[..body.len().min(400)]),
+                    }
+                })?;
+                let top_code = v.get("code").and_then(|x| x.as_i64());
+                let data = v.get("data");
+                let biz_code = data
+                    .and_then(|d| d.get("biz_code"))
+                    .and_then(|x| x.as_i64());
+                let biz_msg = data
+                    .and_then(|d| d.get("biz_msg"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if top_code.unwrap_or(0) != 0 || biz_code.unwrap_or(0) != 0 {
+                    warn!(
+                        target: "ds_core::client",
+                        "upload_file 业务错误（code={:?}, biz_code={:?}, msg={}）",
+                        top_code, biz_code, biz_msg
+                    );
+                    // msg 带原始体（禁言响应里 biz_data.is_muted/mute_until 可被
+                    // 上层 parse_mute_response 解析出到期时间）
+                    return Err(ClientError::Business {
+                        code: top_code.filter(|c| *c != 0).or(biz_code).unwrap_or(-1),
+                        msg: body[..floor_utf8_end(&body, 600)].to_string(),
+                    });
+                }
+                warn!(
+                    target: "ds_core::client",
+                    "upload_file 响应解析失败（{}），尝试宽容解析: {}",
+                    primary,
+                    &body[..body.len().min(1200)]
+                );
+                extract_upload_loose(&v).ok_or(ClientError::Business {
+                    code: -1,
+                    msg: format!("upload_file 响应中未找到文件 id: {}", &body[..body.len().min(400)]),
+                })
+            }
+        }
     }
 
     /// 查询文件状态，返回文件列表（含 status: PENDING/SUCCESS/FAILED）
@@ -1030,33 +1490,236 @@ impl DsClient {
         file_ids: &[String],
     ) -> Result<FetchFilesData, ClientError> {
         let ids = file_ids.join(",");
+        let cid = net_capture::begin();
         let resp = self
-            .http
-            .get(format!("{}{}", self.api_base, ENDPOINT_FILE_FETCH))
-            .headers(self.auth_headers(token)?)
-            .query(&[("file_ids", &ids)])
-            .send()
+            .send_traced(
+                cid,
+                "GET",
+                &format!(
+                    "{}{}?file_ids={}",
+                    self.api_base, ENDPOINT_FILE_FETCH, ids
+                ),
+                self.auth_headers(token)?,
+                None,
+                false,
+            )
             .await?;
-        Self::parse_envelope::<FetchFilesData>(resp).await
+        Self::parse_envelope::<FetchFilesData>(cid, resp).await
     }
 
     pub async fn get_wasm(&self) -> Result<Bytes, ClientError> {
-        let resp = self.http.get(&self.wasm_url).send().await?;
+        let cid = net_capture::begin();
+        net_capture::req(
+            cid,
+            "GET",
+            &self.wasm_url,
+            &wreq::header::HeaderMap::new(),
+            None,
+        );
+        let resp = self.http.get(&self.wasm_url).send().await;
+        match &resp {
+            Ok(r) => net_capture::resp(cid, r.status().as_u16(), r.headers(), false),
+            Err(e) => net_capture::err(cid, &e.to_string()),
+        }
+        let resp = resp?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            net_capture::body(cid, body.as_bytes(), false);
             return Err(ClientError::Status {
                 status: status.as_u16(),
                 body,
             });
         }
-        Ok(resp.bytes().await?)
+        let bytes = resp.bytes().await?;
+        net_capture::body_note(
+            cid,
+            &format!("二进制 wasm {} 字节，内容不落盘", bytes.len()),
+        );
+        Ok(bytes)
     }
+
 }
+/// 云端消息树剪枝：返回活跃链（每层"数组顺序最后一个子节点"），
+/// 同层被替换的兄弟版本作为 alt_texts（升序，不含当前）。
+/// has_tree=false（老协议无 parent_id）或无法定位根时退化为平铺，不丢数据。
+fn prune_message_tree(nodes: Vec<(String, TreeNode)>, has_tree: bool) -> Vec<CloudMessage> {
+    let mut out = Vec::new();
+    if !has_tree {
+        for (_, n) in &nodes {
+            if n.is_empty {
+                continue;
+            }
+            out.push(CloudMessage {
+                role: if n.role_raw.eq_ignore_ascii_case("user") { "user".into() } else { "assistant".into() },
+                content: n.content.clone(),
+                reasoning: n.reasoning.clone(),
+                alt_texts: Vec::new(),
+            });
+        }
+        return out;
+    }
+
+    use std::collections::HashMap;
+    let mut children_of: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, (_, n)) in nodes.iter().enumerate() {
+        if let Some(p) = n.parent.as_deref() {
+            children_of.entry(p.to_string()).or_default().push(idx);
+        }
+    }
+
+    // 根的 parent_id 约定 "0"（或空串）；找不到时退化为"parent 指向不存在节点"的组。
+    let known_ids: std::collections::HashSet<&str> =
+        nodes.iter().map(|(id, _)| id.as_str()).collect();
+    let root_key: Option<String> = ["0", ""]
+        .iter()
+        .find(|k| children_of.contains_key(**k))
+        .map(|k| (*k).to_string())
+        .or_else(|| {
+            children_of
+                .keys()
+                .find(|k| !known_ids.contains(k.as_str()))
+                .cloned()
+        });
+
+    let Some(root) = root_key else {
+        // 无法定位根：平铺兜底
+        for (_, n) in &nodes {
+            if n.is_empty {
+                continue;
+            }
+            out.push(CloudMessage {
+                role: if n.role_raw.eq_ignore_ascii_case("user") { "user".into() } else { "assistant".into() },
+                content: n.content.clone(),
+                reasoning: n.reasoning.clone(),
+                alt_texts: Vec::new(),
+            });
+        }
+        return out;
+    };
+
+    // 活跃链：从根开始每层取数组里最后一个子节点
+    let mut cur: Option<String> = Some(root);
+    // 已访问节点集合：畸形数据（如 parent_id 指向自己）会让链成环，
+    // 没有它这里会无限循环、无限消耗内存并挂死请求。
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while let Some(key) = cur {
+        if !visited.insert(key.clone()) {
+            // 成环：剩余节点全部按平铺兜底，不丢数据
+            for (_, n) in &nodes {
+                if n.is_empty {
+                    continue;
+                }
+                out.push(CloudMessage {
+                    role: if n.role_raw.eq_ignore_ascii_case("user") { "user".into() } else { "assistant".into() },
+                    content: n.content.clone(),
+                    reasoning: n.reasoning.clone(),
+                    alt_texts: Vec::new(),
+                });
+            }
+            break;
+        }
+        let kids = match children_of.get(&key) {
+            Some(k) if !k.is_empty() => k.clone(),
+            _ => break,
+        };
+        let last = *kids.last().unwrap();
+        let (last_id, n) = &nodes[last];
+        if !n.is_empty {
+            let is_user = n.role_raw.eq_ignore_ascii_case("user");
+            let alt_texts: Vec<String> = kids[..kids.len() - 1]
+                .iter()
+                .filter_map(|&i| {
+                    let (_, s) = &nodes[i];
+                    if s.is_empty { None } else { Some(s.content.clone()) }
+                })
+                .collect();
+            out.push(CloudMessage {
+                role: if is_user { "user".into() } else { "assistant".into() },
+                content: n.content.clone(),
+                reasoning: n.reasoning.clone(),
+                alt_texts,
+            });
+        }
+        cur = if last_id.is_empty() { None } else { Some(last_id.clone()) };
+    }
+    out
+}
+
+
 
 #[cfg(test)]
 mod tests {
-    use super::{origin_of, ChatMute, CreateSessionWrapper, Envelope, LoginData, UserInfo};
+    use super::{
+        prune_message_tree, origin_of, ChatMute, CloudMessage, CreateSessionWrapper, Envelope,
+        LoginData, TreeNode, UserInfo,
+    };
+
+    fn node(id: &str, parent: Option<&str>, role: &str, content: &str) -> (String, TreeNode) {
+        (
+            id.to_string(),
+            TreeNode {
+                role_raw: role.to_string(),
+                content: content.to_string(),
+                reasoning: String::new(),
+                parent: parent.map(|p| p.to_string()),
+                is_empty: content.is_empty(),
+            },
+        )
+    }
+
+    fn texts(msgs: &[CloudMessage]) -> Vec<&str> {
+        msgs.iter().map(|m| m.content.as_str()).collect()
+    }
+
+    /// bug 4 回归：编辑产生的兄弟版本不堆叠——活跃链只含最新版本，
+    /// 旧版本进 alt_texts（升序，不含当前）。
+    /// 实测协议：message_id/parent_id 均为数字（scalar_to_string 统一），
+    /// 编辑 = 同一 parent 下的多个兄弟，数组最后一个（最新 inserted_at）为活跃版。
+    #[test]
+    fn message_tree_keeps_active_branch_with_alts() {
+        // 用户消息被编辑两次：三版用户消息是同一 parent("0") 下的兄弟节点，
+        // v3 是数组最后一个（活跃）；v3 下有两版回复（r1 历史，r2 活跃）。
+        let nodes = vec![
+            node("1", Some("0"), "user", "v1"),
+            node("2", Some("0"), "user", "v2"),
+            node("3", Some("0"), "user", "v3"),
+            node("4", Some("3"), "assistant", "r1"),
+            node("5", Some("3"), "assistant", "r2"),
+        ];
+        let out = prune_message_tree(nodes, true);
+        assert_eq!(texts(&out), vec!["v3", "r2"]);
+        assert_eq!(out[0].alt_texts, vec!["v1", "v2"]);
+        assert_eq!(out[1].alt_texts, vec!["r1"]);
+        assert_eq!(out[0].role, "user");
+        assert_eq!(out[1].role, "assistant");
+    }
+
+    /// 老协议（无 parent_id）平铺不丢数据
+    #[test]
+    fn flat_messages_pass_through() {
+        let nodes = vec![
+            node("a", None, "user", "q"),
+            node("b", None, "assistant", "ans"),
+        ];
+        let out = prune_message_tree(nodes, false);
+        assert_eq!(texts(&out), vec!["q", "ans"]);
+        assert!(out.iter().all(|m| m.alt_texts.is_empty()));
+    }
+
+    /// 空内容节点（如仅含已删 fragment）不进活跃链
+    #[test]
+    fn empty_nodes_skipped() {
+        let nodes = vec![
+            node("1", Some("0"), "user", "q"),
+            node("2", Some("1"), "assistant", ""),
+            node("3", Some("1"), "assistant", "ans"),
+        ];
+        let out = prune_message_tree(nodes, true);
+        assert_eq!(texts(&out), vec!["q", "ans"]);
+        // r1 非空才进 alt_texts；空节点被过滤
+        assert!(out[1].alt_texts.is_empty());
+    }
 
     /// 回归：未禁言的账号，上游登录响应里 `mute_until` 是显式 null。
     /// 旧实现（裸 #[serde(default)]）会整体反序列化失败，账号永远登录不了。
@@ -1159,5 +1822,38 @@ mod tests {
 
         let wrapper = envelope.into_result().expect("envelope should be successful");
         assert_eq!(wrapper.chat_session.id, "01234567-89ab-cdef-0123-456789abcdef");
+    }
+    /// 回归：畸形消息树曾让活跃链 while 循环无限执行（cur 永远停在同一个
+    /// id 上）、out 无限增长并挂死请求。触发形状是「重复 id + 其中一份的
+    /// parent_id 指向同名 id」：走到 "X" 时最后一个子节点又是 id="X" 的
+    /// 节点，cur 永远回到 "X"。现在 visited 集合会截断成环，剩余节点
+    /// 平铺兜底，不丢数据。
+    #[test]
+    fn self_referential_parent_does_not_hang() {
+        let nodes = vec![
+            node("X", Some("0"), "user", "q"),
+            node("Y", Some("X"), "assistant", "a"),
+            // 同名 id 且 parent 指向同名 id：children_of["X"] 的最后一项
+            // 的 id 还是 "X"
+            node("X", Some("X"), "assistant", "loop"),
+        ];
+        let out = prune_message_tree(nodes, true);
+        let t = texts(&out);
+        assert!(t.contains(&"q"), "user msg kept, got {t:?}");
+        assert!(t.contains(&"a"), "mid msg kept, got {t:?}");
+        assert!(t.contains(&"loop"), "cyclic node kept via fallback, got {t:?}");
+    }
+
+    /// 深链不成环时仍走正常活跃链语义（visited 集合不影响正常数据）
+    #[test]
+    fn deep_chain_still_walks_active_branch() {
+        let nodes = vec![
+            node("1", Some("0"), "user", "q1"),
+            node("2", Some("1"), "assistant", "a1"),
+            node("3", Some("2"), "user", "q2"),
+            node("4", Some("3"), "assistant", "a2"),
+        ];
+        let out = prune_message_tree(nodes, true);
+        assert_eq!(texts(&out), vec!["q1", "a1", "q2", "a2"]);
     }
 }

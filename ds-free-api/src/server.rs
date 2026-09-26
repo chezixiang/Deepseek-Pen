@@ -8,6 +8,7 @@ mod auth;
 mod device_capture;
 mod error;
 mod handlers;
+pub mod net_capture;
 pub mod runtime_log;
 mod stats;
 mod store;
@@ -21,13 +22,12 @@ use axum::{
     extract::Request,
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
 };
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 
-use crate::anthropic_compat::AnthropicCompat;
 use crate::config::Config;
 use crate::openai_adapter::OpenAIAdapter;
 
@@ -36,6 +36,34 @@ use handlers::AppState;
 /// Extension to carry the API key through the request
 #[derive(Clone)]
 pub(crate) struct ApiKeyExt(pub(crate) String);
+
+/// 按字符脱敏：保留前 `keep` 个字符 + "***"，不足则整体 "***"。
+/// 账号 id / API key 都是用户可控输入，按字节切片（&s[..8]）在
+/// 多字节字符中间会 panic，必须走 char_indices。
+pub(crate) fn mask_prefix(s: &str, keep: usize) -> String {
+    match s.char_indices().nth(keep) {
+        Some((idx, _)) => format!("{}***", &s[..idx]),
+        None => "***".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::mask_prefix;
+
+    #[test]
+    fn mask_prefix_is_char_boundary_safe() {
+        assert_eq!(mask_prefix("user@example.com", 3), "use***");
+        // 按字节切 [..3] 会 panic 的输入（"小"占 3 字节，[..3] 恰好切完"小"，
+        // 但 [..8] 会切在"红"中间）
+        assert_eq!(mask_prefix("小红@example.com", 3), "小红@***");
+        assert_eq!(mask_prefix("小红@example.com", 8), "小红@examp***");
+        assert_eq!(mask_prefix("ab", 3), "***");
+        assert_eq!(mask_prefix("", 8), "***");
+        assert_eq!(mask_prefix("abcdefgh", 8), "***", "恰为 keep 个字符时按原语义整体脱敏");
+        assert_eq!(mask_prefix("abcdefghij", 8), "abcdefgh***");
+    }
+}
 
 /// 绑定端口，带退避重试。debug=true 时监听 0.0.0.0。
 async fn bind_with_retry(addr: &str, debug: bool) -> Result<(TcpListener, String), std::io::Error> {
@@ -86,6 +114,12 @@ async fn bind_with_retry(addr: &str, debug: bool) -> Result<(TcpListener, String
 }
 
 /// 启动 HTTP 服务器
+///
+/// 启动时序（应用侧依赖 /health 的 ready 字段等待"完全启动"，bug 5）：
+/// 1. 端口绑定与路由立即就绪 —— /health 从进程启动几毫秒后即可访问；
+/// 2. 重活（wasm 下载+PoW 编译、账号登录）在后台任务进行，
+///    完成后 /health 的 ready 才变 true；
+/// 3. 设备凭据 mint 很快且落盘 config，仍在绑定前同步执行（它影响登录）。
 pub async fn run(mut config: Config, config_path: PathBuf) -> anyhow::Result<()> {
     let cors_origins = config.server.cors_origins.clone();
     let host = config.server.host.clone();
@@ -95,9 +129,37 @@ pub async fn run(mut config: Config, config_path: PathBuf) -> anyhow::Result<()>
     // 详见 docs/deepseek-verification-analysis.md §5f。
     crate::device_bootstrap::ensure_device_credentials(&mut config, &config_path).await;
 
-    let adapter = Arc::new(OpenAIAdapter::new(&config).await?);
     let config = Arc::new(tokio::sync::RwLock::new(config));
-    let anthropic_compat = Arc::new(AnthropicCompat::new(Arc::clone(&adapter)));
+    // 就绪门闩：OpenAIAdapter 构造（含 wasm 下载 + 全账号登录）在后台完成后置位。
+    let ready = Arc::new(tokio::sync::RwLock::new(false));
+    let ready_flag = ready.clone();
+
+    // 后台构造 adapter（重活）：wasm 下载、PoW 编译、全部账号登录都在这里。
+    let boot_config = config.clone();
+    let adapter_slot: Arc<tokio::sync::RwLock<Option<Arc<OpenAIAdapter>>>> =
+        Arc::new(tokio::sync::RwLock::new(None));
+    let adapter_slot_writer = adapter_slot.clone();
+    let boot_handle = tokio::spawn(async move {
+        // 先把配置克隆出来再放掉读锁：若把 .read().await 写在 match 表达式里，
+        // 读锁会存活到整个 match 结束——即横跨 wasm 下载、PoW 编译、全账号登录
+        // 的整个初始化过程，期间任何 config.write()（管理面板改配置、set_jwt_issued_at、
+        // 设备验证提交等）都会被阻塞数分钟。
+        let boot_cfg = boot_config.read().await.clone();
+        match OpenAIAdapter::new(&boot_cfg).await {
+            Ok(a) => {
+                *adapter_slot_writer.write().await = Some(Arc::new(a));
+                *ready_flag.write().await = true;
+                log::info!(target: "http::server", "后端初始化完成，/health ready=true");
+            }
+            Err(e) => {
+                // 初始化失败：服务仍监听（/health ready=false + last_error 可查），
+                // 应用侧会显示启动失败而不是无限等待。
+                log::error!(target: "http::server", "后端初始化失败: {e}");
+                *ready_flag.write().await = false;
+            }
+        }
+    });
+
     let data_dir = std::env::var("DS_DATA_DIR").unwrap_or_else(|_| ".".to_string());
     let store = Arc::new(store::StoreManager::new(
         std::path::Path::new(&data_dir),
@@ -107,8 +169,9 @@ pub async fn run(mut config: Config, config_path: PathBuf) -> anyhow::Result<()>
     let stats = Arc::new(stats::Stats::new_with_store(Some(store.clone())));
     let login_limiter = Arc::new(auth::LoginLimiter::new());
     let state = AppState {
-        adapter: adapter.clone(),
-        anthropic_compat,
+        adapter_slot,
+        ready,
+        boot_handle: Some(Arc::new(boot_handle)),
         stats: stats.clone(),
         config: config.clone(),
         config_path: config_path.clone(),
@@ -125,6 +188,7 @@ pub async fn run(mut config: Config, config_path: PathBuf) -> anyhow::Result<()>
     log::info!(target: "http::server", "openai兼容base_url: http://{}", bound_addr);
     log::info!(target: "http::server", "anthropic兼容base_url: http://{}/anthropic", bound_addr);
     log::info!(target: "http::server", "管理面板: http://{}/admin", bound_addr);
+    log::info!(target: "http::server", "HTTP 已监听（账号登录转后台，/health ready 判定就绪）");
 
     // 设备验证 LAN 监听器（0.0.0.0:22230，仅 /device* 路由，key 校验）：
     // 供无浏览器 miniapp 的笔用手机扫码访问辅助页（见 device_capture.rs）。
@@ -164,7 +228,12 @@ pub async fn run(mut config: Config, config_path: PathBuf) -> anyhow::Result<()>
 
     log::info!(target: "http::server", "HTTP 服务已停止，正在清理资源");
     stats.persist_now();
-    state.adapter.shutdown().await;
+    if let Some(h) = state.boot_handle {
+        h.abort();
+    }
+    if let Some(a) = state.adapter_slot.read().await.clone() {
+        a.shutdown().await;
+    }
     log::info!(target: "http::server", "清理完成");
 
     Ok(())
@@ -205,6 +274,14 @@ fn build_router(state: AppState, cors_origins: Vec<String>) -> Router {
         .route(
             "/v1/cloud-sessions/{id}/messages",
             get(handlers::cloud_session_messages),
+        )
+        // 删除云端会话（应用侧删除本地对话时同步调用，bug 3）。
+        // 同时挂 DELETE 与 POST：笔端 Falcon http 模块不支持 DELETE 方法
+        // （请求被拒/降级成 GET → 405），应用侧已改用 POST；DELETE 保留给
+        // 标准 OpenAI 风格调用方。
+        .route(
+            "/v1/cloud-sessions/{id}",
+            delete(handlers::delete_cloud_session).post(handlers::delete_cloud_session),
         )
         // Anthropic
         .route("/anthropic/v1/messages", post(handlers::anthropic_messages))
@@ -335,17 +412,28 @@ async fn root() -> axum::response::Redirect {
 }
 
 /// Health check endpoint
+///
+/// `ready`：后台初始化（wasm 下载 + 全账号登录）完成才为 true ——
+/// 应用侧（词典笔启动页）以它为"完全启动"信号（bug 5）。
 async fn health(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> Json<serde_json::Value> {
-    let account_status = state.adapter.get_account_pool_status().await;
+    let ready = *state.ready.read().await;
+    let (total, idle, busy) = match state.adapter_slot.read().await.clone() {
+        Some(a) => {
+            let s = a.get_account_pool_status().await;
+            (s.total, s.idle, s.busy)
+        }
+        None => (0, 0, 0),
+    };
     Json(serde_json::json!({
         "status": "ok",
+        "ready": ready,
         "accounts": {
-            "total": account_status.total,
-            "idle": account_status.idle,
-            "busy": account_status.busy,
-            "available": account_status.total > 0
+            "total": total,
+            "idle": idle,
+            "busy": busy,
+            "available": total > 0
         }
     }))
 }

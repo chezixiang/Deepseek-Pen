@@ -3,15 +3,8 @@ name = "sm_des"
 version = "0.1.0"
 edition = "2021"
 
-[dependencies]
+# base64 / serde_json 只被 tests/ 下的调试脚本使用，放 dev-dependencies，
+# 不进正式构建产物（本 crate 会编译进词典笔上的 ds-free-api）。
+[dev-dependencies]
 base64 = "0.22.1"
 serde_json = "1"
-
-[[test]]
-name = "verify_bc"
-
-[[test]]
-name = "decrypt_ip"
-
-[[test]]
-name = "decrypt_fields"

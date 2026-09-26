@@ -15,7 +15,8 @@
 //! 因此**无需嵌入 JS 执行器**：这是一个纯 HTTP 动态凭据，Rust 原生实现即可，
 //! 且取到的是真实有效的 token（而非伪造）。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 
@@ -31,25 +32,49 @@ const INITIAL_BACKOFF_SECS: u64 = 1;
 /// 当前持有的 HIF token（None = 尚未获取到，对应前端 getValue() 的空串）
 #[derive(Default)]
 struct HifState {
-    leim: RwLock<Option<String>>,
-    dliq: RwLock<Option<String>>,
+    leim: RwLock<Option<CachedToken>>,
+    dliq: RwLock<Option<CachedToken>>,
+}
+
+struct CachedToken {
+    value: String,
+    expires_at: Instant,
+}
+
+/// 任务不能持有自身生命周期的强引用；最后一个客户端释放时停止旧轮询。
+#[derive(Default)]
+struct RefreshTasks(Mutex<Vec<tokio::task::AbortHandle>>);
+
+impl Drop for RefreshTasks {
+    fn drop(&mut self) {
+        for task in self.0.get_mut().unwrap().drain(..) {
+            task.abort();
+        }
+    }
+}
+
+async fn current_token(slot: &RwLock<Option<CachedToken>>) -> Option<String> {
+    slot.read().await.as_ref()
+        .filter(|token| token.expires_at > Instant::now())
+        .map(|token| token.value.clone())
 }
 
 /// 共享的 HIF token 管理器
 #[derive(Clone, Default)]
 pub struct HifManager {
     state: Arc<HifState>,
+    tasks: Arc<RefreshTasks>,
 }
 
 impl HifManager {
     /// 读取当前 leim 值（可能为 None）
     pub async fn leim(&self) -> Option<String> {
-        self.state.leim.read().await.clone()
+        current_token(&self.state.leim).await
     }
 
     /// 读取当前 dliq 值（可能为 None）
     pub async fn dliq(&self) -> Option<String> {
-        self.state.dliq.read().await.clone()
+        current_token(&self.state.dliq).await
     }
 
     /// 启动后台刷新任务：leim 与 dliq 各自独立轮询（与前端两个 poller 一致）。
@@ -63,13 +88,18 @@ impl HifManager {
             log::warn!(target: "ds_core::hif", "无 tokio 运行时，HIF token 动态获取未启动");
             return;
         };
+        let mut tasks = self.tasks.0.lock().unwrap();
+        if !tasks.is_empty() {
+            return;
+        }
         for (name, url) in [("leim", LEIM_URL), ("dliq", DLIQ_URL)] {
             let state = Arc::clone(&self.state);
             let http = http.clone();
             let origin = origin.clone();
-            handle.spawn(async move {
+            let task = handle.spawn(async move {
                 poll_loop(&state, &http, &origin, name, url).await;
             });
+            tasks.push(task.abort_handle());
         }
     }
 }
@@ -85,7 +115,10 @@ async fn poll_loop(state: &HifState, http: &wreq::Client, origin: &str, name: &s
                 } else {
                     &state.dliq
                 };
-                *store.write().await = Some(value);
+                *store.write().await = Some(CachedToken {
+                    value,
+                    expires_at: Instant::now() + Duration::from_secs(ttl),
+                });
                 backoff = INITIAL_BACKOFF_SECS;
                 log::debug!(target: "ds_core::hif", "HIF {} token 已刷新，{}s 后重新拉取", name, ttl);
                 ttl
@@ -110,21 +143,32 @@ async fn fetch_token(
     origin: &str,
     url: &str,
 ) -> Result<(String, u64), String> {
+    use wreq::header::{HeaderMap, HeaderValue};
+
+    let mut headers = HeaderMap::new();
+    headers.insert("Origin", HeaderValue::from_str(origin).map_err(|e| format!("Origin: {e}"))?);
+    headers.insert(
+        "Referer",
+        HeaderValue::from_str(&format!("{origin}/")).map_err(|e| format!("Referer: {e}"))?,
+    );
+    headers.insert("Accept", HeaderValue::from_static("*/*"));
+
+    let cid = crate::server::net_capture::begin();
+    crate::server::net_capture::req(cid, "GET", url, &headers, None);
     let resp = http
         .get(url)
-        .header("Origin", origin)
-        .header("Referer", format!("{origin}/"))
-        .header("Accept", "*/*")
+        .headers(headers)
         .timeout(std::time::Duration::from_secs(3))
         .send()
-        .await
-        .map_err(|e| format!("HTTP: {e}"))?;
+        .await;
+    match &resp {
+        Ok(r) => crate::server::net_capture::resp(cid, r.status().as_u16(), r.headers(), false),
+        Err(e) => crate::server::net_capture::err(cid, &e.to_string()),
+    }
+    let resp = resp.map_err(|e| format!("HTTP: {e}"))?;
 
     let status = resp.status();
-    if !status.is_success() {
-        return Err(format!("HTTP status {}", status.as_u16()));
-    }
-
+    // x-hif-ttl 在响应头上，必须在消费 resp（读体）之前取出
     let ttl = resp
         .headers()
         .get("x-hif-ttl")
@@ -132,6 +176,13 @@ async fn fetch_token(
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(DEFAULT_TTL_SECS);
+    // resp.json() 内部读体不可观测，改 text+parse 以落盘响应体（HIF 拉取失败
+    // 常伴随 completion 缺头被风控，失败响应同样要留痕）
+    let text = resp.text().await.map_err(|e| format!("读取响应: {e}"))?;
+    crate::server::net_capture::body(cid, text.as_bytes(), false);
+    if !status.is_success() {
+        return Err(format!("HTTP status {}", status.as_u16()));
+    }
 
     #[derive(serde::Deserialize)]
     struct Envelope {
@@ -153,7 +204,7 @@ async fn fetch_token(
         value: String,
     }
 
-    let env: Envelope = resp.json().await.map_err(|e| format!("JSON: {e}"))?;
+    let env: Envelope = serde_json::from_str(&text).map_err(|e| format!("JSON: {e}"))?;
     if env.code != 0 {
         return Err(format!("code {}", env.code));
     }
@@ -177,10 +228,35 @@ mod tests {
     async fn manager_stores_and_reads_tokens() {
         let m = HifManager::default();
         assert!(m.leim().await.is_none());
-        *m.state.leim.write().await = Some("tok1".into());
-        *m.state.dliq.write().await = Some("tok2".into());
+        *m.state.leim.write().await = Some(CachedToken {
+            value: "tok1".into(), expires_at: Instant::now() + Duration::from_secs(60),
+        });
+        *m.state.dliq.write().await = Some(CachedToken {
+            value: "tok2".into(), expires_at: Instant::now() + Duration::from_secs(60),
+        });
         assert_eq!(m.leim().await.as_deref(), Some("tok1"));
         assert_eq!(m.dliq().await.as_deref(), Some("tok2"));
+    }
+
+    #[tokio::test]
+    async fn expired_token_is_not_sent_during_refresh_failure() {
+        let m = HifManager::default();
+        *m.state.leim.write().await = Some(CachedToken {
+            value: "expired".into(), expires_at: Instant::now(),
+        });
+        assert!(m.leim().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn last_manager_drop_cancels_refresh_tasks() {
+        let m = HifManager::default();
+        let other_client = m.clone();
+        let task = tokio::spawn(std::future::pending::<()>());
+        m.tasks.0.lock().unwrap().push(task.abort_handle());
+        drop(m);
+        assert!(!task.is_finished());
+        drop(other_client);
+        assert!(task.await.unwrap_err().is_cancelled());
     }
 
     #[test]

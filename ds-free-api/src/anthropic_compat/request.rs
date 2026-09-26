@@ -91,7 +91,10 @@ pub(crate) fn into_chat_completions(req: MessagesRequest) -> ChatCompletionsRequ
             include_obfuscation: true,
         }),
         top_logprobs: None,
-        user: None,
+        // Anthropic 客户端把终端用户标识放在 metadata.user_id；映射到 user 字段
+        // 才能命中会话复用（openai_adapter 按 req.user 复用），否则 Anthropic
+        // 端每轮对话都冷启动重建会话 + 全量历史上传。
+        user: req.metadata.as_ref().and_then(|m| m.user_id.clone()),
         verbosity: None,
         _extra: Default::default(),
     }

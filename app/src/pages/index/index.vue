@@ -5,7 +5,7 @@
              flex:1 + position:relative 的布局根上（此前结构白屏的可能原因） -->
         <div :class="portrait ? dc('rotate-canvas') : 'fill-canvas'" :style="portraitStyle">
         <!-- 顶栏：会话 | 联网/深度思考 | 模式/标题 | 设置 -->
-        <div :class="dc('topbar')">
+        <div :class="dc('topbar')" v-if="!camMode">
             <text :class="dc('icon-btn')" @click="toggleDrawer">会话</text>
             <text :class="toggleClass(search)" @click="toggleSearch">联网</text>
             <text :class="toggleClass(thinking)" @click="toggleThinking">深度</text>
@@ -23,27 +23,27 @@
         </div>
 
         <!-- 编辑提示条 -->
-        <div :class="dc('edit-banner')" v-if="editingMsgId">
+        <div :class="dc('edit-banner')" v-if="editingMsgId && !camMode">
             <text :class="dc('edit-banner-text')">正在修改消息，发送后重新生成回复</text>
             <text :class="dc('edit-banner-btn')" @click="cancelEdit">取消</text>
         </div>
 
         <!-- 后端断线提示 -->
-        <div :class="dc('backend-error-banner')" v-if="backendDisconnected">
+        <div :class="dc('backend-error-banner')" v-if="backendDisconnected && !camMode">
             <text :class="dc('backend-error-text')">⚠️ 后端连接已断开（如果是安装/更新后第一次打开软件可以通过配置账号的方式重启服务试试）</text>
         </div>
 
-        <!-- 消息区 -->
+        <!-- 消息区。scroller 绝不能套 v-if：Falcon 引擎对被 v-if 三元包装的
+             scroller 渲染异常（整个内容区空白，欢迎语/消息全丢，真机实证）。
+             相机模式下改为清空内容数组（chatMessages）来隐藏消息。 -->
         <scroller class="msgs" scroll-direction="vertical">
-            <div class="empty" v-if="messages.length === 0">
+            <div class="empty" v-if="!camMode && messages.length === 0">
                 <text v-if="cloudLoadingId === activeId" :class="dc('empty-tip')">正在加载云端对话…</text>
-                <template v-else>
-                    <text :class="dc('empty-title')">Deepseek</text>
-                    <text :class="dc('empty-tip')">你好，我是 DeepSeek，有什么可以帮你？</text>
-                </template>
+                <text v-else :class="dc('empty-title')">Deepseek</text>
+                <text v-if="cloudLoadingId !== activeId" :class="dc('empty-tip')">你好，我是 DeepSeek，有什么可以帮你？</text>
             </div>
 
-            <div v-for="m in messages" :key="m.id" class="msg">
+            <div v-for="m in chatMessages" :key="m.id" class="msg" :ref="'msg-' + m.id">
                 <!-- 用户消息 -->
                 <div v-if="m.role === 'user'" class="msg-row-user">
                     <div :class="dc('bubble-user')">
@@ -76,17 +76,48 @@
                                 </div>
                                 <text v-if="m.error" :class="dc('bubble-text-error')">{{ m.error }}</text>
                                 <div v-else :class="dc('md')">
-                                    <div v-for="(block, bi) in markdownBlocks(m.content)" :key="bi" class="md-block">
+                                    <div v-for="(block, bi) in markdownBlocks(m.content, !m.pending)" :key="bi" class="md-block">
                                         <div v-if="block.type === 'p'" :class="dc('md-p')">
-                                            <text v-for="(s, si) in spans(block.text)" :key="si" :class="spanClass(s)"><text v-for="(r, ri) in emojiRuns(s.text)" :key="ri" :class="emojiRunClass(s, r)">{{ r.t }}</text></text>
+                                            <!-- run 必须是**同级**节点，不能嵌套（见 mdRuns 注释：嵌套会让框架 abort）。
+                                                 数学 run 用 <richtext><latex value> 走原生排版，与 <text> 平级。 -->
+                                            <template v-for="(r, ri) in mdRuns(block.text, !m.pending)" :key="ri">
+                                                <richtext v-if="r.math" :class="dc('md-math')"><latex :value="r.text"></latex></richtext>
+                                                <text v-else :class="runClass(r)">{{ r.text }}</text>
+                                            </template>
+                                        </div>
+                                        <div v-else-if="block.type === 'math'" :class="dc('md-math-block')">
+                                            <richtext v-if="canTypeset(block.text)" :class="dc('md-math')"><latex :value="block.text"></latex></richtext>
+                                            <text v-else-if="!mathBalanced(block.text)" :class="dc('md-math-src')">${{ block.text }}$</text>
+                                            <text v-else :class="dc('md-math-fallback')">{{ dispText(block.text) }}</text>
                                         </div>
                                         <text v-else-if="block.type === 'code'" :class="dc('md-code')">{{ block.text }}</text>
                                         <text v-else-if="block.type === 'quote'" :class="dc('md-quote')">{{ dispText(block.text) }}</text>
                                         <text v-else-if="block.type === 'hr'" :class="dc('md-hr')">————————</text>
                                         <div v-else-if="block.type === 'list'" :class="dc('md-list')">
                                             <div v-for="(item, ii) in block.items" :key="ii" class="md-li-row">
-                                                <text :class="dc('md-li-marker')">{{ block.ordered ? (ii + 1) + '. ' : '• ' }}</text>
-                                                <text v-for="(s, si) in spans(item)" :key="si" :class="spanClass(s)"><text v-for="(r, ri) in emojiRuns(s.text)" :key="ri" :class="emojiRunClass(s, r)">{{ r.t }}</text></text>
+                                                <text :class="dc('md-li-marker')">{{ listMarker(block, ii) }}</text>
+                                                <template v-for="(r, ri) in mdRuns(item, !m.pending)" :key="ri">
+                                                    <richtext v-if="r.math" :class="dc('md-math')"><latex :value="r.text"></latex></richtext>
+                                                    <text v-else :class="runClass(r, isTaskDone(block, ii))">{{ r.text }}</text>
+                                                </template>
+                                            </div>
+                                        </div>
+                                        <!-- 表格：等宽列、横线分隔（无竖线外框，与整体轻线条风格一致）。
+                                             表头是纯文本（粗体+底色）；单元格走行内 runs，
+                                             run 仍须同级平铺（<text> 内嵌元素会 abort，见 mdRuns 注释） -->
+                                        <div v-else-if="block.type === 'table'" :class="dc('md-table')">
+                                            <div :class="dc('md-tr')">
+                                                <div v-for="(cell, ci) in block.header" :key="'h' + ci" :class="dc('md-th')">
+                                                    <text :class="dc('md-th-text')" :style="mdAlign(block.align, ci)">{{ dispText(cell) }}</text>
+                                                </div>
+                                            </div>
+                                            <div v-for="(row, ri) in block.rows" :key="'r' + ri" :class="dc('md-tr')">
+                                                <div v-for="(cell, ci) in row" :key="'c' + ci" :class="dc('md-td')">
+                                                    <template v-for="(r, rr) in mdRuns(cell, !m.pending)" :key="rr">
+                                                        <richtext v-if="r.math" :class="dc('md-math')"><latex :value="r.text"></latex></richtext>
+                                                        <text v-else :class="runClass(r)">{{ r.text }}</text>
+                                                    </template>
+                                                </div>
                                             </div>
                                         </div>
                                         <text v-else :class="dc('md-heading') + ' md-' + block.type">{{ dispText(block.text) }}</text>
@@ -104,24 +135,70 @@
                     </div>
                 </div>
             </div>
-            <div class="bottom-anchor" ref="bottom"></div>
+            <!-- 空态（欢迎语）时不渲染 spacer/anchor：否则内容高度超过视口，
+                 scroller 能滑动且 scrollToBottom 会把气泡滚出视口（用户反馈：
+                 欢迎语不应可滑、短会话滚到底只剩"重试"按钮）。 -->
+            <div class="msgs-tail-spacer" v-if="messages.length"></div>
+            <div class="bottom-anchor" ref="bottom" v-if="messages.length"></div>
         </scroller>
 
-        <!-- 待发图片 -->
-        <div :class="dc('draft-imgs')" v-if="draftImages.length">
+        <!-- 待发图片（悬浮输入组件上方，右对齐） -->
+        <div :class="dc('draft-imgs-float')" v-if="draftImages.length && !camMode">
             <div v-for="(img, i) in draftImages" :key="img.path" class="draft-img">
                 <image :class="dc('draft-thumb')" resize="cover" :src="fileUrl(img.path)" />
                 <text class="draft-remove" @click="removeDraftImage(i)">×</text>
             </div>
         </div>
+        <text v-if="imageWarn && !camMode" :class="dc('draft-warn')">{{ imageWarn }}</text>
 
-        <!-- 输入栏 -->
-        <div :class="dc('inputbar')">
-            <text v-if="canUploadImage" class="upload" @click="openPicker">图片</text>
-            <div :class="dc('input-display')" @click="openInput">
-                <text :class="draft ? dc('input-display-text') : dc('input-display-text-ph')">{{ draft || '点击输入消息…' }}</text>
+        <!-- 右下角悬浮输入组件：小文本框在上，相册/发送圆钮在下——
+             几乎不占消息区竖向空间（用户手绘稿布局）。
+             按钮禁用文字与 emoji（设备字体缺字形渲染白块），一律 PNG 图标 -->
+        <div :class="dc('float-input')" v-if="!camMode">
+            <div :class="dc('float-textbox')" @click="openInput">
+                <text :class="draft ? dc('input-display-text') : dc('input-display-text-ph')">{{ draft || '点击输入' }}</text>
             </div>
-            <text :class="sendClass()" @click="send">{{ sending ? '停止' : '发送' }}</text>
+            <div class="float-btns">
+                <div v-if="canUploadImage" :class="dc('float-btn')" @click="openPicker">
+                    <image class="float-icon-img" resize="contain" :src="albumIconSrc()" />
+                </div>
+                <div :class="sendFloatClass()" @click="send">
+                    <image class="float-icon-img" resize="contain" :src="sendIconSrc()" />
+                </div>
+            </div>
+        </div>
+
+        <!-- 相机取景（帧循环预览）：
+             kmssink overlay"透明洞"方案不可用（Falcon 跳过透明区域绘制，相册
+             残影留在洞里，真机实证）。改为：洞区不透明黑底 + video29 每 400ms
+             抓帧转 JPG，image 组件轮换刷新（camera.js startFramePreview）。 -->
+        <div class="cam-stage" v-if="showCamera && !showConfirm">
+            <div :class="dc('cam-side')"></div>
+            <div class="cam-gap">
+                <image class="cam-frame" v-if="previewFrame" resize="contain" :src="previewFrame" />
+            </div>
+            <div :class="dc('cam-side-r')">
+                <image :class="dc('cam-close')" resize="contain" :src="closeIconSrc()" @click="closeCamera" />
+                <div class="cam-spacer"></div>
+                <div :class="dc('shutter-outer')" @click="shoot">
+                    <div :class="dc('shutter-inner')"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 拍照确认浮层：预览图 + 比例标签 + 重拍/裁剪/确认（悬浮圆钮） -->
+        <div class="camera-view" v-if="showConfirm">
+            <image class="camera-preview" resize="contain" :src="confirmSrc" />
+            <text :class="dc('crop-label')">{{ cropRatio || '全图' }}</text>
+            <div :class="dc('confirm-btn-redo')" @click="retakeShot">
+                <image class="confirm-icon" resize="contain" :src="redoIconSrc()" />
+            </div>
+            <div :class="dc('confirm-btn-crop')" @click="cycleCrop">
+                <image class="confirm-icon" resize="contain" :src="cropIconSrc()" />
+            </div>
+            <div :class="dc('confirm-btn-ok')" @click="confirmShot">
+                <image class="confirm-icon" resize="contain" :src="checkIconSrc()" />
+            </div>
         </div>
 
         <!-- 竖屏旋转画布到此为止：遮罩/抽屉/选择器保持不旋转，绝对定位于 pwrap -->
@@ -130,8 +207,8 @@
         <!-- 会话抽屉：全屏遮罩挡住穿透点击（#8），点遮罩关闭。
              bug 修复：Weex 中未绑定点击的容器不拦截触摸，事件会穿透到遮罩导致
              点击列表内空白处也关闭抽屉——根节点/头部/列表绑定空消费点击。 -->
-        <div class="drawer-mask" v-if="showDrawer" @click="closeDrawer"></div>
-        <div :class="dc('drawer')" v-if="showDrawer" @click="noopDrawer">
+        <div class="drawer-mask" v-if="showDrawer && !camMode" @click="closeDrawer"></div>
+        <div :class="dc('drawer')" v-if="showDrawer && !camMode" @click="noopDrawer">
             <div :class="dc('drawer-head')" @click="noopDrawer">
                 <text :class="dc('drawer-title')">会话列表</text>
                 <text :class="dc('icon-btn')" @click="searchConversations">{{ convFilter ? '重搜' : '搜索' }}</text>
@@ -156,23 +233,30 @@
             <text :class="dc('drawer-close')" @click="closeDrawer">关闭</text>
         </div>
 
-        <!-- 图片选择器 -->
-        <div class="picker" v-if="showPicker">
+        <!-- 相册选择器：竖向滚动网格（新图在上），底部"去拍照"引导 -->
+        <div class="picker" v-if="showPicker && !camMode">
             <div :class="dc('picker-head')">
-                <text :class="dc('picker-title')">选择图片（/userdisk/Pictures）</text>
+                <text :class="dc('picker-title')">相册（/userdisk/Pictures）</text>
                 <text :class="dc('icon-btn')" @click="closePicker">关闭</text>
             </div>
-            <text v-if="albumLoading" class="picker-hint">加载中…</text>
-            <text v-else-if="albumError" class="picker-hint-error">{{ albumError }}</text>
-            <text v-else-if="albumImages.length === 0" class="picker-hint">相册里没有图片</text>
-            <scroller v-else class="picker-list" scroll-direction="horizontal">
-                <image
-                    v-for="img in albumImages"
-                    :key="img.path"
-                    class="pick-thumb"
-                    resize="cover"
-                    :src="fileUrl(img.path)"
-                    @click="pickImage(img)" />
+            <scroller class="picker-vlist" scroll-direction="vertical">
+                <text v-if="albumLoading" class="picker-hint">加载中…</text>
+                <text v-else-if="albumError" class="picker-hint-error">{{ albumError }}</text>
+                <text v-else-if="albumImages.length === 0" class="picker-hint">相册里还没有图片</text>
+                <div v-else class="picker-grid">
+                    <!-- 拍照固定为第一格（一张"图片"，点击进入取景） -->
+                    <div class="pick-cell" @click="openCamera">
+                        <div :class="dc('pick-camera')">
+                            <image class="pick-camera-icon" resize="contain" :src="cameraIconSrc()" />
+                        </div>
+                    </div>
+                    <div v-for="img in albumImages" :key="img.path" class="pick-cell" @click="pickImage(img)">
+                        <image class="pick-thumb-v" resize="cover" :src="fileUrl(img.thumb || img.path)" />
+                    </div>
+                </div>
+                <div class="picker-photo-tip">
+                    <text class="picker-photo-text">要发新照片？用系统"拍照识题/拍照"功能拍摄后，回到这里选择</text>
+                </div>
             </scroller>
         </div>
         </div>
@@ -180,15 +264,17 @@
 </template>
 
 <script>
-import { MODES, getMode, buildMessages, chat, chatStream, stripInternalTags, listCloudSessions, listCloudSessionMessages } from '../../services/ds.js'
+import { MODES, getMode, buildMessages, chatStream, stripInternalTags, listCloudSessions, listCloudSessionMessages, deleteCloudSession } from '../../services/ds.js'
+import { isAccountSuspension, isRateLimitedError } from '../../services/error-classify.js'
 import {
     loadConversations, saveConversations, loadMessages, saveMessages,
     deleteMessages, loadSettings, loadActiveId, saveActiveId, uid, DEFAULT_SETTINGS,
     recordAccountTrouble
 } from '../../services/store.js'
-import { listAlbum, readImageDataUrl } from '../../services/images.js'
+import { listAlbum, readImageDataUrl, ensureThumb } from '../../services/images.js'
+import { startFramePreview, stopFramePreview, capturePhoto, cropFrame } from '../../services/camera.js'
 import { openTextEditor, setDebugLogEnabled, stopStream, INPUT_TYPES, ensureBackendRunning } from '../../services/native.js'
-import { markdownToBlocks, inlineSpans, splitEmojiRuns } from '../../services/markdown.js'
+import { markdownToBlocks, inlineSpans, splitEmojiRuns, latexToText, splitMathSegments, canTypesetMath, bracesBalanced } from '../../services/markdown.js'
 import { ensureEmojiFont } from '../../services/emoji-font.js'
 import { substituteEmoji } from '../../services/emoji-subst.js'
 import { createBackendMonitor } from '../../services/backend-health.js'
@@ -232,6 +318,19 @@ export default {
             albumImages: [],
             albumError: '',
             albumLoading: false,
+            // 现场拍摄进行中（services/camera.js）
+            takingPhoto: false,
+            // 相机取景浮层（帧循环预览：video29 抓帧转 JPG 轮换刷新）
+            showCamera: false,
+            // 取景帧路径（/tmp 双文件轮换，见 camera.js startFramePreview）
+            previewFrame: '',
+            // 拍照确认浮层：预览图 + 确认/重拍/裁剪（比例循环）
+            showConfirm: false,
+            confirmSrc: '',
+            confirmPath: '',
+            cropRatio: null,
+            // 图片过大无法发送时的提示（见 images.js 的体积上限）
+            imageWarn: '',
             // 请求序号（用于丢弃过期响应 / 停止）
             reqSeq: 0,
             // 云端会话同步（#10）
@@ -249,12 +348,32 @@ export default {
     },
     computed: {
         pageClass() {
+            // 相机模式不再需要页面透明（预览已改为帧循环 image，不再依赖
+            // DRM overlay 从页面底下透出）
             return this.isDark ? 'page page-dark' : 'page'
+        },
+        // 相机相关浮层是否激活（取景或确认）
+        camMode() {
+            return this.showCamera || this.showConfirm
+        },
+        // 消息区的消息列表：相机模式下清空（scroller 本体不能套 v-if，
+        // 否则 Falcon 渲染异常；用内容数组切换来隐藏消息）
+        chatMessages() {
+            return this.camMode ? [] : this.messages
         },
         isDark() {
             // 深色模式：'dark' 深色，其余浅色（词典笔无系统深色；兼容旧设置里的 'auto' 视为浅色）
             if (!this.settings) return false
             return this.settings.theme === 'dark'
+        },
+        // 抽屉渲染列表：按搜索词过滤（#7）
+        // 必须放在 computed 里：之前定义在 methods 中，模板 `v-for="c in drawerConversations"`
+        // 拿到的是**函数本身**（不是返回值），v-for 遍历函数对象得到空数组 —— 抽屉永远显示
+        // "暂无会话"，云端同步导入成功也看不到（bug 3）。
+        drawerConversations() {
+            const q = (this.convFilter || '').trim().toLowerCase()
+            if (!q) return this.conversations
+            return this.conversations.filter((c) => (c.title || '').toLowerCase().indexOf(q) >= 0)
         },
         portrait() {
             // 仅调试模式下才允许竖屏（实验性功能，避免普通用户误触白屏）
@@ -304,6 +423,9 @@ export default {
     destroyed() {
         this.$page.off('show', this.onPageShow)
         this.stopBackendMonitor()
+        // 清理节流的渲染/滚动定时器，避免页面销毁后回调仍持有组件引用
+        if (this._renderTimer) { clearTimeout(this._renderTimer); this._renderTimer = null }
+        if (this._scrollTimer) { clearTimeout(this._scrollTimer); this._scrollTimer = null }
     },
     methods: {
         // 深色模式类名切换：浅色返回原类，深色返回 -dark 变体类
@@ -315,6 +437,25 @@ export default {
         cacheTheme() {
             try { $falcon.__dsTheme = (this.settings && this.settings.theme) || 'light' } catch (e) { /* 忽略 */ }
         },
+        // 流式渲染节流：每来一个 delta 就 $forceUpdate + 滚动，会把弱 SoC 的 CPU
+        // 打满（消息多时还要全量重渲染整列），是"发送消息时设备卡死/重启"的诱因之一。
+        // 合并成最多 ~8 帧/秒；流式结束时用 flushRender 保证最终画面一致。
+        scheduleRender() {
+            if (this._renderTimer) return
+            this._renderTimer = setTimeout(() => {
+                this._renderTimer = null
+                this.$forceUpdate()
+                this.scrollToBottom(true)
+            }, 120)
+        },
+        flushRender() {
+            if (this._renderTimer) {
+                clearTimeout(this._renderTimer)
+                this._renderTimer = null
+            }
+            this.$forceUpdate()
+            this.scrollToBottom(true)
+        },
         closeDrawer() {
             this.showDrawer = false
             this.syncMsg = ''
@@ -322,12 +463,6 @@ export default {
         },
         // 空消费点击：挡住抽屉内部空白区域的事件穿透到遮罩（bug 修复）
         noopDrawer() {},
-        // 抽屉渲染列表：按搜索词过滤（#7）
-        drawerConversations() {
-            const q = (this.convFilter || '').trim().toLowerCase()
-            if (!q) return this.conversations
-            return this.conversations.filter((c) => (c.title || '').toLowerCase().indexOf(q) >= 0)
-        },
         async searchConversations() {
             const text = await openTextEditor(INPUT_TYPES.ZH_CN_PREFERRED, this.convFilter || '')
             if (text === null) return
@@ -354,12 +489,35 @@ export default {
                     authMode: this.settings.authMode
                 })
                 let added = 0
+                let linked = 0
                 for (const s of list) {
                     const title = String(s.title || '').trim()
                     if (!title) continue
-                    // 仅按 cloudId 去重（标题同名不再挤掉云端条目，本地/云端可并存）
-                    if (this.conversations.some((c) => c.cloudId === s.id)) continue
                     const ts = s.updated_at ? Math.round(s.updated_at * 1000) : Date.now()
+                    // 已关联过的云端会话（cloudId 匹配）：不重复导入
+                    if (this.conversations.some((c) => c.cloudId === s.id)) continue
+                    // 本机新建的会话在云端也有一条同名会话（服务端为每次对话都建了 session），
+                    // 但它本地还没有 cloudId。旧实现只按 cloudId 去重，于是同步时把同一条
+                    // 对话又导入一遍 —— 抽屉里出现两份（云的一份是空占位，进入才拉取）。
+                    // 这里先按标题认领：命中未关联的本地会话就补上 cloudId 并标记
+                    // cloudLoaded（消息本地已有，不需要再拉云端内容覆盖）。
+                    const candidates = this.conversations.filter((c) => !c.cloudId && !c.cloudLinked && (c.title || '').trim() === title)
+                    if (candidates.length) {
+                        let best = candidates[0]
+                        let bestDiff = Math.abs((best.updatedAt || 0) - ts)
+                        for (const c of candidates) {
+                            const diff = Math.abs((c.updatedAt || 0) - ts)
+                            if (diff < bestDiff) {
+                                best = c
+                                bestDiff = diff
+                            }
+                        }
+                        best.cloudId = s.id
+                        best.cloudLinked = true
+                        best.cloudLoaded = true
+                        linked += 1
+                        continue
+                    }
                     // 模型已合并：云端 model_type 无论是 default/expert/vision 都映射到唯一模式
                     const mode = MODES[0].key
                     this.conversations.push({
@@ -376,15 +534,18 @@ export default {
                     added += 1
                 }
                 this.conversations.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
-                if (added > 0) {
+                if (added > 0 || linked > 0) {
                     await saveConversations(this.conversations)
                 }
-                this.syncMsg = added > 0 ? ('已导入 ' + added + ' 个云端会话（进入时加载内容）') : '云端会话均已存在'
-                appLog('[sync] 云端会话 ' + list.length + ' 个，新增 ' + added)
+                // 已关联的会话不再计入"导入"：认领只是给本地会话补云端身份，没有新增条目
+                this.syncMsg = added > 0
+                    ? ('已导入 ' + added + ' 个云端会话（进入时加载内容）' + (linked ? '，关联 ' + linked + ' 个本地会话' : ''))
+                    : (linked > 0 ? ('已关联 ' + linked + ' 个本地会话，无重复导入') : '云端会话均已存在')
+                appLog('[sync] 云端会话 ' + list.length + ' 个，新增 ' + added + '，关联 ' + linked)
             } catch (e) {
                 this.syncMsg = '同步失败：' + (e && e.message ? e.message : '未知错误')
                 const msg = e && e.message ? e.message : String(e)
-                if (/封禁|限制|HTTP_401|HTTP_403|未认证|没有可用账号|空闲账号/.test(msg)) {
+                if (isAccountSuspension(msg)) {
                     recordAccountTrouble('同步', msg)
                 }
                 appLog('[sync] 失败 ' + msg)
@@ -416,17 +577,27 @@ export default {
                 for (const m of list) {
                     if (m.role === 'user') {
                         const id = uid('u')
+                        // 云端编辑历史：alt_texts 是被替换的旧版本（升序），当前
+                        // content 是最新——与本地 revisions 的语义一致
+                        // （revisions[activeRevision] 为当前显示版本）。
+                        const alts = Array.isArray(m.alt_texts) ? m.alt_texts : []
                         msgs.push({
                             id, role: 'user', content: m.content, images: [], createdAt: now + seq++,
-                            revisions: [{ content: m.content, images: [], createdAt: now + seq }], activeRevision: 0
+                            revisions: alts.map((t) => ({ content: t, images: [], createdAt: now + seq }))
+                                .concat([{ content: m.content, images: [], createdAt: now + seq }]),
+                            activeRevision: alts.length
                         })
                     } else {
                         const id = uid('a')
+                        // 云端重试历史同理映射为 attempts（attempts[activeAttempt]
+                        // 为当前版本，本地 retryMessage 就是往 attempts 追加）。
+                        const alts = Array.isArray(m.alt_texts) ? m.alt_texts : []
                         msgs.push({
                             id, role: 'assistant', content: m.content, reasoning: m.reasoning || '', pending: false,
                             createdAt: now + seq++,
-                            attempts: [{ id, content: m.content, reasoning: m.reasoning || '', pending: false, createdAt: now + seq }],
-                            activeAttempt: 0
+                            attempts: alts.map((t) => ({ id: uid('a'), content: t, reasoning: '', pending: false, createdAt: now + seq }))
+                                .concat([{ id, content: m.content, reasoning: m.reasoning || '', pending: false, createdAt: now + seq }]),
+                            activeAttempt: alts.length
                         })
                     }
                 }
@@ -442,7 +613,7 @@ export default {
             } catch (e) {
                 // 静默失败：保留占位会话，下次进入重试
                 const msg = e && e.message ? e.message : String(e)
-                if (/封禁|限制|HTTP_401|HTTP_403|未认证|没有可用账号|空闲账号/.test(msg)) {
+                if (isAccountSuspension(msg)) {
                     recordAccountTrouble('云端内容', msg)
                 }
                 appLog('[cloud] 拉取云端会话内容失败 ' + msg)
@@ -471,8 +642,14 @@ export default {
         // ---------- Markdown ----------
         // 解析结果缓存（bug 修复：$forceUpdate 触发全列表重渲染时，未变化的消息
         // 不再重复跑 markdown/行内解析——这是展开思考/流式输出卡顿的主因）
-        markdownBlocks(content) {
+        //
+        // final=true 表示该内容已定稿（消息不再增长），才写缓存。流式过程中每来
+        // 一个 delta 都解析一次却从不命中缓存，把 cache 填满 400 条前缀后就整表
+        // clear —— 反复解析 + 反复清缓存是长回复时的内存与 CPU 峰值来源，也是
+        // 发送消息时设备卡死/重启的诱因之一（bug 2）。
+        markdownBlocks(content, final = true) {
             if (!content) return []
+            if (!final) return markdownToBlocks(content)
             const cache = this._mdCache || (this._mdCache = new Map())
             if (cache.has(content)) return cache.get(content)
             const blocks = markdownToBlocks(content)
@@ -480,35 +657,100 @@ export default {
             cache.set(content, blocks)
             return blocks
         },
-        spans(text) {
+        // 行内 run 列表：把一段文本拆成 [{ text, bold?, italic?, code?, emoji }]，
+        // 每个 run 由模板渲染成**一个同级 <text>**。
+        //
+        // 为什么不用嵌套 <text>：本设备的 Falcon 引擎在 <text> 里再放 <text> 时，
+        // Yoga 会走到 "Cannot add child: Nodes with measure functions cannot have
+        // children." 断言并 abort **整个框架进程**（/usrdisk/corefile 有 dmp）。
+        // 表现为"一发消息 App 就闪退/设备像重启了"，重新进入后只要渲染到同一条
+        // 消息就立刻再崩——因为 abort 发生在渲染期，消息又已落盘。
+        // 曾经的写法是 <text :class="spanClass(s)"><text :class="emojiRunClass(...)">…，
+        // 正好踩中这个断言。现在两层合一层，run 之间平级。
+        mdRuns(text, final = true) {
             const key = String(text === undefined || text === null ? '' : text)
-            const cache = this._spanCache || (this._spanCache = new Map())
+            if (!final) return this._buildRuns(key, false)
+            const cache = this._runCache || (this._runCache = new Map())
             if (cache.has(key)) return cache.get(key)
-            const result = inlineSpans(key)
+            const result = this._buildRuns(key, true)
             if (cache.size > 600) cache.clear()
             cache.set(key, result)
             return result
         },
-        // emoji 片段拆分（带缓存）：emoji run 单独套 NotoColorEmoji 字体（#2）。
-        // 字体注册不可用时（本设备无 weex/dom 模块），先用 substituteEmoji 把
-        // emoji 换成文字标签，避免白块；注册成功后关闭替换并清缓存重新渲染。
-        emojiRuns(text) {
-            const key = String(text === undefined || text === null ? '' : text)
-            const cache = this._emojiCache || (this._emojiCache = new Map())
-            if (cache.has(key)) return cache.get(key)
-            const source = this._emojiFontActive ? key : substituteEmoji(key)
-            const result = splitEmojiRuns(source)
-            if (cache.size > 600) cache.clear()
-            cache.set(key, result)
-            return result
+        // 实际转换：先按 markdown 行内语法切 span，再把每个 span 按 emoji 区段切 run，
+        // 最后拍平成一个数组（不保留层级，模板才能平铺渲染）。
+        //
+        // 数学公式：设备固件自带 clatexmath，<richtext><latex value="…"/></richtext> 能排出
+        // 真正的分式/求和号/根式。但两个实测限制决定了它只用在"定稿 + 短公式"上：
+        // 超长公式被截断（不换行），括号不配平的中间态渲染成空白。其余情况一律回退
+        // Unicode（latexToText），内容完整且能换行——宁可朴素，不要显示半截或空白。
+        _buildRuns(text, final = true) {
+            const src = String(text === undefined || text === null ? '' : text)
+            const runs = []
+            const segs = splitMathSegments(src)
+            for (let k = 0; k < segs.length; k++) {
+                const seg = segs[k]
+                if (seg.math) {
+                    if (final && canTypesetMath(seg.text)) {
+                        runs.push({ text: seg.text, math: true })
+                    } else if (!bracesBalanced(seg.text)) {
+                        // 括号不配平（流式中间态 / 模型笔误）：原生排成空白、Unicode
+                        // 会把 \frac 啃成 "frac" 拼出错字。原样显示源码最诚实，且
+                        // 流式下一帧就变正常，不会停留。
+                        runs.push({ text: '$' + seg.text + '$', code: true })
+                    } else {
+                        // 超长等其它情况：Unicode 近似（内容完整、可换行，只是不精确）
+                        const uni = latexToText('$' + seg.text + '$')
+                        if (uni) runs.push({ text: uni })
+                    }
+                    continue
+                }
+                const spans = inlineSpans(seg.text)
+                for (let i = 0; i < spans.length; i++) {
+                    const s = spans[i]
+                    // emoji 替换只改显示层：字体可用时用原文，否则把 emoji 换成文字标签
+                    const source = this._emojiFontActive ? s.text : substituteEmoji(s.text)
+                    const pieces = splitEmojiRuns(source)
+                    for (let j = 0; j < pieces.length; j++) {
+                        if (!pieces[j].t) continue
+                        runs.push({
+                            text: pieces[j].t,
+                            bold: !!s.bold,
+                            italic: !!s.italic,
+                            code: !!s.code,
+                            emoji: !!pieces[j].e
+                        })
+                    }
+                }
+            }
+            if (runs.length === 0) runs.push({ text: '' })
+            return runs
         },
-        // 纯文本展示路径（用户消息 / 思考过程 / 引用 / 标题）：字体不可用时替换 emoji
+        // run 的 class：行内样式 + emoji 字体（字体可用时才套，否则已经是文字标签）
+        // forceStrike：任务列表已完成项整条加删除线（√ + 删除线传达"完成"）
+        runClass(r, forceStrike) {
+            let s = r
+            if (forceStrike && r && !r.math && !r.code) {
+                s = { text: r.text, bold: r.bold, italic: r.italic, code: r.code, strike: true }
+            }
+            let cls = this.spanClass(s)
+            if (r && r.emoji && this._emojiFontActive) cls += ' md-emoji'
+            return cls
+        },
+        // 块级公式是否交给原生排版（过长/括号不配平 → 回退，见 canTypesetMath）
+        canTypeset(tex) {
+            return canTypesetMath(tex)
+        },
+        mathBalanced(tex) {
+            return bracesBalanced(tex)
+        },
+        // 纯文本展示路径（用户消息 / 思考过程 / 引用 / 标题）：字体不可用时替换 emoji。
+        // 数学公式（LaTeX）在此转成 Unicode 纯文本——这些路径不经过 inlineSpans，
+        // 不转换就会把 $x^{2}$ 原样显示出来（bug 2）。
         dispText(text) {
             const key = String(text === undefined || text === null ? '' : text)
-            return this._emojiFontActive ? key : substituteEmoji(key)
-        },
-        emojiRunClass(s, r) {
-            return this.spanClass(s) + (r.e ? ' md-emoji' : '')
+            const withMath = latexToText(key)
+            return this._emojiFontActive ? withMath : substituteEmoji(withMath)
         },
         spanStyle(s) {
             let st = ''
@@ -518,12 +760,32 @@ export default {
             return st
         },
         // bug 修复（深色黑字）：Weex 的 <div> 颜色不会可靠继承到 <text>，
-        // 裸 span/加粗/斜体必须带显式颜色类，否则深色模式下渲染为默认黑色
+        // 裸 span/加粗/斜体必须带显式颜色类，否则深色模式下渲染为默认黑色。
+        // 优先级从上往下：删除线压过粗斜（任务完成项 "√ + ~~**名**~~" 以删除线为准）
         spanClass(s) {
+            if (s.strike) return this.dc('md-strike')
+            if (s.bold && s.italic) return this.dc('md-bold-italic')
             if (s.bold) return this.dc('md-bold')
             if (s.italic) return this.dc('md-italic')
+            if (s.link) return this.dc('md-link')
             if (s.code) return this.dc('md-inline-code')
             return this.dc('md-span')
+        },
+        // 列表 marker：任务项 √/□（√ 是数学符号 U+221A，设备数学字体必有；
+        // □ U+25A1 CJK 字体常带——避开缺字形的 emoji 字符），普通项沿用原符号
+        listMarker(block, ii) {
+            const st = block.taskStates && block.taskStates[ii]
+            if (st === 'done') return '√ '
+            if (st === 'open') return '□ '
+            return block.ordered ? ((block.start || 1) + ii) + '. ' : '• '
+        },
+        isTaskDone(block, ii) {
+            return !!(block.taskStates && block.taskStates[ii] === 'done')
+        },
+        // 表格列对齐：GFM 分隔行解析出的 left/center/right 套到单元格文字上
+        mdAlign(align, ci) {
+            const a = (align && align[ci]) || 'left'
+            return 'text-align:' + a
         },
 
         // ---------- 重试/修改版本切换 ----------
@@ -578,6 +840,9 @@ export default {
                 m.content = att.content || ''
                 m.reasoning = att.reasoning || ''
                 m.error = att.error || ''
+                // errorCode 必须跟着切：重试按钮靠它判断"这条是限流失败"，
+                // 漏掉会让用户切到成功的版本后重试仍被拦（或反之放行）（bug 1）
+                m.errorCode = att.errorCode || ''
                 m.pending = !!att.pending
             }
             this.$forceUpdate()
@@ -600,7 +865,8 @@ export default {
                 .then((r) => {
                     if (r.ok) {
                         this._emojiFontActive = true
-                        if (this._emojiCache) this._emojiCache.clear()
+                        // run 缓存里存的是「按当时字体可用性构建」的结果，字体状态一变就得整表清掉
+                        if (this._runCache) this._runCache.clear()
                         this.$forceUpdate()
                         return
                     }
@@ -733,10 +999,27 @@ export default {
         canSend() {
             return (this.draft && this.draft.trim().length > 0) || this.draftImages.length > 0
         },
-        sendClass() {
-            // 深色模式：发送键用 send-dark 变体（浅色保持原样）
-            if (this.sending) return this.dc('send')
-            return this.canSend() ? this.dc('send') : this.dc('send-disabled')
+        // 悬浮圆钮状态：正常（可发）/禁用（无内容）/停止（发送中）——
+        // 引擎仅支持单类选择器，三种状态是三个独立类名
+        sendFloatClass() {
+            if (this.sending) return this.dc('float-btn-stop')
+            return this.canSend() ? this.dc('float-btn-send') : this.dc('float-btn')
+        },
+        // 按钮 PNG 图标（icons/ 随 AMR 打包，见 build-wrapper 步骤 4）。
+        // 浅色按钮蓝图标 / 深色按钮亮蓝图标；发送（蓝底白机）/停止（红底白方块）。
+        albumIconSrc() {
+            return this.isDark ? 'icons/album-dark.png' : 'icons/album.png'
+        },
+        sendIconSrc() {
+            if (this.sending) return this.isDark ? 'icons/stop-dark.png' : 'icons/stop.png'
+            if (!this.canSend()) return this.isDark ? 'icons/send-blue-dark.png' : 'icons/send-blue.png'
+            return this.isDark ? 'icons/send-dark.png' : 'icons/send.png'
+        },
+        closeIconSrc() {
+            return this.isDark ? 'icons/close-dark.png' : 'icons/close.png'
+        },
+        cameraIconSrc() {
+            return this.isDark ? 'icons/camera-dark.png' : 'icons/camera.png'
         },
         isLastAssistant(m) {
             const last = this.messages[this.messages.length - 1]
@@ -805,10 +1088,12 @@ export default {
             this.showDrawer = false
             this.syncMsg = ''
             this.$forceUpdate()
-            this.scrollToBottom()
+            // 切换会话不滚到底：短会话会被"锚点对齐上沿"式滚动把气泡滚出
+            // 视口（只剩"重试"按钮），历史会话从头看更自然
         },
         async deleteConversation(c) {
             this.reqSeq += 1
+            const cloudId = c && c.cloudId
             this.conversations = this.conversations.filter((x) => x.id !== c.id)
             await saveConversations(this.conversations)
             await deleteMessages(c.id)
@@ -834,6 +1119,32 @@ export default {
                 this.editingMsgId = null
             }
             this.$forceUpdate()
+            // 同步删云端会话（bug 3）：只删本地的话，下次「同步」会把这条会话
+            // 从云端再导回来，用户看到"删了又回来"。失败不阻断本地删除
+            // （本地已经删掉了），只把原因写进提示，用户能自己决定要不要重试。
+            if (cloudId) {
+                this.deleteCloudConversation(cloudId, c.title)
+            }
+        },
+        // 删除远端会话：失败时把原因显示在抽屉的同步提示里（不弹窗打扰）
+        async deleteCloudConversation(cloudId, title) {
+            try {
+                await deleteCloudSession({
+                    baseUrl: this.settings.baseUrl,
+                    apiKey: this.settings.apiKey,
+                    authMode: this.settings.authMode,
+                    sessionId: cloudId
+                })
+                appLog('[cloud] 已删除云端会话 ' + cloudId + '（' + (title || '') + '）')
+            } catch (e) {
+                const msg = e && e.message ? e.message : String(e)
+                this.syncMsg = '本地已删除，云端删除失败：' + msg + '（下次同步可能重新出现）'
+                if (isAccountSuspension(msg)) {
+                    recordAccountTrouble('删除云端会话', msg)
+                }
+                appLog('[cloud] 删除云端会话失败 ' + msg)
+                this.$forceUpdate()
+            }
         },
         async persistConversation(conv) {
             const exists = this.conversations.some((c) => c.id === conv.id)
@@ -894,6 +1205,12 @@ export default {
         },
 
         // ---------- 发送 / 重试 / 修改 ----------
+        // 发送前的本地校验失败提示（不写入消息，避免污染会话）
+        failSend(text) {
+            this.imageWarn = text
+            this.$forceUpdate()
+            try { appLog('[send] 已阻断：' + text) } catch (e) { /* 忽略 */ }
+        },
         async send() {
             if (this.sending) {
                 this.stopGeneration()
@@ -907,6 +1224,15 @@ export default {
             // 等待后台预压缩完成（若还没好），把 dataUrl 补进每个待发图片对象
             await Promise.all(images.map((i) => i.pending || Promise.resolve()))
             images.forEach((i) => { i.dataUrl = i.dataUrl || null })
+            const usable = images.filter((i) => i.dataUrl)
+            if (images.length && !usable.length) {
+                // 全部图片都超限：别发空消息，直接告知原因
+                this.failSend('图片过大无法发送（单图上限约 900KB），请换一张或先裁剪')
+                return
+            }
+            if (usable.length < images.length) {
+                this.imageWarn = '部分图片过大，无法发送（已跳过）'
+            }
 
             if (!this.activeConversation()) {
                 await this.newConversation()
@@ -981,6 +1307,7 @@ export default {
 
             this.draft = ''
             this.draftImages = []
+            this.imageWarn = ''
             conv.updatedAt = Date.now()
             await this.persistConversation(conv)
             await saveMessages(convId, this.messages)
@@ -1009,53 +1336,47 @@ export default {
                     conversationId: convId
                 }
 
-                const isStream = !!(this.settings && this.settings.sse === true)
-                let res = null
-                if (isStream) {
-                    console.error('GEN | using SSE stream')
-                    res = await chatStream(opts, {
-                        isCancelled: () => seq !== this.reqSeq || convId !== this.activeId,
-                        onToken: (token) => { this.streamToken = token },
-                        onDelta: (delta) => {
-                            if (seq !== this.reqSeq || convId !== this.activeId) return
-                            const m = this.messages.find((x) => x.id === pendingId)
-                            if (!m) return
-                            const att = m.attempts && m.attempts[m.activeAttempt]
-                            if (att) {
-                                att.content = (att.content || '') + delta
-                                m.content = att.content
-                            } else {
-                                m.content = (m.content || '') + delta
-                            }
-                            // 实时清洗内部标签，避免用户看到协议标签
-                            if (m.content) {
-                                const cleaned = stripInternalTags(m.content)
-                                if (cleaned !== m.content) {
-                                    if (att) att.content = cleaned
-                                    m.content = cleaned
-                                }
-                            }
-                            this.$forceUpdate()
-                            this.scrollToBottom()
-                        },
-                        onReasoning: (delta) => {
-                            if (seq !== this.reqSeq || convId !== this.activeId) return
-                            const m = this.messages.find((x) => x.id === pendingId)
-                            if (!m) return
-                            const att = m.attempts && m.attempts[m.activeAttempt]
-                            if (att) {
-                                att.reasoning = (att.reasoning || '') + delta
-                                m.reasoning = att.reasoning
-                            } else {
-                                m.reasoning = (m.reasoning || '') + delta
-                            }
-                            this.$forceUpdate()
+                // 流式（SSE）始终启用：逐字输出是设备上唯一可接受的体验，
+                // 非流式要等整段生成完才出字（开关已移除，见 store.js）
+                console.error('GEN | using SSE stream')
+                const res = await chatStream(opts, {
+                    isCancelled: () => seq !== this.reqSeq || convId !== this.activeId,
+                    onToken: (token) => { this.streamToken = token },
+                    onDelta: (delta) => {
+                        if (seq !== this.reqSeq || convId !== this.activeId) return
+                        const m = this.messages.find((x) => x.id === pendingId)
+                        if (!m) return
+                        const att = m.attempts && m.attempts[m.activeAttempt]
+                        if (att) {
+                            att.content = (att.content || '') + delta
+                            m.content = att.content
+                        } else {
+                            m.content = (m.content || '') + delta
                         }
-                    })
-                } else {
-                    console.error('GEN | using non-stream chat')
-                    res = await chat(opts)
-                }
+                        // 实时清洗内部标签，避免用户看到协议标签
+                        if (m.content) {
+                            const cleaned = stripInternalTags(m.content)
+                            if (cleaned !== m.content) {
+                                if (att) att.content = cleaned
+                                m.content = cleaned
+                            }
+                        }
+                        this.scheduleRender()
+                    },
+                    onReasoning: (delta) => {
+                        if (seq !== this.reqSeq || convId !== this.activeId) return
+                        const m = this.messages.find((x) => x.id === pendingId)
+                        if (!m) return
+                        const att = m.attempts && m.attempts[m.activeAttempt]
+                        if (att) {
+                            att.reasoning = (att.reasoning || '') + delta
+                            m.reasoning = att.reasoning
+                        } else {
+                            m.reasoning = (m.reasoning || '') + delta
+                        }
+                        this.scheduleRender()
+                    }
+                })
 
                 console.error('GEN | chat returned content len=' + (res && res.content ? res.content.length : 0))
                 if (seq !== this.reqSeq || convId !== this.activeId) {
@@ -1063,11 +1384,30 @@ export default {
                     return
                 }
 
+                // 上游限流：**立即停止，不做任何自动重试/续发**。
+                // 后端此时已让账号进入退避窗口；应用侧再自动发一次，就等于把
+                // 退避白等（bug 1：连续请求会被上游升级为禁言）。
+                if (res && res.rateLimited) {
+                    appLog('[generate] 上游限流，停止自动重试（' + (res.content || '') + '）')
+                    const rm = this.messages.find((x) => x.id === pendingId)
+                    if (rm) {
+                        const rAtt = rm.attempts && rm.attempts[rm.activeAttempt]
+                        if (rAtt) {
+                            rAtt.pending = false
+                            rAtt.error = res.content || '上游限流，请稍后再试'
+                        }
+                        rm.pending = false
+                        rm.error = res.content || '上游限流，请稍后再试'
+                    }
+                    this.$forceUpdate()
+                    return
+                }
+
                 // #12：非思考模式返回空内容时，自动按"深度思考开启"重试一次。
                 // thinking=OFF 是唯一返回空内容的场景（疑似 DeepSeek 服务端兼容问题），
                 // 自动回退保证用户总能拿到回复；根因以诊断日志持续观察。
                 if (res && !res.content && !res.reasoning && conv.thinking === false && !forceThinking) {
-                    appLog('[generate] 非思考模式返回空内容（mode=' + conv.mode + ' search=' + conv.search + ' sse=' + isStream + '），自动以思考模式重试 #12')
+                    appLog('[generate] 非思考模式返回空内容（mode=' + conv.mode + ' search=' + conv.search + '），自动以思考模式重试 #12')
                     return await this.generate(conv, convId, seq, pendingId, true)
                 }
 
@@ -1082,6 +1422,15 @@ export default {
                         await this.persistConversation(convNow)
                         appLog('[generate] 会话自动命名 => ' + convNow.title)
                     }
+                }
+                // 云端会话 id（后端随流末尾下发）：记下来，同步时按 id 去重，
+                // 本机这条对话就不会被当成"云端还有一条新的"重复导入（bug 3）
+                if (res && res.dsSessionId && convNow && convNow.cloudId !== res.dsSessionId) {
+                    convNow.cloudId = res.dsSessionId
+                    convNow.cloudLinked = true
+                    convNow.cloudLoaded = true
+                    await this.persistConversation(convNow)
+                    appLog('[generate] 记录云端会话 id => ' + res.dsSessionId)
                 }
 
                 const m = this.messages.find((x) => x.id === pendingId)
@@ -1113,19 +1462,26 @@ export default {
                 console.error('GEN | catch err=' + (e && e.message ? e.message : String(e)))
                 if (seq !== this.reqSeq || convId !== this.activeId) return
                 const msg = e && e.message ? e.message : '发生未知错误，请重试'
-                // 账号异常取证：疑似封号/禁言/鉴权失败时记录首次检出时间（#封号取证）
-                if (/被限制|禁言|封|空 SSE|HTTP_401|HTTP_403|未认证/.test(msg)) {
+                // 账号异常取证：只记"上游真的限制了这个账号"（禁言/封禁/空 SSE）。
+                // 401/未认证不算——那多半是本机后端没起来或 key 失配，记进来会把
+                // 用户和后续排查都引向"换账号"（bug 4）。
+                if (isAccountSuspension(msg)) {
                     recordAccountTrouble('对话', msg)
                 }
+                // 限流单独标记在消息上：重试按钮据此拦截，不再向已退避的后端发请求（bug 1）
+                const errCode = e && e.code ? String(e.code) : ''
+                const rateLimited = isRateLimitedError(e)
                 const m = this.messages.find((x) => x.id === pendingId)
                 if (m) {
                     const att = m.attempts && m.attempts[m.activeAttempt]
                     if (att) {
                         att.pending = false
                         att.error = e && e.message ? e.message : '发生未知错误，请重试'
+                        att.errorCode = rateLimited ? 'upstream_rate_limited' : errCode
                     }
                     m.pending = false
                     m.error = e && e.message ? e.message : '发生未知错误，请重试'
+                    m.errorCode = rateLimited ? 'upstream_rate_limited' : errCode
                 } else {
                     this.messages.push({
                         id: pendingId,
@@ -1133,8 +1489,9 @@ export default {
                         content: '',
                         pending: false,
                         error: e && e.message ? e.message : '发生未知错误，请重试',
+                        errorCode: rateLimited ? 'upstream_rate_limited' : errCode,
                         createdAt: Date.now(),
-                        attempts: [{ id: pendingId, content: '', pending: false, error: e && e.message ? e.message : '发生未知错误，请重试', createdAt: Date.now() }],
+                        attempts: [{ id: pendingId, content: '', pending: false, error: e && e.message ? e.message : '发生未知错误，请重试', errorCode: rateLimited ? 'upstream_rate_limited' : errCode, createdAt: Date.now() }],
                         activeAttempt: 0
                     })
                 }
@@ -1149,8 +1506,8 @@ export default {
                 if (seq === this.reqSeq && convId === this.activeId) {
                     await saveMessages(convId, this.messages)
                 }
-                this.$forceUpdate()
-                this.scrollToBottom()
+                // 结束前把节流的渲染补上（流式期间可能还有一帧没落地）
+                this.flushRender()
             }
         },
 
@@ -1159,6 +1516,13 @@ export default {
             const conv = this.activeConversation()
             if (!conv) return
             if (!m || m.role !== 'assistant') return
+            // 上游限流期间点「重试」= 再发一次请求，正是把限流升级成禁言的动作（bug 1）。
+            // 后端已让账号退避，这里直接拦住并说明原因，不再向后端发请求。
+            if (isRateLimitedError({ code: m.errorCode, message: m.error })) {
+                this.imageWarn = '上游正在限流：请等待一段时间再重试（连续请求会导致账号被禁言）'
+                this.$forceUpdate()
+                return
+            }
 
             // 不覆盖旧回复：在当前助手气泡上新增一次生成尝试
             const att = { id: uid('a'), content: '', reasoning: '', pending: true, createdAt: Date.now() }
@@ -1241,11 +1605,26 @@ export default {
             this.albumImages = []
             this.$forceUpdate()
             try {
-                this.albumImages = await listAlbum()
+                const list = await listAlbum()
+                // 逐张后台生成缩略图（原图 12MP 直接进 image 会堵死渲染线程，
+                // 真机表现为相册浮层全黑）：每张就绪立即刷新，列表渐进显示
+                this.albumImages = list
+                this.albumLoading = false
+                this.$forceUpdate()
+                for (const img of list) {
+                    const thumb = await ensureThumb(img.path)
+                    if (thumb !== img.path) {
+                        const item = this.albumImages.find((i) => i.path === img.path)
+                        if (item) {
+                            item.thumb = thumb
+                            this.$forceUpdate()
+                        }
+                    }
+                }
             } catch (e) {
                 this.albumError = e && e.message ? e.message : '无法访问相册'
+                this.albumLoading = false
             }
-            this.albumLoading = false
             this.$forceUpdate()
         },
         closePicker() {
@@ -1253,24 +1632,133 @@ export default {
             this.$forceUpdate()
         },
         pickImage(img) {
-            if (!this.draftImages.some((i) => i.path === img.path)) {
-                // 选中后立即在后台预压缩/base64，避免发送时 UI 卡顿。
-                // dataUrl 就绪前 pending 保持 Promise，发送时统一 await。
-                const item = { name: img.name, path: img.path, dataUrl: null, pending: null }
-                item.pending = readImageDataUrl(img.path)
-                    .then((du) => { item.dataUrl = du || null })
-                    .catch(() => { item.dataUrl = null })
-                this.draftImages.push(item)
-            }
+            this.addDraftImage(img.name, img.path)
             this.showPicker = false
             this.$forceUpdate()
         },
+        // ---------- 相机取景浮层（对齐手机选图体验：预览 → 快门 → 占一位待发）----------
+        async openCamera() {
+            if (this.showCamera) return
+            // 关掉相册浮层（camMode 也会隐藏它；显式关掉避免状态残留）
+            this.showPicker = false
+            this.showCamera = true
+            this.$forceUpdate()
+            // 帧循环取景：video29 抓帧转 JPG（与拍照同路径，方向一致横画面）
+            startFramePreview((jpg) => {
+                this.previewFrame = 'file://' + jpg
+                this.$forceUpdate()
+            })
+        },
+        closeCamera() {
+            this.showCamera = false
+            this.showConfirm = false
+            this.previewFrame = ''
+            stopFramePreview()
+            this.$forceUpdate()
+        },
+        // 快门：抓一帧 → 确认浮层（可裁剪，勾收进待发 / 环形箭头重拍）
+        async shoot() {
+            if (this.takingPhoto || !this.showCamera) return
+            this.takingPhoto = true
+            // 暂停取景循环：与拍照共用 video29，避免设备占用冲突
+            stopFramePreview()
+            this.$forceUpdate()
+            try {
+                const r = await capturePhoto()
+                if (!r.ok) {
+                    this.albumError = r.error || '拍照失败'
+                    this.$forceUpdate()
+                    return
+                }
+                this.confirmPath = r.path
+                // 确认页用 640 宽小图预览（全图 1920x1080 解码会堵渲染线程）
+                this.confirmSrc = 'file://' + (r.preview || r.path)
+                this.cropRatio = null
+                this.showConfirm = true
+            } catch (e) {
+                this.albumError = (e && e.message) || '拍照失败'
+            } finally {
+                this.takingPhoto = false
+                this.$forceUpdate()
+            }
+        },
+        // 裁剪比例循环：全图 → 1:1 → 4:3 → 16:9 → 全图
+        cycleCrop() {
+            const order = [null, '1:1', '4:3', '16:9']
+            const i = order.indexOf(this.cropRatio)
+            this.cropRatio = order[(i + 1) % order.length]
+            this.$forceUpdate()
+        },
+        // 确认：按比例裁剪后收进待发图片，退出相机
+        async confirmShot() {
+            if (this.takingPhoto) return
+            this.takingPhoto = true
+            this.$forceUpdate()
+            try {
+                const path = await cropFrame(this.confirmPath, this.cropRatio)
+                const name = String(path).split('/').pop()
+                this.addDraftImage(name, path)
+                this.closeCamera()
+            } finally {
+                this.takingPhoto = false
+                this.$forceUpdate()
+            }
+        },
+        // 重拍：关确认浮层回取景（重启取景帧循环）
+        retakeShot() {
+            this.showConfirm = false
+            this.confirmSrc = ''
+            this.confirmPath = ''
+            this.cropRatio = null
+            this.$forceUpdate()
+            startFramePreview((jpg) => {
+                this.previewFrame = 'file://' + jpg
+                this.$forceUpdate()
+            })
+        },
+        cropIconSrc() {
+            return this.isDark ? 'icons/crop-dark.png' : 'icons/crop.png'
+        },
+        checkIconSrc() {
+            // 确认钮是蓝底：用白色勾（蓝底蓝勾不可见）
+            return 'icons/check-ok.png'
+        },
+        redoIconSrc() {
+            return this.isDark ? 'icons/redo-dark.png' : 'icons/redo.png'
+        },
+        // 加入待发图片（相册选择与拍照共用）：后台预压缩，发送时统一 await
+        addDraftImage(name, path) {
+            this.imageWarn = ''
+            if (this.draftImages.some((i) => i.path === path)) return
+            const item = { name, path, dataUrl: null, pending: null }
+            item.pending = readImageDataUrl(path)
+                .then((du) => {
+                    item.dataUrl = du || null
+                    if (!item.dataUrl) this.setImageWarn()
+                    this.$forceUpdate()
+                })
+                .catch(() => {
+                    item.dataUrl = null
+                    this.setImageWarn()
+                })
+            this.draftImages.push(item)
+            this.$forceUpdate()
+        },
+        setImageWarn() {
+            // 单图上限 900KB（见 images.js）：超过就不随消息发送，提示用户换一张
+            this.imageWarn = '部分图片过大，无法发送（已跳过）'
+            this.$forceUpdate()
+        },
         // 把待发图片规整为存进消息的形态：等待预压缩完成，携带 dataUrl。
+        // 没有 dataUrl 的一律丢弃——把几 MB 原图内联进消息会把设备内存打爆（bug 2）。
         normalizeImages(images) {
-            return images.map((i) => ({ name: i.name, path: i.path, dataUrl: i.dataUrl || null }))
+            return images
+                .map((i) => ({ name: i.name, path: i.path, dataUrl: i.dataUrl || null }))
+                .filter((i) => !!i.dataUrl)
         },
         removeDraftImage(i) {
             this.draftImages.splice(i, 1)
+            if (!this.draftImages.length) this.imageWarn = ''
             this.$forceUpdate()
         },
 
@@ -1278,11 +1766,29 @@ export default {
         goSettings() {
             $falcon.navTo('settings')
         },
-        scrollToBottom() {
+        scrollToBottom(force = false) {
+            // 空态/无消息绝不滚动：anchor 不渲染（v-if），且短内容滚到底会把
+            // 仅有的几条消息滚出视口（Falcon scrollToElement 是"锚点对齐视口上沿"）
+            if (!this.messages || !this.messages.length) return
+            // 合并重复请求：锚点元素固定，多次排队滚动只在最后一帧有意义
+            if (this._scrollTimer) {
+                if (!force) return
+                clearTimeout(this._scrollTimer)
+            }
             const self = this
-            setTimeout(() => {
+            this._scrollTimer = setTimeout(() => {
+                self._scrollTimer = null
                 try {
-                    if (self.$refs.bottom && self.$page && self.$page.$dom) {
+                    if (!self.$page || !self.$page.$dom) return
+                    // 优先滚到"最后一条消息行"的上沿：短会话时目标位置在视口内、
+                    // 滚动量被钳制为 0（不滚过头）；长会话视线锚定最新回复行首。
+                    // 旧的"滚到内容末尾 anchor"会把气泡整体滚出视口（真机实证）。
+                    const last = self.chatMessages[self.chatMessages.length - 1]
+                    const ref = last && self.$refs['msg-' + last.id]
+                    const el = ref && (Array.isArray(ref) ? ref[ref.length - 1] : ref)
+                    if (el) {
+                        self.$page.$dom.scrollToElement(el)
+                    } else if (self.$refs.bottom) {
                         self.$page.$dom.scrollToElement(self.$refs.bottom)
                     }
                 } catch (e) {
@@ -1497,7 +2003,10 @@ export default {
     flex: 1;
 }
 .empty {
-    flex: 1;
+    /* 注意：绝不能用 flex:1 —— Falcon 引擎里 scroller 子项的 flex:1 会高度
+       塌陷为 0（真机实证：欢迎语完全不可见，改固定高度立即恢复）。
+       屏幕固定 936x280，顶栏约 55px，悬浮输入不占布局，消息区约 225px。 */
+    height: 220px;
     justify-content: center;
     align-items: center;
     padding: 40px 20px;
@@ -1618,6 +2127,34 @@ export default {
     line-height: 28px;
     color: #222222;
 }
+/* 数学公式（原生 <latex> 排版）：字号与正文一致，垂直居中；与相邻文字平级混排 */
+.md-math {
+    font-size: 20px;
+    color: #222222;
+}
+/* 独立成块的公式：整行居中，上下留白，视觉上与正文段落区分 */
+.md-math-block {
+    flex-direction: row;
+    justify-content: center;
+    align-items: center;
+    margin: 6px 0;
+}
+/* 块级公式回退（过长）：按普通段落展示，保证内容完整可换行 */
+.md-math-fallback {
+    font-size: 20px;
+    line-height: 28px;
+    color: #222222;
+}
+/* 块级公式回退（括号不配平）：原样显示源码，用等宽+底色表明"这是公式源码" */
+.md-math-src {
+    font-family: monospace;
+    font-size: 18px;
+    line-height: 26px;
+    color: #b04a2f;
+    background-color: #f6f7f9;
+    border-radius: 6px;
+    padding: 4px 8px;
+}
 .md-bold {
     font-weight: bold;
     color: #222222;
@@ -1661,6 +2198,56 @@ export default {
     border-left-color: #cccccc;
     padding-left: 10px;
     margin: 4px 0;
+}
+/* 表格：等宽列（flex:1），表头底色，行间横线；无竖线外框，走轻线条风格 */
+.md-table {
+    flex-direction: column;
+    margin: 4px 0;
+}
+.md-tr {
+    flex-direction: row;
+}
+.md-th {
+    flex: 1;
+    padding: 6px 8px;
+    background-color: #f2f3f5;
+    border-bottom-width: 1px;
+    border-bottom-color: #dddddd;
+}
+.md-td {
+    flex: 1;
+    flex-direction: row;
+    flex-wrap: wrap;
+    padding: 6px 8px;
+    border-bottom-width: 1px;
+    border-bottom-color: #eeeeee;
+}
+.md-th-text {
+    font-size: 18px;
+    line-height: 26px;
+    font-weight: bold;
+    color: #222222;
+}
+/* 删除线：~~text~~；颜色压灰一档，弱化"已作废"内容 */
+.md-strike {
+    text-decoration: line-through;
+    color: #999999;
+    font-size: 20px;
+    line-height: 28px;
+}
+/* 链接：只显示文字（设备无浏览器），下划线+蓝提示可点，URL 不上屏 */
+.md-link {
+    color: #2f6fed;
+    text-decoration: underline;
+    font-size: 20px;
+    line-height: 28px;
+}
+.md-bold-italic {
+    font-weight: bold;
+    font-style: italic;
+    color: #222222;
+    font-size: 20px;
+    line-height: 28px;
 }
 .md-hr {
     font-size: 16px;
@@ -1732,11 +2319,20 @@ export default {
     height: 1px;
 }
 
-.draft-imgs {
+/* 消息区底部留空：右下角悬浮输入组件不遮挡最后一条消息 */
+.msgs-tail-spacer {
+    height: 170px;
+}
+
+/* 待发图片：悬浮在输入组件上方，右对齐、不占通栏 */
+.draft-imgs-float {
+    position: absolute;
+    right: 14px;
+    bottom: 178px;
     flex-direction: row;
     flex-wrap: wrap;
-    background-color: #ffffff;
-    padding: 6px 12px 0 12px;
+    justify-content: flex-end;
+    max-width: 420px;
 }
 .draft-img {
     margin-right: 10px;
@@ -1760,50 +2356,79 @@ export default {
     font-size: 16px;
     text-align: center;
 }
+/* 图片超限提示（单图 900KB 上限，见 images.js） */
+.draft-warn {
+    font-size: 14px;
+    color: #d93025;
+    background-color: #fdecea;
+    padding: 4px 12px;
+}
 
-.inputbar {
-    flex-direction: row;
-    align-items: center;
-    background-color: #ffffff;
-    padding: 8px 8px 12px 8px;
+// 右下角悬浮输入组件：小文本框 + 相册/发送圆钮（不占消息区通栏）
+.float-input {
+    position: absolute;
+    right: 14px;
+    bottom: 14px;
+    flex-direction: column;
+    align-items: flex-end;
 }
-.upload {
-    font-size: 22px;
-    color: #1a73e8;
-    padding: 6px 10px;
-    margin-right: 4px;
-}
-.input-display {
-    flex: 1;
-    height: 44px;
+.float-textbox {
+    /* 与按钮组总宽一致（68+14+68），不超出 */
+    width: 150px;
+    height: 52px;
     justify-content: center;
-    background-color: #f2f3f5;
-    border-radius: 22px;
-    padding: 0 16px;
+    background-color: #ffffff;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: #dfe3e8;
+    padding: 0 14px;
+}
+.float-btns {
+    flex-direction: row;
+    margin-top: 10px;
+}
+.float-btn {
+    width: 68px;
+    height: 68px;
+    border-radius: 34px;
+    background-color: #ffffff;
+    border-width: 1px;
+    border-color: #dfe3e8;
+    align-items: center;
+    justify-content: center;
+    margin-left: 14px;
+}
+.float-icon-img {
+    width: 34px;
+    height: 34px;
+}
+.float-btn-send {
+    width: 68px;
+    height: 68px;
+    border-radius: 34px;
+    background-color: #1a73e8;
+    align-items: center;
+    justify-content: center;
+    margin-left: 14px;
+}
+.float-btn-stop {
+    width: 68px;
+    height: 68px;
+    border-radius: 34px;
+    background-color: #d93025;
+    align-items: center;
+    justify-content: center;
+    margin-left: 14px;
 }
 .input-display-text {
     font-size: 20px;
     color: #222222;
+    lines: 1;
+    text-overflow: ellipsis;
 }
 .input-display-text-ph {
     font-size: 20px;
     color: #999999;
-}
-.send {
-    font-size: 20px;
-    color: #ffffff;
-    background-color: #1a73e8;
-    border-radius: 18px;
-    padding: 8px 20px;
-    margin-left: 8px;
-}
-.send-disabled {
-    font-size: 20px;
-    color: #aaaaaa;
-    background-color: #e0e2e6;
-    border-radius: 18px;
-    padding: 8px 20px;
-    margin-left: 8px;
 }
 
 .drawer {
@@ -1912,17 +2537,180 @@ export default {
     text-align: center;
     padding: 30px 20px;
 }
-.picker-list {
+// 竖向相册网格：3 列缩略图 + 文件名
+.picker-vlist {
     flex: 1;
     background-color: #333333;
     padding: 12px;
 }
-.pick-thumb {
-    width: 140px;
-    height: 140px;
+.picker-grid {
+    flex-direction: row;
+    flex-wrap: wrap;
+    justify-content: space-between;
+}
+.pick-cell {
+    width: 218px;
+    margin-bottom: 12px;
+}
+.pick-thumb-v {
+    width: 218px;
+    height: 160px;
     border-radius: 8px;
-    margin-right: 12px;
     background-color: #555555;
+}
+.picker-photo-tip {
+    padding: 20px 10px 40px 10px;
+}
+.picker-photo-text {
+    font-size: 16px;
+    color: #90a4ae;
+    text-align: center;
+    line-height: 24px;
+}
+
+/* ========== 相机取景（计算器同款硬件预览：两侧板 + 中间透明洞） ========== */
+/* UI 层只画左右两侧（各 220px），中间 496px 完全不画——kmssink 的
+   DRM overlay 画面从中间透出。洞的几何 = 硬件 plane 输出区域
+   （面板中央 497x280），与计算器 camera-hole 同原理。 */
+.cam-stage {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    flex-direction: row;
+}
+.cam-side {
+    width: 220px;
+    background-color: #0d0d0d;
+}
+/* 中间"洞"区：不透明黑底（残影防护）+ 帧循环 image 铺满。
+   绝不能用透明背景——Falcon 跳过透明区域绘制会把进取景前的
+   旧画面（相册浮层）留在 UI surface 上。 */
+.cam-gap {
+    flex: 1;
+    position: relative;
+    background-color: #0d0d0d;
+}
+.cam-frame {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    right: 0;
+}
+.cam-side-r {
+    width: 220px;
+    background-color: #0d0d0d;
+    flex-direction: column;
+    align-items: center;
+    padding: 14px 0 20px 0;
+}
+.cam-close {
+    width: 46px;
+    height: 46px;
+}
+.cam-spacer {
+    flex: 1;
+}
+.camera-view {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background-color: #101418;
+}
+.camera-preview {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background-color: #000000;
+}
+.crop-label {
+    position: absolute;
+    top: 12px;
+    left: 0;
+    right: 0;
+    text-align: center;
+    font-size: 18px;
+    color: #ffffff;
+    background-color: rgba(0, 0, 0, 0.45);
+    padding: 4px 0;
+}
+/* 三个操作钮各自绝对定位（Weex flex row 对混合尺寸子项布局不稳定，
+   绝对定位是唯一确定的行为）。竖排一列（右侧，自下而上：确认/裁剪/重拍），
+   预览图 contain 后居中约 498 宽，右侧留黑正好放按钮列 */
+.confirm-btn-redo {
+    position: absolute;
+    right: 22px;
+    bottom: 190px;
+    width: 68px;
+    height: 68px;
+    border-radius: 34px;
+    background-color: rgba(255, 255, 255, 0.92);
+    align-items: center;
+    justify-content: center;
+}
+.confirm-btn-crop {
+    position: absolute;
+    right: 22px;
+    bottom: 106px;
+    width: 68px;
+    height: 68px;
+    border-radius: 34px;
+    background-color: rgba(255, 255, 255, 0.92);
+    align-items: center;
+    justify-content: center;
+}
+.confirm-btn-ok {
+    position: absolute;
+    right: 22px;
+    bottom: 22px;
+    width: 68px;
+    height: 68px;
+    border-radius: 34px;
+    background-color: #1a73e8;
+    align-items: center;
+    justify-content: center;
+}
+.confirm-icon {
+    width: 34px;
+    height: 34px;
+}
+.shutter-outer {
+    width: 84px;
+    height: 84px;
+    border-radius: 42px;
+    border-width: 5px;
+    border-color: #ffffff;
+    align-items: center;
+    justify-content: center;
+}
+.shutter-inner {
+    width: 62px;
+    height: 62px;
+    border-radius: 31px;
+    background-color: #ffffff;
+}
+/* 相机模式页面背景：不再透明（帧循环预览不依赖 overlay 透出） */
+.page-cam {
+    background-color: transparent;
+}
+/* 相册第一格：拍照入口（图标格，无文字） */
+.pick-camera {
+    width: 218px;
+    height: 160px;
+    border-radius: 8px;
+    background-color: #e8f0fe;
+    align-items: center;
+    justify-content: center;
+}
+.pick-camera-icon {
+    width: 52px;
+    height: 52px;
 }
 
 /* ========== 深色模式（引擎仅支持单类选择器，用 -dark 变体类切换） ========== */
@@ -2034,37 +2822,95 @@ export default {
     border-radius: 4px;
     padding: 0 4px;
 }
-.inputbar-dark {
-    flex-direction: row;
-    align-items: center;
-    background-color: #1e1e1e;
-    border-top-width: 1px;
-    border-top-color: #333333;
-    padding: 8px 8px 12px 8px;
+/* 数学公式（深色）：<latex> 的颜色取自 richtext 样式，必须显式给白色 */
+.md-math-dark {
+    font-size: 20px;
+    color: #ffffff;
 }
-.input-display-dark {
-    flex: 1;
-    height: 44px;
+.md-math-block-dark {
+    flex-direction: row;
+    justify-content: center;
+    align-items: center;
+    margin: 6px 0;
+}
+.md-math-fallback-dark {
+    font-size: 20px;
+    line-height: 28px;
+    color: #ffffff;
+}
+.md-math-src-dark {
+    font-family: monospace;
+    font-size: 18px;
+    line-height: 26px;
+    color: #ffb4a0;
+    background-color: #232323;
+    border-radius: 6px;
+    padding: 4px 8px;
+}
+.float-input-dark {
+    position: absolute;
+    right: 14px;
+    bottom: 14px;
+    flex-direction: column;
+    align-items: flex-end;
+}
+.float-textbox-dark {
+    /* 与按钮组总宽一致（68+14+68），不超出 */
+    width: 150px;
+    height: 52px;
     justify-content: center;
     background-color: #2a2a2a;
-    border-radius: 22px;
-    padding: 0 16px;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: #444444;
+    padding: 0 14px;
+}
+.float-btns-dark {
+    flex-direction: row;
+    margin-top: 10px;
+}
+.float-btn-dark {
+    width: 68px;
+    height: 68px;
+    border-radius: 34px;
+    background-color: #2a2a2a;
+    border-width: 1px;
+    border-color: #444444;
+    align-items: center;
+    justify-content: center;
+    margin-left: 14px;
+}
+.float-icon-img-dark {
+    width: 34px;
+    height: 34px;
+}
+.float-btn-send-dark {
+    width: 68px;
+    height: 68px;
+    border-radius: 34px;
+    background-color: #82b1ff;
+    align-items: center;
+    justify-content: center;
+    margin-left: 14px;
+}
+.float-btn-stop-dark {
+    width: 68px;
+    height: 68px;
+    border-radius: 34px;
+    background-color: #e05545;
+    align-items: center;
+    justify-content: center;
+    margin-left: 14px;
 }
 .input-display-text-dark {
     font-size: 20px;
     color: #ffffff;
+    lines: 1;
+    text-overflow: ellipsis;
 }
 .input-display-text-ph-dark {
     font-size: 20px;
     color: #ffffff;
-}
-.send-dark {
-    font-size: 20px;
-    color: #000000;
-    background-color: #82b1ff;
-    border-radius: 18px;
-    padding: 8px 20px;
-    margin-left: 8px;
 }
 .drawer-dark {
     position: absolute;
@@ -2136,6 +2982,154 @@ export default {
     background-color: #1e1e1e;
     padding: 12px;
 }
+.picker-vlist-dark {
+    flex: 1;
+    background-color: #191919;
+    padding: 12px;
+}
+.picker-grid-dark {
+    flex-direction: row;
+    flex-wrap: wrap;
+    justify-content: space-between;
+}
+.pick-cell-dark {
+    width: 218px;
+    margin-bottom: 12px;
+}
+.pick-thumb-v-dark {
+    width: 218px;
+    height: 160px;
+    border-radius: 8px;
+    background-color: #2a2a2a;
+}
+.picker-photo-tip-dark {
+    padding: 20px 10px 40px 10px;
+}
+.picker-photo-text-dark {
+    font-size: 16px;
+    color: #5f747f;
+    text-align: center;
+    line-height: 24px;
+}
+.cam-stage-dark {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    flex-direction: row;
+}
+.cam-side-dark {
+    width: 220px;
+    background-color: #0d0d0d;
+}
+.cam-gap-dark {
+    flex: 1;
+}
+.cam-side-r-dark {
+    width: 220px;
+    background-color: #0d0d0d;
+    flex-direction: column;
+    align-items: center;
+    padding: 14px 0 20px 0;
+}
+.cam-close-dark {
+    width: 46px;
+    height: 46px;
+}
+.cam-spacer-dark {
+    flex: 1;
+}
+.camera-view-dark {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background-color: #101418;
+}
+.camera-preview-dark {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background-color: #000000;
+}
+.crop-label-dark {
+    position: absolute;
+    top: 12px;
+    left: 0;
+    right: 0;
+    text-align: center;
+    font-size: 18px;
+    color: #ffffff;
+    background-color: rgba(0, 0, 0, 0.45);
+    padding: 4px 0;
+}
+.confirm-btn-redo-dark {
+    position: absolute;
+    right: 186px;
+    bottom: 22px;
+    width: 68px;
+    height: 68px;
+    border-radius: 34px;
+    background-color: rgba(255, 255, 255, 0.92);
+    align-items: center;
+    justify-content: center;
+}
+.confirm-btn-crop-dark {
+    position: absolute;
+    right: 104px;
+    bottom: 22px;
+    width: 68px;
+    height: 68px;
+    border-radius: 34px;
+    background-color: rgba(255, 255, 255, 0.92);
+    align-items: center;
+    justify-content: center;
+}
+.confirm-btn-ok-dark {
+    position: absolute;
+    right: 22px;
+    bottom: 22px;
+    width: 68px;
+    height: 68px;
+    border-radius: 34px;
+    background-color: #82b1ff;
+    align-items: center;
+    justify-content: center;
+}
+.confirm-icon-dark {
+    width: 34px;
+    height: 34px;
+}
+.shutter-outer-dark {
+    width: 84px;
+    height: 84px;
+    border-radius: 42px;
+    border-width: 5px;
+    border-color: #ffffff;
+    align-items: center;
+    justify-content: center;
+}
+.shutter-inner-dark {
+    width: 62px;
+    height: 62px;
+    border-radius: 31px;
+    background-color: #ffffff;
+}
+.page-cam-dark {
+    background-color: transparent;
+}
+.pick-camera-dark {
+    width: 218px;
+    height: 160px;
+    border-radius: 8px;
+    background-color: #16233a;
+    align-items: center;
+    justify-content: center;
+}
 .picker-title-dark {
     font-size: 20px;
     color: #ffffff;
@@ -2184,11 +3178,20 @@ export default {
     font-size: 16px;
     color: #ffffff;
 }
-.draft-imgs-dark {
+.draft-imgs-float-dark {
+    position: absolute;
+    right: 14px;
+    bottom: 178px;
     flex-direction: row;
     flex-wrap: wrap;
-    background-color: #1e1e1e;
-    padding: 6px 12px 0 12px;
+    justify-content: flex-end;
+    max-width: 420px;
+}
+.draft-warn-dark {
+    font-size: 14px;
+    color: #ff8a80;
+    background-color: #3d1f1f;
+    padding: 4px 12px;
 }
 
 /* ========== build 22 深色补全（#1/#7）：以下为模板中经 dc() 切换的类 ========== */
@@ -2235,6 +3238,53 @@ export default {
     border-left-color: #555555;
     padding-left: 10px;
     margin: 4px 0;
+}
+.md-table-dark {
+    flex-direction: column;
+    margin: 4px 0;
+}
+.md-tr-dark {
+    flex-direction: row;
+}
+.md-th-dark {
+    flex: 1;
+    padding: 6px 8px;
+    background-color: #2a2a2a;
+    border-bottom-width: 1px;
+    border-bottom-color: #444444;
+}
+.md-td-dark {
+    flex: 1;
+    flex-direction: row;
+    flex-wrap: wrap;
+    padding: 6px 8px;
+    border-bottom-width: 1px;
+    border-bottom-color: #3a3a3a;
+}
+.md-th-text-dark {
+    font-size: 18px;
+    line-height: 26px;
+    font-weight: bold;
+    color: #e8e8e8;
+}
+.md-strike-dark {
+    text-decoration: line-through;
+    color: #777777;
+    font-size: 20px;
+    line-height: 28px;
+}
+.md-link-dark {
+    color: #6ea8ff;
+    text-decoration: underline;
+    font-size: 20px;
+    line-height: 28px;
+}
+.md-bold-italic-dark {
+    font-weight: bold;
+    font-style: italic;
+    color: #e8e8e8;
+    font-size: 20px;
+    line-height: 28px;
 }
 .md-hr-dark {
     font-size: 16px;

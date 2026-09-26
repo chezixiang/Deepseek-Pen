@@ -125,8 +125,9 @@ pub(crate) async fn execute_tool_repair(
 
     let (calls, _) = tool_parser::parse_tool_calls_with(&wrapped, tag_config).ok_or_else(|| {
         OpenAIAdapterError::Internal(format!(
+            // 修复模型输出常含中文等多字节字符，直接按字节截断可能切在字符中间 panic
             "修复模型返回无法解析为工具调用: {}",
-            &text[..text.len().min(200)]
+            &text[..tool_parser::floor_char_boundary(&text, text.len().min(200))]
         ))
     })?;
 
@@ -278,6 +279,7 @@ impl Stream for RepairStream {
                                 service_tier: None,
                                 system_fingerprint: None,
                                 ds_title: None,
+                                ds_session_id: None,
                             })));
                         }
                         return Poll::Pending;
@@ -300,7 +302,12 @@ pin_project! {
         #[pin]
         inner: S,
         stop: Vec<String>,
+        model: String,
         stopped: bool,
+        // buffer 中已转发给客户端的字节数。为防 stop 序列跨 chunk 边界时
+        // 「前缀已转发、无法撤回」，转发位置永远落后 buffer 末尾至少
+        // max(stop 字节数)-1 字节（holdback）；残余在上游结束或收到
+        // 无 content 的 chunk（finish/usage 等）时冲出去。
         sent_len: usize,
         buffer: String,
         include_obfuscation: bool,
@@ -317,13 +324,31 @@ where
         let mut this = self.project();
         loop {
             match this.inner.as_mut().poll_next(cx) {
-                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(None) => {
+                    // 上游正常收尾（未命中 stop）：把 holdback 扣住的残余冲出去，
+                    // 否则最后一段内容会丢在本地 buffer 里。
+                    if !*this.stopped && *this.sent_len < this.buffer.len() {
+                        let tail = this.buffer[*this.sent_len..].to_string();
+                        *this.sent_len = this.buffer.len();
+                        return Poll::Ready(Some(Ok(converter::make_chunk(
+                            this.model,
+                            Delta {
+                                content: Some(tail),
+                                ..Default::default()
+                            },
+                            None,
+                        ))));
+                    }
+                    return Poll::Ready(None);
+                }
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
                 Poll::Ready(Some(Ok(mut chunk))) => {
                     if *this.stopped {
-                        // usage 尾随 chunk 与 ds_title 尾随 chunk（空 choices）继续放行
+                        // usage / ds_title / ds_session_id 尾随 chunk（空 choices）继续放行
                         if chunk.choices.is_empty()
-                            && (chunk.usage.is_some() || chunk.ds_title.is_some())
+                            && (chunk.usage.is_some()
+                                || chunk.ds_title.is_some()
+                                || chunk.ds_session_id.is_some())
                         {
                             return Poll::Ready(Some(Ok(chunk)));
                         }
@@ -345,18 +370,50 @@ where
                         this.buffer.push_str(content);
                         if let Some(pos) = find_stop_pos(this.buffer, this.stop) {
                             trace!(target: "adapter", ">>> stop: truncate at {}", pos);
-                            let truncated = &this.buffer[*this.sent_len..pos];
+                            // pos >= sent_len 恒成立：sent_len 落后 buffer 末尾至多
+                            // max(stop)-1 字节，而此处新命中的 stop 匹配必然起始于
+                            // 上一次检查之后（更早出现的匹配早已触发 stopped）。
+                            let truncated = this.buffer[*this.sent_len..pos].to_string();
                             if truncated.is_empty() {
                                 choice.delta.content = None;
                             } else {
-                                choice.delta.content = Some(truncated.to_string());
+                                choice.delta.content = Some(truncated);
                             }
                             choice.finish_reason = Some(FINISH_STOP);
                             *this.stopped = true;
                             this.buffer.clear();
-                            *this.sent_len = pos;
+                            *this.sent_len = 0;
                         } else {
+                            // 无命中：只转发安全前缀，扣住末尾 max(stop)-1 字节，
+                            // 防止下一片把 stop 序列补全时前缀已经发给客户端。
+                            let hold = this.stop.iter().map(|s| s.len()).max().unwrap_or(0);
+                            let limit = if hold <= 1 {
+                                this.buffer.len()
+                            } else {
+                                tool_parser::floor_char_boundary(
+                                    this.buffer,
+                                    // buffer 可能比 holdback 还短（中文 stop 6 字节 +
+                                    // 短内容），必须 saturating 防止减法下溢 panic
+                                    this.buffer.len().saturating_sub(hold - 1),
+                                )
+                            };
+                            let emit = this.buffer[*this.sent_len..limit].to_string();
+                            *this.sent_len = limit;
+                            choice.delta.content = if emit.is_empty() {
+                                None
+                            } else {
+                                Some(emit)
+                            };
+                        }
+                    } else if !*this.stopped && *this.sent_len < this.buffer.len() {
+                        // 无 content 的 chunk（finish / usage / reasoning 等）：
+                        // 把扣住的残余搭这趟车冲出去，避免流结束后才 flush 导致乱序。
+                        if let Some(choice) = chunk.choices.first_mut()
+                            && choice.delta.content.is_none()
+                        {
+                            let tail = this.buffer[*this.sent_len..].to_string();
                             *this.sent_len = this.buffer.len();
+                            choice.delta.content = Some(tail);
                         }
                     }
                     if *this.include_obfuscation && !chunk.choices.is_empty() {
@@ -388,6 +445,9 @@ pub(crate) struct StreamCfg {
     pub prompt_tokens: u32,
     pub repair_fn: Option<RepairFn>,
     pub tag_config: Arc<TagConfig>,
+    /// 本对话的云端会话 id（持久会话才有）：流末尾追加一个尾随 chunk 透传给客户端，
+    /// 供应用侧把本地会话与云端会话对上号（同步去重）。
+    pub session_id: Option<String>,
 }
 
 /// 流式响应：把 ds_core 字节流转换为 ChatCompletionsResponseChunk 流
@@ -417,7 +477,7 @@ where
     let after_repair: Pin<
         Box<dyn Stream<Item = Result<ChatCompletionsResponseChunk, OpenAIAdapterError>> + Send>,
     > = if let Some(f) = cfg.repair_fn {
-        Box::pin(RepairStream::new(tool_boxed, f, model))
+        Box::pin(RepairStream::new(tool_boxed, f, model.clone()))
     } else {
         tool_boxed
     };
@@ -425,12 +485,22 @@ where
     let stop_detect = StopDetectStream {
         inner: after_repair,
         stop: cfg.stop,
+        model: model.clone(),
         stopped: false,
         sent_len: 0,
         buffer: String::new(),
         include_obfuscation: cfg.include_obfuscation,
     };
-    Box::pin(stop_detect)
+    // 持久会话：末尾追加会话 id 尾随 chunk（与 ds_title 同形态），供应用侧做云端会话关联
+    match cfg.session_id {
+        Some(sid) => {
+            let tail = futures::stream::once(futures::future::ready(Ok(
+                converter::make_session_chunk(&model, sid),
+            )));
+            Box::pin(stop_detect.chain(tail))
+        }
+        None => Box::pin(stop_detect),
+    }
 }
 
 /// 非流式响应：stream() 的下游收集器，纯重组无特殊逻辑
@@ -466,6 +536,7 @@ where
     let mut tool_calls: Option<Vec<ToolCall>> = None;
     let mut usage = None;
     let mut ds_title: Option<String> = None;
+    let mut ds_session_id: Option<String> = None;
     let mut finish_reason: Option<&'static str> = None;
 
     while let Some(res) = chunk_stream.next().await {
@@ -474,6 +545,11 @@ where
         if id.is_empty() {
             id = chunk.id;
             created = chunk.created;
+        }
+
+        if let Some(sid) = chunk.ds_session_id {
+            ds_session_id = Some(sid);
+            continue;
         }
 
         if let Some(t) = chunk.ds_title {
@@ -555,6 +631,7 @@ where
         service_tier: None,
         system_fingerprint: None,
         ds_title,
+        ds_session_id,
     };
 
     debug!(
@@ -674,6 +751,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                session_id: None,
             },
         )))
         .await;
@@ -704,6 +782,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                session_id: None,
             },
         )
         .await
@@ -726,6 +805,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                session_id: None,
             },
         )
         .await
@@ -752,6 +832,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                session_id: None,
             },
         )
         .await
@@ -777,6 +858,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                session_id: None,
             },
         )
         .await
@@ -832,6 +914,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                session_id: None,
             },
         )))
         .await;
@@ -869,6 +952,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                session_id: None,
             },
         )))
         .await;
@@ -913,6 +997,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                session_id: None,
             },
         )))
         .await;
@@ -956,6 +1041,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                session_id: None,
             },
         )))
         .await;
@@ -1017,6 +1103,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                session_id: None,
             },
         )))
         .await;
@@ -1064,6 +1151,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                session_id: None,
             },
         )))
         .await;
@@ -1128,6 +1216,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                session_id: None,
             },
         )
         .await
@@ -1167,6 +1256,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                session_id: None,
             },
         )))
         .await;
@@ -1224,6 +1314,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                session_id: None,
             },
         )))
         .await;
@@ -1274,6 +1365,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                session_id: None,
             },
         )))
         .await;
@@ -1316,6 +1408,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                session_id: None,
             },
         )))
         .await;
@@ -1347,6 +1440,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                session_id: None,
             },
         )))
         .await;
@@ -1386,9 +1480,93 @@ mod tests {
         // 最后一个 chunk 的 finish_reason 应该是 tool_calls
         let last = chunks.last().unwrap();
         assert_eq!(
-            last["choices"][0]["finish_reason"], "tool_calls",
-            "finish_reason should be tool_calls, got {:?}",
-            last["choices"][0]["finish_reason"]
+        last["choices"][0]["finish_reason"], "tool_calls",
+        "finish_reason should be tool_calls, got {:?}",
+        last["choices"][0]["finish_reason"]
+    );
+    }
+
+    // ── StopDetectStream 回归（stop 序列跨 chunk 边界） ──────────────────
+
+    async fn run_stop_stream(pieces: &[(&str, &str)], stop: Vec<String>) -> Vec<serde_json::Value> {
+        let frames = make_ds_stream(pieces, None);
+        let bytes_stream = futures::stream::iter(frames);
+        collect_chunks(to_bytes_stream(super::stream(
+            bytes_stream,
+            "m".into(),
+            super::StreamCfg {
+                include_usage: false,
+                include_obfuscation: false,
+                stop,
+                prompt_tokens: 0,
+                repair_fn: None,
+                tag_config: default_tag_config(),
+                session_id: None,
+            },
+        )))
+        .await
+    }
+
+    fn joined_content(chunks: &[serde_json::Value]) -> String {
+        chunks
+            .iter()
+            .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
+            .collect()
+    }
+
+    /// P0 回归：stop 序列跨 chunk 边界。旧实现把已转发前缀记进 sent_len 后
+    /// 用 buffer[sent_len..pos] 截断——"abc" + "d"（stop="cd"）时 pos(2) <
+    /// sent_len(3)，切片直接 panic；release 是 panic=abort，等于杀掉整个
+    /// 服务进程。修复后 holdback 扣住末尾，命中时截在正确位置。
+    #[tokio::test]
+    async fn stream_stop_straddling_chunk_boundary() {
+        // "abcd" 每 3 字符一片 → "abc" + "d"，stop="cd" 恰好跨片
+        let chunks = run_stop_stream(&[("abcd", "RESPONSE")], vec!["cd".to_string()]).await;
+        assert_eq!(joined_content(&chunks), "ab", "stop 前内容完整且不含 stop 序列");
+        assert_eq!(chunks.last().unwrap()["choices"][0]["finish_reason"], "stop");
+    }
+
+    /// holdback 轮次：内容尾部被扣住，stop 在后续片上补全时一并截断
+    #[tokio::test]
+    async fn stream_stop_hit_after_holdback() {
+        // "abxy" → "abx" + "y"，stop="xy" 从片 2 开始
+        let chunks = run_stop_stream(&[("abxy", "RESPONSE")], vec!["xy".to_string()]).await;
+        assert_eq!(joined_content(&chunks), "ab");
+        assert_eq!(chunks.last().unwrap()["choices"][0]["finish_reason"], "stop");
+    }
+
+    /// 中文 stop 序列 + 短内容：holdback 字节数可能大于 buffer，
+    /// 旧修复（减法下溢）与新行为都要保证不 panic、内容最终完整冲出去
+    #[tokio::test]
+    async fn stream_no_stop_flushes_multibyte_tail_at_end() {
+        // "结果好" 9 字节按 3 字节切片；stop="结束" 6 字节 → holdback=5，
+        // 第一片（3 字节）时 buffer 比 holdback 还短
+        let chunks = run_stop_stream(&[("结果好", "RESPONSE")], vec!["结束".to_string()]).await;
+        assert_eq!(joined_content(&chunks), "结果好", "未命中 stop 时内容必须完整（含 holdback 残余）");
+        // finish_reason 由 converter 合并在最后一个上游内容 chunk 上；
+        // holdback 残余经合成 chunk 在其后冲出（finish_reason=None），
+        // 所以这里断言「finish 出现过」而不是「最后一个 chunk 带 finish」
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c["choices"][0]["finish_reason"] == "stop"),
+            "应有 finish_reason=stop"
         );
+    }
+
+    /// 中文内容命中中文 stop：截断点必须落在字符边界
+    #[tokio::test]
+    async fn stream_stop_multibyte_boundary() {
+        let chunks = run_stop_stream(&[("结果结束", "RESPONSE")], vec!["结束".to_string()]).await;
+        assert_eq!(joined_content(&chunks), "结果");
+        assert_eq!(chunks.last().unwrap()["choices"][0]["finish_reason"], "stop");
+    }
+
+    /// 无 stop 配置时行为与旧版逐字节一致（回归保护：holdback 路径不启用）
+    #[tokio::test]
+    async fn stream_no_stop_passthrough() {
+        let chunks = run_stop_stream(&[("hello 世界", "RESPONSE")], vec![]).await;
+        assert_eq!(joined_content(&chunks), "hello 世界");
+        assert_eq!(chunks.last().unwrap()["choices"][0]["finish_reason"], "stop");
     }
 }

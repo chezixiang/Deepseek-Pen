@@ -1,60 +1,28 @@
 // DES 往返自测：encrypt → b64 → decode → decrypt → 明文
-use sm_des::{sm_des_decrypt_ecb_zero_pad, sm_des_encrypt_ecb_zero_pad};
-
-fn b64e(data: &[u8]) -> String {
-    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        out.push(T[(n >> 18) as usize & 63] as char);
-        out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
-    }
-    out
-}
-
-fn b64d(s: &str) -> Vec<u8> {
-    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut vals = Vec::new();
-    for c in s.bytes() {
-        if c == b'=' {
-            break;
-        }
-        let v = T.iter().position(|t| *t == c).expect("bad b64") as u32;
-        vals.push(v);
-    }
-    let mut out = Vec::new();
-    for chunk in vals.chunks(4) {
-        let mut n = 0u32;
-        for (i, v) in chunk.iter().enumerate() {
-            n |= v << (18 - 6 * i);
-        }
-        out.push((n >> 16) as u8);
-        if chunk.len() > 1 {
-            out.push((n >> 8) as u8);
-        }
-        if chunk.len() > 2 {
-            out.push(n as u8);
-        }
-    }
-    out
-}
+//
+// 历史注记：本测试曾长期失败，根因不在 sm_des 实现（与官方 SDK JS 逐字节
+// 一致，见 src/sm_des.rs 的 known-answer 测试），而在本测试脚本自己：
+//   1. 手写的 b64d 在末尾 2/3 值分组会多吐一个 0x00 字节（条件写反：
+//      4 值组才出 3 字节、3 值组出 2 字节、2 值组出 1 字节）；
+//   2. `b as char` 再 collect 成 String 会把 >=0x80 的字节按 UTF-8 重新编码，
+//      交给 &str 版解密函数时密文早已被改写；
+//   3. 断言没有剥掉加密时补的 \0 padding（JS 参考实现同样返回带 padding 的块）。
+// 修正：统一用库内的 sm_base64_decode / *_bytes 变体，断言前 trim \0。
+use sm_des::{
+    sm_base64_decode, sm_base64_encode, sm_des_decrypt_ecb_zero_pad_bytes,
+    sm_des_encrypt_ecb_zero_pad,
+};
 
 #[test]
 fn des_roundtrip() {
     let key = "ysu63re6";
     let pt = "-480";
     let ct_bytes = sm_des_encrypt_ecb_zero_pad(key, pt);
-    let ct_b64 = b64e(&ct_bytes);
-    println!("ct_bytes = {:02x?}", ct_bytes);
-    println!("ct_b64   = {ct_b64}  (期望 uMfKlkexGvw=)");
-    let decoded = b64d(&ct_b64);
-    println!("decoded  = {:02x?}", decoded);
-    let ct_str: String = decoded.iter().map(|b| *b as char).collect();
-    let back = sm_des_decrypt_ecb_zero_pad(key, &ct_str);
-    println!("back     = {:02x?}", back);
-    println!("back_str = {}", String::from_utf8_lossy(&back));
-    assert_eq!(String::from_utf8_lossy(&back), pt);
+    let ct_b64 = sm_base64_encode(&ct_bytes);
+    assert_eq!(ct_b64, "uMfKlkexGvw=", "密文应与官方 SDK JS 输出一致");
+    let decoded = sm_base64_decode(&ct_b64);
+    assert_eq!(decoded, ct_bytes, "base64 解码应无损还原密文字节");
+    let back = sm_des_decrypt_ecb_zero_pad_bytes(key.as_bytes(), &decoded);
+    let back_str = String::from_utf8(back).unwrap();
+    assert_eq!(back_str.trim_end_matches('\0'), pt);
 }

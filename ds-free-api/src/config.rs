@@ -171,10 +171,10 @@ pub struct DeepSeekConfig {
     /// 达到上限的账号在本窗口内不再被分配，由池中其他账号承接。
     #[serde(default = "default_hourly_request_quota")]
     pub hourly_request_quota: u64,
-    /// 未显式传入 `web_search_options` 时是否默认开启搜索模式（默认 true）
+    /// 未显式传入 `web_search_options` 时是否默认开启搜索模式（默认 false）
     ///
-    /// `true` 保持历史行为（始终搜索）；设为 `false` 则严格遵循 OpenAI 语义
-    /// （未传即关闭），可减少 DeepSeek 侧的系统提示词注入。
+    /// `false` 严格遵循 OpenAI 语义（未传即关闭），可减少 DeepSeek 侧的
+    /// 系统提示词注入，也避免"每次对话都搜索"这一非人分布（风控差异 #8）。
     #[serde(default = "default_search_enabled")]
     pub default_search_enabled: bool,
     /// 设备指纹配置（可选；留空则从运行环境动态采集硬件特征）
@@ -300,9 +300,11 @@ fn default_hourly_request_quota() -> u64 {
     60
 }
 
-/// 未传 `web_search_options` 时默认开启搜索（与历史行为一致）
+/// 未传 `web_search_options` 时默认关闭搜索（风控差异 #8）：
+/// 100% 的对话都开搜索在真实用户分布里几乎不存在（官方极少用户全搜），
+/// 联网需求由应用侧显式传 web_search_options 表达。
 fn default_search_enabled() -> bool {
-    true
+    false
 }
 
 /// HIF 动态凭据自动拉取默认开启（与真实浏览器行为一致，失败自动降级为不发）
@@ -359,6 +361,11 @@ pub struct ServerConfig {
     /// 调试模式：true 时监听 0.0.0.0（方便外部调试），忽略 host 字段
     #[serde(default)]
     pub debug: bool,
+    /// 网络抓取：true 时把发往上游（DeepSeek/数美）的全部 HTTP 往返逐条落盘
+    /// logs/net-capture.jsonl（JSONL，见 server::net_capture）。
+    /// 词典笔端由设置页「启用调试日志」开关联动写入；改值需重启后端生效。
+    #[serde(default)]
+    pub net_capture: bool,
 }
 
 fn default_cors_origins() -> Vec<String> {
@@ -481,6 +488,7 @@ impl Config {
                     port: 22217,
                     cors_origins: default_cors_origins(),
                     debug: false,
+                    net_capture: false,
                 },
                 proxy: ProxyConfig::default(),
                 admin: AdminConfig::default(),
@@ -530,11 +538,8 @@ impl Config {
         let mut seen_keys = std::collections::HashSet::new();
         for k in &self.api_keys {
             if !seen_keys.insert(&k.key) {
-                let prefix = if k.key.len() > 12 {
-                    &k.key[..12]
-                } else {
-                    &k.key
-                };
+                // key 是用户可控输入，按字节截前缀在多字节字符中间会 panic
+                let prefix: String = k.key.chars().take(12).collect();
                 return Err(ConfigError::Validation(format!(
                     "API key 重复: {}...",
                     prefix
@@ -551,8 +556,12 @@ impl Config {
         std::fs::rename(&tmp, path.as_ref())?;
         #[cfg(unix)]
         {
+            // 0644 而非 0600：词典笔应用侧的 fs.readFile 在部分机型上以非 root
+            // 身份运行，0600（root 属主）会让应用读不到本文件，报
+            // "无法读取 ds-free-api 配置文件"（10201）。内容仅限本机，
+            // 应用本就能经 execShell 以 root 读写它，放宽权限不扩大暴露面。
             use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
+            let perms = std::fs::Permissions::from_mode(0o644);
             std::fs::set_permissions(path.as_ref(), perms)?;
         }
         Ok(())
@@ -572,4 +581,50 @@ pub enum ConfigError {
     Cli(String),
     #[error("TOML 序列化错误: {0}")]
     TomlSerialization(#[from] toml::ser::Error),
+}
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+
+    fn base_config() -> Config {
+        Config {
+            accounts: Vec::new(),
+            deepseek: DeepSeekConfig::default(),
+            server: ServerConfig {
+                host: "127.0.0.1".into(),
+                port: 22217,
+                cors_origins: default_cors_origins(),
+                debug: false,
+                net_capture: false,
+            },
+            proxy: ProxyConfig::default(),
+            admin: AdminConfig::default(),
+            api_keys: Vec::new(),
+        }
+    }
+
+    /// 回归：validate() 曾用 &k.key[..12] 按字节截前缀拼错误信息，
+    /// 多字节（中文）key 一旦重复，启动时不是返回配置错误而是 panic。
+    #[test]
+    fn duplicate_multibyte_api_key_errors_cleanly() {
+        let mut cfg = base_config();
+        let key = "中文密钥中文密钥中文密钥";
+        cfg.api_keys = vec![
+            ApiKeyEntry { key: key.into(), description: "a".into() },
+            ApiKeyEntry { key: key.into(), description: "b".into() },
+        ];
+        let err = cfg.validate().expect_err("重复 key 必须报错");
+        let msg = err.to_string();
+        assert!(msg.contains("重复"), "错误信息应说明 key 重复: {msg}");
+    }
+
+    #[test]
+    fn distinct_api_keys_pass_validation() {
+        let mut cfg = base_config();
+        cfg.api_keys = vec![
+            ApiKeyEntry { key: "key-one".into(), description: String::new() },
+            ApiKeyEntry { key: "key-two".into(), description: String::new() },
+        ];
+        cfg.validate().expect("不同 key 应通过校验");
+    }
 }

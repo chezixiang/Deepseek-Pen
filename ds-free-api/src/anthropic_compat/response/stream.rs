@@ -359,6 +359,7 @@ mod tests {
             service_tier: None,
             system_fingerprint: None,
             ds_title: None,
+        ds_session_id: None,
         }
     }
 
@@ -381,6 +382,7 @@ mod tests {
             service_tier: None,
             system_fingerprint: None,
             ds_title: None,
+        ds_session_id: None,
         }
     }
 
@@ -403,6 +405,7 @@ mod tests {
             service_tier: None,
             system_fingerprint: None,
             ds_title: None,
+        ds_session_id: None,
         }
     }
 
@@ -425,6 +428,7 @@ mod tests {
             service_tier: None,
             system_fingerprint: None,
             ds_title: None,
+        ds_session_id: None,
         }
     }
 
@@ -444,6 +448,7 @@ mod tests {
             service_tier: None,
             system_fingerprint: None,
             ds_title: None,
+        ds_session_id: None,
         }
     }
 
@@ -464,6 +469,7 @@ mod tests {
             service_tier: None,
             system_fingerprint: None,
             ds_title: None,
+        ds_session_id: None,
         }
     }
 
@@ -483,6 +489,7 @@ mod tests {
             service_tier: None,
             system_fingerprint: None,
             ds_title: None,
+        ds_session_id: None,
         }
     }
 

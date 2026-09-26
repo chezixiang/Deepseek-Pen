@@ -201,7 +201,7 @@ fn next_call_id() -> String {
     format!("call_{:016x}", n)
 }
 
-fn floor_char_boundary(s: &str, max: usize) -> usize {
+pub(super) fn floor_char_boundary(s: &str, max: usize) -> usize {
     if max >= s.len() {
         return s.len();
     }
@@ -386,7 +386,10 @@ fn parse_invoke_calls(inner: &str, prefix: &str, suffix: &str) -> Option<(Vec<To
     use std::collections::BTreeMap;
     let mut calls = Vec::new();
     let mut pos = 0;
-    let lower = inner.to_lowercase();
+    // 必须用 ASCII 小写：to_lowercase() 对某些字符（如 İ）会改变字节长度，
+    // 在副本上找到的偏移量就不能再用于切原串。标签本身都是 ASCII，
+    // ASCII 小写不改变字节长度，偏移量对原串依然有效。
+    let lower = inner.to_ascii_lowercase();
     while let Some(invoke_start) = lower[pos..].find("<invoke ") {
         let abs_start = pos + invoke_start;
         let name_attr = &inner[abs_start..];
@@ -399,7 +402,7 @@ fn parse_invoke_calls(inner: &str, prefix: &str, suffix: &str) -> Option<(Vec<To
         let invoke_body = &inner[abs_start..abs_start + close_pos + close_tag.len()];
         let mut params: BTreeMap<String, serde_json::Value> = BTreeMap::new();
         let mut ppos = 0;
-        let body_lower = invoke_body.to_lowercase();
+        let body_lower = invoke_body.to_ascii_lowercase();
         while let Some(p_start) = body_lower[ppos..].find("<parameter ") {
             let p_abs = ppos + p_start;
             let p_attr = &invoke_body[p_abs..];
@@ -455,6 +458,7 @@ fn make_end_chunk(
         service_tier: None,
         system_fingerprint: None,
         ds_title: None,
+        ds_session_id: None,
     }
 }
 
@@ -543,6 +547,7 @@ where
                     service_tier: None,
                     system_fingerprint: None,
                     ds_title: None,
+        ds_session_id: None,
                 })));
             }
 
@@ -985,5 +990,19 @@ mod tests {
         );
         let (calls, _) = parse_tool_calls(&xml).unwrap();
         assert_eq!(calls.len(), 1);
+    }
+
+    /// 回归：to_lowercase 对 'İ'（U+0130）会改变字节长度，旧版在小写副本上
+    /// 找到的偏移量直接切原串，产生错误切片甚至 panic。改用 ASCII 小写
+    /// （字节数不变）后，含土耳其字符/中文的参数值应原样保留。
+    #[test]
+    fn parse_invoke_calls_multibyte_case_expansion() {
+        let inner = "<invoke name=\"f\"><parameter name=\"q\">\"İstanbul 北京\"</parameter></invoke>";
+        let (calls, _) = parse_invoke_calls(inner, "", "").expect("含多字节字符也应解析出调用");
+        assert_eq!(calls[0].function.as_ref().unwrap().name, "f");
+        assert_eq!(
+            calls[0].function.as_ref().unwrap().arguments,
+            "{\"q\":\"İstanbul 北京\"}"
+        );
     }
 }

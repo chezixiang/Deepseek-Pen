@@ -1,0 +1,21 @@
+# 本文件已被 git 跟踪（.gitignore 里对它开了例外），是仓库的交叉编译契约：
+# 默认 target 钉在 aarch64（词典笔），宿主机跑测试/构建必须显式覆盖，
+# 见 run-host-tests.sh / build-deploy.sh / .github/workflows/ci.yml。
+#
+# 国内镜像加速走用户级配置（~/.cargo/config.toml，rsproxy 官方推荐装法），
+# 不写在这里 —— 否则 GitHub CI 的 crate 下载也要绕道第三方镜像。
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+[env]
+CC_aarch64_unknown_linux_gnu = "aarch64-linux-gnu-gcc"
+CXX_aarch64_unknown_linux-gnu = "aarch64-linux-gnu-g++"
+AR_aarch64_unknown_linux_gnu = "aarch64-linux-gnu-ar"
+
+CC = "aarch64-linux-gnu-gcc"
+CXX = "aarch64-linux-gnu-g++"
+AR = "aarch64-linux-gnu-ar"
+
+[build]
+target = "aarch64-unknown-linux-gnu"

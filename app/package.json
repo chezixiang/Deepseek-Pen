@@ -1,6 +1,6 @@
 {
   "name": "Deepseek",
-  "version": "0.1.2",
+  "version": "0.1.4",
   "description": "Deepseek 聊天客户端（有道词典笔版，对接 ds-free-api）",
   "appid": "8000000000182376",
   "icon": "app_icon.png",
@@ -18,7 +18,12 @@
     "build:web": "npx -y node@18 node_modules/aiot-vue-cli/src/cli.js build-web",
     "build:simulator": "npx -y node@18 node_modules/aiot-vue-cli/src/cli.js simulator ./",
     "upload": "npx -y node@18 node_modules/aiot-vue-cli/src/cli.js upload -n",
-    "check": "npx -y node@18 node_modules/aiot-vue-cli/src/cli.js check"
+    "check": "npx -y node@18 node_modules/aiot-vue-cli/src/cli.js check",
+    "audit:template": "node scripts/audit-text-nesting.js",
+    "test:latex": "node scripts/test-latex.mjs",
+    "test:config": "node scripts/test-config-parse.mjs",
+    "test": "node scripts/test-latex.mjs && node scripts/test-config-parse.mjs && node scripts/test-ratelimit.mjs && node scripts/test-ds-text.mjs && node scripts/test-markdown.mjs && node scripts/test-store-schema.mjs && node scripts/test-emoji.mjs",
+    "test:ratelimit": "node scripts/test-ratelimit.mjs"
   },
   "dependencies": {
     "falcon-ui": "^2.0.2",

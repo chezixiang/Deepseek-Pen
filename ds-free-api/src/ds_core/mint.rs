@@ -371,6 +371,23 @@ pub async fn mint_device_id(user_agent: &str) -> Result<(String, String), String
         log::info!(target: "device_mint", "已落盘调试数据: {dump}.payload.json / .body.json");
     }
 
+    let cid = crate::server::net_capture::begin();
+    {
+        let mut rec_headers = wreq::header::HeaderMap::new();
+        rec_headers.insert("Origin", "https://chat.deepseek.com".parse().map_err(|e| format!("Origin: {e}"))?);
+        rec_headers.insert("Referer", "https://chat.deepseek.com/".parse().map_err(|e| format!("Referer: {e}"))?);
+        rec_headers.insert(
+            wreq::header::CONTENT_TYPE,
+            wreq::header::HeaderValue::from_static("application/json"),
+        );
+        crate::server::net_capture::req(
+            cid,
+            "POST",
+            SM_API_URL,
+            &rec_headers,
+            Some(Value::String(body.to_string())),
+        );
+    }
     let client = wreq::Client::builder()
         .user_agent(user_agent.to_string())
         .build()
@@ -382,11 +399,16 @@ pub async fn mint_device_id(user_agent: &str) -> Result<(String, String), String
         .json(&body)
         .timeout(std::time::Duration::from_secs(10))
         .send()
-        .await
-        .map_err(|e| format!("注册请求失败: {e}"))?;
+        .await;
+    match &resp {
+        Ok(r) => crate::server::net_capture::resp(cid, r.status().as_u16(), r.headers(), false),
+        Err(e) => crate::server::net_capture::err(cid, &e.to_string()),
+    }
+    let resp = resp.map_err(|e| format!("注册请求失败: {e}"))?;
 
     let status = resp.status();
     let text = resp.text().await.map_err(|e| format!("读取响应: {e}"))?;
+    crate::server::net_capture::body(cid, text.as_bytes(), false);
     if !status.is_success() {
         return Err(format!("注册 HTTP {}", status.as_u16()));
     }
@@ -401,7 +423,10 @@ pub async fn mint_device_id(user_agent: &str) -> Result<(String, String), String
             return Ok((format!("B{id}"), smid));
         }
     }
-    Err(format!("注册未通过: {}", &text[..text.len().min(200)]))
+    Err(format!(
+        "注册未通过: {}",
+        &text[..super::floor_utf8_end(&text, text.len().min(200))]
+    ))
 }
 
 #[cfg(test)]

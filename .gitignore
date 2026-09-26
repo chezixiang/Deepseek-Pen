@@ -24,6 +24,10 @@ app/src/services/ds-free-api-aarch64
 /ds-free-api-aarch64
 # test leftovers
 resp_test.json
+# 真机崩溃复现用的临时工作目录（.bench/ 下的脚本、注入用例、抓下来的日志与 dmp）
+.bench/
+# UI 调试过程中的临时截图（.shots/）
+.shots/
 
 # ---- Rust ----
 target/

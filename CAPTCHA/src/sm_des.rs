@@ -314,11 +314,48 @@ mod tests {
         assert_eq!(&plain2, b"hello\0\0\0");
     }
 
+    /// 与 main.rs 自检同一组的 known-answer 向量（对照官方 SDK JS 逐字节核实），
+    /// `cargo test` 可跑而 `cargo run` 不会 —— 防止 main.rs 被改动后自检丢失。
+    #[test]
+    fn known_answer_vectors_from_sdk() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("sshummei", "hello", "f7fAI89lgcI="),
+            ("ed4576ba", "hello", "UgnWaap2sqQ="),
+            ("ishumei.com", "hello", "LlJSUNclnOI="),
+            (
+                "0123456789abcdef",
+                "0123456789abcdef",
+                "yGp9USVRfz53CcymFR5+3Q==",
+            ),
+        ];
+        for (key, pt, expected) in cases {
+            let ct = sm_des_encrypt_ecb_zero_pad(key, pt);
+            assert_eq!(&sm_base64_encode(&ct), expected, "key={key} pt={pt}");
+            // 解密应还原明文（剥掉补位 \0）
+            let back = sm_des_decrypt_ecb_zero_pad_bytes(key.as_bytes(), &ct);
+            let s = String::from_utf8(back).unwrap();
+            assert_eq!(s.trim_end_matches('\0'), *pt);
+        }
+    }
+
     #[test]
     fn base64_round_trip() {
         let data = b"hello\0\0\0";
         let s = sm_base64_encode(data);
         assert_eq!(sm_base64_decode(&s), data);
+    }
+
+    /// 回归：密文含 >=0x80 字节时必须走 *_bytes 变体。
+    /// &str 变体经 as_bytes() 消费的是「字节被 UTF-8 重编码后的串」，
+    /// 高字节密文喂给它必然得到乱码（tests/verify_bc.rs 的历史 bug）。
+    #[test]
+    fn high_byte_ciphertext_roundtrip_via_bytes_variant() {
+        let key = "pceqy3rl";
+        let pt = "d41d8cd98f00b204e9800998ecf8427e"; // 32 位 md5 hex
+        let ct = sm_des_encrypt_ecb_zero_pad(key, pt);
+        assert!(ct.iter().any(|&b| b >= 0x80), "前置条件：密文应含高字节");
+        let back = sm_des_decrypt_ecb_zero_pad_bytes(key.as_bytes(), &ct);
+        assert_eq!(String::from_utf8_lossy(&back).trim_end_matches('\0'), pt);
     }
 }
 

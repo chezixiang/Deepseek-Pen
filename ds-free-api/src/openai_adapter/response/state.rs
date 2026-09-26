@@ -11,6 +11,7 @@ use log::{trace, warn};
 use crate::openai_adapter::OpenAIAdapterError;
 
 use super::sse_parser::SseEvent;
+use super::tool_parser::floor_char_boundary;
 
 const FRAG_THINK: &str = "THINK";
 const FRAG_RESPONSE: &str = "RESPONSE";
@@ -304,7 +305,8 @@ fn trace_frame(frame: &DsFrame) -> String {
                 "ThinkDelta"
             };
             if s.len() > MAX_LEN {
-                format!("{}(\"{}\")", ty, &s[..MAX_LEN])
+                // 日志截断也要落在字符边界（中文内容按字节切会 panic）
+                format!("{}(\"{}\")", ty, &s[..floor_char_boundary(s, MAX_LEN)])
             } else {
                 format!("{:?}", frame)
             }

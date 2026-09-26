@@ -85,13 +85,7 @@ impl Drop for TokenGuard {
             api_key: self
                 .api_key
                 .as_deref()
-                .map(|k| {
-                    if k.len() > 8 {
-                        format!("{}***", &k[..8])
-                    } else {
-                        "***".to_string()
-                    }
-                })
+                .map(|k| super::mask_prefix(k, 8))
                 .unwrap_or_default(),
             prompt_tokens: self.prompt_tokens,
             completion_tokens: ct,
@@ -134,24 +128,38 @@ const X_DS_ACCOUNT: &str = "x-ds-account";
 
 /// 脱敏账号 ID：邮箱/手机号只保留前 3 字符 + ***
 fn mask_account_id(id: &str) -> String {
-    if id.len() <= 3 {
-        "***".to_string()
-    } else {
-        format!("{}***", &id[..3])
-    }
+    super::mask_prefix(id, 3)
 }
 
 /// 应用状态
+///
+/// `adapter_slot` + `ready`：后端"早绑定"启动（bug 5）——端口先服务，wasm
+/// 下载 / PoW 编译 / 全账号登录在后台进行；就绪前业务 handler 统一返回
+/// 503 initializing，/health 的 ready 字段供应用侧等待"完全启动"。
 #[derive(Clone)]
 pub(crate) struct AppState {
-    pub(crate) adapter: Arc<OpenAIAdapter>,
-    pub(crate) anthropic_compat: Arc<AnthropicCompat>,
+    pub(crate) adapter_slot: Arc<tokio::sync::RwLock<Option<Arc<OpenAIAdapter>>>>,
+    pub(crate) ready: Arc<tokio::sync::RwLock<bool>>,
+    /// 后台初始化任务句柄（优雅关闭时 abort）
+    pub(crate) boot_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     pub(crate) stats: Arc<Stats>,
     pub(crate) config: Arc<tokio::sync::RwLock<Config>>,
     pub(crate) store: Arc<StoreManager>,
     pub(crate) login_limiter: Arc<LoginLimiter>,
     pub(crate) config_path: PathBuf,
     pub(crate) captcha: super::captcha_bridge::CaptchaStore,
+}
+
+impl AppState {
+    /// 取已就绪的 adapter；未就绪返回 503（应用侧轮询 /health ready 后才会
+    /// 发业务请求，这里只是防御）。
+    pub(crate) async fn adapter(&self) -> Result<Arc<OpenAIAdapter>, ServerError> {
+        self.adapter_slot
+            .read()
+            .await
+            .clone()
+            .ok_or(ServerError::Initializing)
+    }
 }
 /// Record a completed request — logs tokens and appends RequestLog via Stats
 impl AppState {
@@ -174,13 +182,7 @@ impl AppState {
         );
         let api_key_masked = api_key
             .as_deref()
-            .map(|k| {
-                if k.len() > 8 {
-                    format!("{}***", &k[..8])
-                } else {
-                    "***".to_string()
-                }
-            })
+            .map(|k| super::mask_prefix(k, 8))
             .unwrap_or_default();
         let log = super::stats::RequestLog {
             timestamp: std::time::SystemTime::now()
@@ -216,7 +218,8 @@ pub(crate) async fn chat_completions(
     log::debug!(target: "http::request", "req={} POST /v1/chat/completions stream={}", request_id, req.stream);
     let model = req.model.clone();
 
-    let result = state.adapter.chat_completions(req, &request_id).await;
+    let adapter = state.adapter().await?;
+    let result = adapter.chat_completions(req, &request_id).await;
     match &result {
         Ok(_) => timer.mark_success(),
         Err(_) => timer.mark_failure(),
@@ -285,22 +288,26 @@ pub(crate) async fn chat_completions(
 }
 
 /// GET /v1/models
-pub(crate) async fn list_models(State(state): State<AppState>) -> Response {
+pub(crate) async fn list_models(State(state): State<AppState>) -> Result<Response, ServerError> {
     log::debug!(target: "http::request", "GET /v1/models");
-    let bytes = serde_json::to_vec(&state.adapter.list_models().await).unwrap();
+    let adapter = state.adapter().await?;
+    let bytes = serde_json::to_vec(&adapter.list_models().await).unwrap();
     log::debug!(target: "http::response", "200 JSON response {} bytes", bytes.len());
-    (
+    Ok((
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
         Body::from(bytes),
     )
-        .into_response()
+        .into_response())
 }
 
 /// GET /v1/cloud-sessions —— 云端会话列表（#10 同步已有对话）
 pub(crate) async fn cloud_sessions(State(state): State<AppState>) -> Response {
     log::debug!(target: "http::request", "GET /v1/cloud-sessions");
-    match state.adapter.list_cloud_sessions().await {
+    let Ok(adapter) = state.adapter().await else {
+        return ServerError::Initializing.into_response();
+    };
+    match adapter.list_cloud_sessions().await {
         Ok(sessions) => {
             let body = serde_json::json!({
                 "object": "list",
@@ -353,7 +360,10 @@ pub(crate) async fn cloud_session_messages(
     State(state): State<AppState>,
 ) -> Response {
     log::debug!(target: "http::request", "GET /v1/cloud-sessions/{}/messages", id);
-    match state.adapter.list_cloud_session_messages(&id).await {
+    let Ok(adapter) = state.adapter().await else {
+        return ServerError::Initializing.into_response();
+    };
+    match adapter.list_cloud_session_messages(&id).await {
         Ok(messages) => {
             let body = serde_json::json!({
                 "object": "list",
@@ -400,6 +410,69 @@ pub(crate) async fn cloud_session_messages(
     }
 }
 
+/// DELETE /v1/cloud-sessions/{id} —— 删除云端会话（应用侧删除本地对话时同步调用，bug 3）
+///
+/// 本地删除必须连带云端删除：否则下次「同步」会把这条会话再导回来
+/// （用户看到"删了又回来"）。逐个账号尝试，见 ds_core::delete_cloud_session。
+pub(crate) async fn delete_cloud_session(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    log::info!(target: "http::request", "DELETE /v1/cloud-sessions/{}", id);
+    let Ok(adapter) = state.adapter().await else {
+        return ServerError::Initializing.into_response();
+    };
+    match adapter.delete_cloud_session(&id).await {
+        Ok(account) => {
+            let body = serde_json::json!({
+                "object": "cloud_session.deleted",
+                "id": id,
+                "account": account,
+            });
+            let bytes = serde_json::to_vec(&body).unwrap();
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                Body::from(bytes),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let (status, code, msg) = match &e {
+                crate::ds_core::CoreError::NoAccounts => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "no_accounts_configured",
+                    "未配置 DeepSeek 账号，无法删除云端会话".to_string(),
+                ),
+                crate::ds_core::CoreError::Overloaded => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limit_error",
+                    "当前没有空闲账号，请稍后再试".to_string(),
+                ),
+                crate::ds_core::CoreError::RateLimited(m) => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "upstream_rate_limited",
+                    m.clone(),
+                ),
+                other => (
+                    StatusCode::BAD_GATEWAY,
+                    "provider_error",
+                    format!("删除云端会话失败: {other}"),
+                ),
+            };
+            log::warn!(target: "http::response", "DELETE /v1/cloud-sessions/{} 失败: {e}", id);
+            let body = serde_json::json!({ "error": { "code": code, "message": msg } });
+            let bytes = serde_json::to_vec(&body).unwrap();
+            (
+                status,
+                [(header::CONTENT_TYPE, "application/json")],
+                Body::from(bytes),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// GET /v1/models/{id}
 pub(crate) async fn get_model(
     Path(id): Path<String>,
@@ -407,7 +480,7 @@ pub(crate) async fn get_model(
 ) -> Result<Response, ServerError> {
     log::debug!(target: "http::request", "GET /v1/models/{}", id);
 
-    match state.adapter.get_model(&id).await {
+    match state.adapter().await?.get_model(&id).await {
         Some(model) => {
             let bytes = serde_json::to_vec(&model).unwrap();
             log::debug!(target: "http::response", "200 JSON response {} bytes", bytes.len());
@@ -441,7 +514,9 @@ pub(crate) async fn anthropic_messages(
     log::debug!(target: "http::request", "req={} POST /anthropic/v1/messages stream={}", request_id, req.stream);
     let model = req.model.clone();
 
-    let result = state.anthropic_compat.messages(req, &request_id).await;
+    let result = AnthropicCompat::new(state.adapter().await?)
+        .messages(req, &request_id)
+        .await;
     match &result {
         Ok(_) => timer.mark_success(),
         Err(_) => timer.mark_failure(),
@@ -507,16 +582,19 @@ pub(crate) async fn anthropic_messages(
 }
 
 /// GET /anthropic/v1/models
-pub(crate) async fn anthropic_list_models(State(state): State<AppState>) -> Response {
+pub(crate) async fn anthropic_list_models(
+    State(state): State<AppState>,
+) -> Result<Response, ServerError> {
     log::debug!(target: "http::request", "GET /anthropic/v1/models");
-    let bytes = serde_json::to_vec(&state.anthropic_compat.list_models().await).unwrap();
+    let bytes = serde_json::to_vec(&AnthropicCompat::new(state.adapter().await?).list_models().await)
+        .unwrap();
     log::debug!(target: "http::response", "200 JSON response {} bytes", bytes.len());
-    (
+    Ok((
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
         Body::from(bytes),
     )
-        .into_response()
+        .into_response())
 }
 
 /// GET /anthropic/v1/models/{id}
@@ -526,7 +604,7 @@ pub(crate) async fn anthropic_get_model(
 ) -> Result<Response, ServerError> {
     log::debug!(target: "http::request", "GET /anthropic/v1/models/{}", id);
 
-    match state.anthropic_compat.get_model(&id).await {
+    match AnthropicCompat::new(state.adapter().await?).get_model(&id).await {
         Some(model) => {
             let bytes = serde_json::to_vec(&model).unwrap();
             log::debug!(target: "http::response", "200 JSON response {} bytes", bytes.len());

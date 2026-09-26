@@ -131,6 +131,7 @@ mod tests {
             service_tier: None,
             system_fingerprint: None,
             ds_title: None,
+            ds_session_id: None,
         }
     }
 
@@ -326,6 +327,7 @@ mod tests {
             service_tier: None,
             system_fingerprint: None,
             ds_title: None,
+            ds_session_id: None,
         };
         let msg = from_chat_completions(&r);
         assert!(msg.content.is_empty());

@@ -214,7 +214,18 @@ pub(crate) async fn admin_login(
 
 /// GET /admin/api/status
 pub(crate) async fn admin_status(State(state): State<AppState>) -> Response {
-    let statuses = state.adapter.account_statuses();
+    let Ok(adapter) = state.adapter().await else {
+        // 启动中：返回空账号列表（管理面板可见"启动中"状态）
+        return json_response(&AdminStatusResponse {
+            accounts: Vec::new(),
+            total: 0,
+            idle: 0,
+            busy: 0,
+            error: 0,
+            invalid: 0,
+        });
+    };
+    let statuses = adapter.account_statuses();
     let total = statuses.len();
     let busy = statuses.iter().filter(|a| a.state == "busy").count();
     let idle = statuses.iter().filter(|a| a.state == "idle").count();
@@ -241,7 +252,10 @@ pub(crate) async fn admin_stats(State(state): State<AppState>) -> Response {
 
 /// GET /admin/api/models
 pub(crate) async fn admin_models(State(state): State<AppState>) -> Response {
-    let models = state.adapter.list_models().await;
+    let Ok(adapter) = state.adapter().await else {
+        return json_response(&serde_json::json!([]));
+    };
+    let models = adapter.list_models().await;
     json_response(&models)
 }
 
@@ -293,6 +307,9 @@ pub(crate) async fn admin_put_config(
                 .jwt_secret
                 .clone_from(&current.admin.jwt_secret);
         }
+        // jwt_issued_at 是服务端管理的撤销水位：面板 PUT 不携带它，直接采信
+        // 请求体会把水位清零，让已撤销的旧 token 重新有效——永远以现有值为准。
+        new_config.admin.jwt_issued_at = current.admin.jwt_issued_at;
         // 密码修改：前端发 old_password + new_password
         if !new_config.admin.old_password.is_empty() || !new_config.admin.new_password.is_empty() {
             if new_config.admin.old_password.is_empty() || new_config.admin.new_password.is_empty()
@@ -310,7 +327,12 @@ pub(crate) async fn admin_put_config(
             new_config.admin.password_hash =
                 super::store::hash_password(&new_config.admin.new_password);
             new_config.admin.jwt_secret = super::store::generate_hex_secret();
-            new_config.admin.jwt_issued_at += 1;
+            // 用当前时间做新水位（比旧值 +1 更稳：水位为 0 的存量配置下 +1
+            // 追不上真实 token 的 iat，撤销不生效）
+            new_config.admin.jwt_issued_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
         }
     }
 
@@ -326,8 +348,11 @@ pub(crate) async fn admin_put_config(
         }
     }
 
-    // Hot-reload: sync accounts from the new config
-    state.adapter.sync_accounts(&new_config.accounts).await;
+    // Hot-reload: sync accounts from the new config（启动中则跳过，登录完成后
+    // 以后台 init 的账号为准）
+    if let Ok(adapter) = state.adapter().await {
+        adapter.sync_accounts(&new_config.accounts).await;
+    }
     json_response(&serde_json::json!({"ok": true}))
 }
 

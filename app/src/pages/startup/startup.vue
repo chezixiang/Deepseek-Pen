@@ -47,7 +47,8 @@ export default {
             startTime: 0,
             checkTimer: null,
             checkingBackend: false,
-            timeoutTimer: null
+            timeoutTimer: null,
+            navTimer: null
         }
     },
     // 词典笔框架：Vue 组件用 created() + this.$page.on（参考 index.vue）。
@@ -67,6 +68,10 @@ export default {
             clearTimeout(this.timeoutTimer)
             this.timeoutTimer = null
         }
+        if (this.navTimer) {
+            clearTimeout(this.navTimer)
+            this.navTimer = null
+        }
     },
     methods: {
         onPageShow() {
@@ -80,6 +85,17 @@ export default {
             this.statusDetail = '正在更新并启动后端服务...'
             this.startTime = Date.now()
 
+            // 整个流程兜底 try/catch：任何未预期异常（loadSettings 抛错、
+            // ensureBackendRunning reject 等）不能让页面永远停在"正在启动…"。
+            try {
+                await this.doBackendCheck()
+            } catch (e) {
+                this.status = 'error'
+                this.errorMessage = '启动流程异常：' + (e && e.message ? e.message : String(e))
+            }
+        },
+
+        async doBackendCheck() {
             // #7：进入主页前把主题缓存到 $falcon.__dsTheme，index/settings 页
             // 首帧同步读取，消除"进软件闪一下浅色界面"。
             let settings = null
@@ -94,14 +110,11 @@ export default {
             if (settings && settings.authMode && settings.authMode !== 'builtin') {
                 this.status = 'ready'
                 this.statusDetail = '已使用自定义服务地址'
-                setTimeout(() => {
-                    $falcon.navTo('index')
-                }, 300)
+                this.scheduleNav('index')
                 return
             }
 
-            // ensureBackendRunning 内部已完成 deploy + healthCheck 确认，
-            // 成功后直接跳转，不再额外轮询（省 2 秒间隔的重复检查）。
+            // 1) 部署 + 端口级 healthCheck（失败则展示错误）
             const ensureResult = await ensureBackendRunning()
             if (!ensureResult.ok) {
                 this.status = 'error'
@@ -109,8 +122,10 @@ export default {
                 return
             }
 
-            // 快速确认一次（后端可能还在登录 DeepSeek，health 已通但账号未就绪时也允许进入）
-            const quick = await checkBackendHealth({ maxAttempts: 1, interval: 0 })
+            // 2) 等待"完全启动"（ready=true：wasm/账号登录完成）才放行——
+            // 早绑定模式下端口秒通但登录在后台进行，直接放行会让首条消息
+            // 撞上 503 initializing（bug 5"要等 ds-free-api 完全启动才让下一步"）。
+            const full = await checkBackendHealth({ maxAttempts: 60, interval: 1500, waitForReady: true })
 
             // 未配置账号 → 进专用登录页（首次使用的主入口）；已配置 → 直接进主页
             // （老用户升级后无感）。dsConfigured 由 loadSettings 从本机 config.toml
@@ -121,11 +136,29 @@ export default {
                 configured = !!(s2 && s2.dsConfigured)
             } catch (e) { /* 探测失败按未配置处理 */ }
 
+            if (!full.success) {
+                // ready 等待超时：登录可能卡在验证码/风控。已有账号时放行进主页
+                // （主页会显示具体错误并支持重试），未配置则去登录页重试。
+                this.statusDetail = full.error || '后端启动超时'
+                if (!configured) {
+                    this.status = 'error'
+                    this.errorMessage = this.statusDetail
+                    return
+                }
+            }
+
             this.status = 'ready'
-            this.statusDetail = quick.warning || '后端服务已就绪'
+            this.statusDetail = (full && full.warning) || '后端服务已就绪'
             const target = configured ? '/index' : '/login'
-            setTimeout(() => {
-                $falcon.navTo(target === '/login' ? 'login' : 'index')
+            this.scheduleNav(target === '/login' ? 'login' : 'index')
+        },
+
+        // 导航定时器要可取消：onPageShow→retry 时旧定时器还挂着会双跳转
+        scheduleNav(page) {
+            if (this.navTimer) clearTimeout(this.navTimer)
+            this.navTimer = setTimeout(() => {
+                this.navTimer = null
+                $falcon.navTo(page)
             }, 300)
         },
         
@@ -151,9 +184,7 @@ export default {
                         this.timeoutTimer = null
                     }
 
-                    setTimeout(() => {
-                        $falcon.navTo('index')
-                    }, 500)
+                    this.scheduleNav('index')
                 } else {
                     this.statusDetail = result.error || '正在等待后端服务...'
                 }
@@ -172,6 +203,10 @@ export default {
             if (this.timeoutTimer) {
                 clearTimeout(this.timeoutTimer)
                 this.timeoutTimer = null
+            }
+            if (this.navTimer) {
+                clearTimeout(this.navTimer)
+                this.navTimer = null
             }
             this.startBackendCheck()
         }

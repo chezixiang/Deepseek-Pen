@@ -100,6 +100,9 @@ pub enum AnthropicCompatError {
     NoAccounts,
     #[error("service overloaded")]
     Overloaded,
+    /// 上游限流（账号已退避）：与 Overloaded 分开，便于调用方停止重试（bug 1）
+    #[error("rate limited: {0}")]
+    RateLimited(String),
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -110,6 +113,7 @@ impl From<OpenAIAdapterError> for AnthropicCompatError {
             OpenAIAdapterError::BadRequest(msg) => Self::BadRequest(msg),
             OpenAIAdapterError::NoAccounts => Self::NoAccounts,
             OpenAIAdapterError::Overloaded => Self::Overloaded,
+            OpenAIAdapterError::RateLimited(msg) => Self::RateLimited(msg),
             OpenAIAdapterError::ProviderError(msg) => Self::Internal(msg),
             OpenAIAdapterError::Internal(msg) => Self::Internal(msg),
             OpenAIAdapterError::ToolCallRepairNeeded(msg) => Self::Internal(msg),
@@ -124,6 +128,7 @@ impl AnthropicCompatError {
             Self::BadRequest(_) => 400,
             Self::NoAccounts => 503,
             Self::Overloaded => 429,
+            Self::RateLimited(_) => 429,
             Self::Internal(_) => 500,
         }
     }

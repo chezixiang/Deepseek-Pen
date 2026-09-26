@@ -52,6 +52,27 @@
                     <div :class="dc('input')" @click="editField('openaiModelId')">
                         <text :class="form.openaiModelId ? dc('input-text') : dc('input-text-ph')">{{ form.openaiModelId || 'deepseek-v4-flash' }}</text>
                     </div>
+                    <div class="modes model-actions">
+                        <text :class="dc('nav-btn-sm')" @click="fetchModels">{{ modelFetching ? '拉取中…' : '从 API 拉取模型' }}</text>
+                        <text :class="dc('nav-btn-sm')" @click="editField('openaiModelId')">手动输入</text>
+                    </div>
+                    <text v-if="modelMsg" :class="modelMsgErr ? dc('field-hint-warn') : dc('field-hint')">{{ modelMsg }}</text>
+                    <text v-else :class="dc('field-hint')">「从 API 拉取模型」读取端点声明的模型列表（GET /v1/models），点选即填入</text>
+                </div>
+                <!-- 拉取到的模型列表：点一下即选中，避免在设备上手打长模型名。
+                     不用内层 scroller —— 本页 body 已经是纵向 scroller，Weex 里
+                     嵌套同方向滚动容器易出问题；用普通列表由页面统一滚动，
+                     并给条目数封顶，避免个别中转站返回上百个模型拖慢渲染。 -->
+                <div v-if="modelList.length" :class="dc('model-list')">
+                    <div
+                        v-for="m in modelList"
+                        :key="m.id"
+                        :class="form.openaiModelId === m.id ? dc('model-item-active') : dc('model-item')"
+                        @click="pickModel(m.id)">
+                        <text :class="form.openaiModelId === m.id ? dc('model-id-active') : dc('model-id')">{{ m.id }}</text>
+                        <text v-if="m.ownedBy" :class="dc('model-owner')">{{ m.ownedBy }}</text>
+                    </div>
+                    <text v-if="modelTruncated" :class="dc('field-hint')">（仅显示前 {{ MODEL_LIST_MAX }} 个）</text>
                 </div>
             </template>
 
@@ -79,10 +100,7 @@
                 <text :class="dc('label')">默认展开思考过程</text>
                 <text :class="form.defaultExpandThinking ? dc('chip-active') : dc('chip')" @click="form.defaultExpandThinking = !form.defaultExpandThinking">{{ form.defaultExpandThinking ? '展开' : '收起' }}</text>
             </div>
-            <div :class="dc('field')">
-                <text :class="dc('label')">流式输出（SSE）</text>
-                <text :class="form.sse ? dc('chip-active') : dc('chip')" @click="form.sse = !form.sse">{{ form.sse ? '开启' : '关闭' }}</text>
-            </div>
+            <text :class="dc('field-hint')">流式输出（SSE）已固定开启，逐字显示回复，不再提供开关</text>
 
             <text :class="dc('group-title')">外观</text>
             <div :class="dc('field')">
@@ -109,6 +127,7 @@
             <div :class="dc('field')">
                 <text :class="dc('label')">启用调试日志</text>
                 <text :class="form.debugLog ? dc('chip-active') : dc('chip')" @click="form.debugLog = !form.debugLog">{{ form.debugLog ? '开启' : '关闭' }}</text>
+                <text :class="dc('field-hint')">开启后同步抓取本机后端与 DeepSeek/数美的全部网络往返（JSONL，在「查看诊断日志 → 网络抓取」可看尾部，完整文件 logs/net-capture.jsonl）。禁言/风控发生时即有第一手报文可查。注意：报文含账号凭据，外发前自行脱敏；切换后点「保存」，会自动重启后端生效</text>
             </div>
             <div :class="dc('field')">
                 <text :class="dc('label')">Emoji 字体（实验，联网下载约 10MB）</text>
@@ -146,6 +165,7 @@
                 <div class="log-tabs">
                     <text :class="logSource === 'app' ? dc('log-tab-active') : dc('log-tab')" @click="switchLogSource('app')">应用日志</text>
                     <text :class="logSource === 'backend' ? dc('log-tab-active') : dc('log-tab')" @click="switchLogSource('backend')">后端日志</text>
+                    <text :class="logSource === 'capture' ? dc('log-tab-active') : dc('log-tab')" @click="switchLogSource('capture')">网络抓取</text>
                     <text :class="logLines === 80 ? dc('log-tab-active') : dc('log-tab')" @click="setLogLines(80)">80行</text>
                     <text :class="logLines === 200 ? dc('log-tab-active') : dc('log-tab')" @click="setLogLines(200)">200行</text>
                     <text :class="logLines === 500 ? dc('log-tab-active') : dc('log-tab')" @click="setLogLines(500)">500行</text>
@@ -153,7 +173,7 @@
                     <text :class="logGen === 0 ? dc('log-tab-active') : dc('log-tab')" @click="setLogGen(0)">当前</text>
                 </div>
                 <scroller :class="dc('log-body')" scroll-direction="vertical">
-                    <text :class="dc('log-text')">{{ logContent || '暂无日志' }}</text>
+                    <text :class="dc('log-text')">{{ logContent || (logSource === 'capture' ? '暂无抓取（在「启用调试日志」开启并保存后产生）' : '暂无日志') }}</text>
                 </scroller>
                 <div class="log-foot">
                     <text :class="dc('log-btn')" @click="refreshLog">刷新</text>
@@ -174,20 +194,23 @@
 </template>
 
 <script>
-import { MODES } from '../../services/ds.js'
+import { MODES, listRemoteModels } from '../../services/ds.js'
 import { DEFAULT_SETTINGS, APP_VERSION, loadSettings, saveSettings, loadConversations, saveConversations, deleteMessages, saveActiveId, readLocalDsPass, loadAccountTrouble } from '../../services/store.js'
-import { openTextEditor, updateDsFreeApiAccount, readDsFreeApiProxy, updateDsFreeApiProxy, validateProxyUrl, INPUT_TYPES, deployBackend, ensureBackendRunning } from '../../services/native.js'
-import { appLog, appLogTail, appLogClear, backendLogTail, backendLogClear } from '../../services/app-log.js'
+import { openTextEditor, updateDsFreeApiAccount, readDsFreeApiProxy, updateDsFreeApiProxy, validateProxyUrl, updateDsFreeApiNetCapture, INPUT_TYPES, deployBackend, ensureBackendRunning } from '../../services/native.js'
+import { appLog, appLogTail, appLogClear, backendLogTail, backendLogClear, netCaptureTail, netCaptureClear } from '../../services/app-log.js'
 import { ensureEmojiFont } from '../../services/emoji-font.js'
 
 // 首帧主题预读：与 index.vue 一致，从 $falcon.__dsTheme 同步读取，避免深色用户闪浅色（#7）
 function peekBootTheme() {
-  try {
-    return ($falcon && $falcon.__dsTheme) || 'light'
-  } catch (e) {
-    return 'light'
-  }
+    try {
+        return ($falcon && $falcon.__dsTheme) || 'light'
+    } catch (e) {
+        return 'light'
+    }
 }
+
+// 模型列表最多渲染多少条（中转站可能返回上百个模型，全渲染会拖慢弱设备）
+const MODEL_LIST_MAX = 50
 
 export default {
     name: 'settings',
@@ -210,6 +233,14 @@ export default {
             emojiFontMsg: '',
             proxyUrl: '',
             proxyMsg: '',
+            // 定义在 data 之外也可用：模板需要常量参与渲染（列表封顶提示）
+            MODEL_LIST_MAX,
+            // 自定义端点：从 /v1/models 拉取到的声明模型（bug 6）
+            modelList: [],
+            modelTruncated: false,
+            modelFetching: false,
+            modelMsg: '',
+            modelMsgErr: false,
             trouble: []
         }
     },
@@ -254,6 +285,9 @@ export default {
         async init() {
             this.form = await loadSettings()
             this.cacheTheme()
+            // 记录调试日志开关的进入时值：保存时与它比较，变了才同步后端
+            // net_capture 并重启（避免每次保存都白重启一次后端）
+            this._debugLogAtLoad = !!this.form.debugLog
             // 账号异常取证（首次检出时间）
             this.trouble = await loadAccountTrouble()
             // 读取本机已配置密码的掩码预览，避免“已配置”时密码栏空白
@@ -327,6 +361,9 @@ export default {
         async loadLogContent() {
             if (this.logSource === 'app') {
                 this.logContent = await appLogTail(this.logLines, this.logGen)
+            } else if (this.logSource === 'capture') {
+                // 网络抓取是 JSONL，行较长，app-log 内部已按 600 字符/行截断展示
+                this.logContent = await netCaptureTail(this.logLines, this.logGen)
             } else {
                 this.logContent = await backendLogTail(this.logLines, this.logGen)
             }
@@ -350,10 +387,12 @@ export default {
         async clearLog() {
             if (this.logSource === 'app') {
                 await appLogClear()
+            } else if (this.logSource === 'capture') {
+                await netCaptureClear()
             } else {
                 await backendLogClear()
             }
-            appLog('[settings] 已清空' + (this.logSource === 'app' ? '应用' : '后端') + '日志')
+            appLog('[settings] 已清空' + (this.logSource === 'app' ? '应用' : this.logSource === 'capture' ? '网络抓取' : '后端') + '日志')
             this.logContent = ''
             this.$forceUpdate()
         },
@@ -416,6 +455,60 @@ export default {
         },
         setAuthMode(mode) {
             this.form.authMode = mode
+            // 切到内置模式时清掉自定义端点的模型列表/提示，避免残留信息误导
+            if (mode !== 'openai') {
+                this.modelList = []
+                this.modelMsg = ''
+            }
+            this.$forceUpdate()
+        },
+        // 从端点拉取模型列表（GET /v1/models）：第三方兼容服务的可用模型名
+        // 千奇百怪（大小写/前缀/版本），靠猜必错；拉一次让用户直接点选。
+        // 用当前表单里的地址与 Key（不必先保存），改完地址就能立刻验证是否连得通。
+        async fetchModels() {
+            if (this.modelFetching) return
+            const baseUrl = String(this.form.baseUrl || '').trim()
+            if (!baseUrl) {
+                this.modelMsg = '请先填写服务地址'
+                this.modelMsgErr = true
+                this.$forceUpdate()
+                return
+            }
+            this.modelFetching = true
+            this.modelMsg = '正在从 ' + baseUrl + ' 拉取模型列表…'
+            this.modelMsgErr = false
+            this.$forceUpdate()
+            try {
+                const list = await listRemoteModels({
+                    baseUrl,
+                    apiKey: String(this.form.apiKey || '').trim(),
+                    authMode: 'openai'
+                })
+                this.modelTruncated = list.length > MODEL_LIST_MAX
+                this.modelList = list.slice(0, MODEL_LIST_MAX)
+                if (!list.length) {
+                    this.modelMsg = '端点返回了空列表：该服务可能未声明模型，请手动输入'
+                    this.modelMsgErr = true
+                } else {
+                    this.modelMsg = '已获取 ' + list.length + ' 个模型，点选下方条目即填入模型 ID'
+                    this.modelMsgErr = false
+                    appLog('[settings] 已拉取模型 ' + list.length + ' 个：' + list.slice(0, 20).map((m) => m.id).join(','))
+                }
+            } catch (e) {
+                const msg = e && e.message ? e.message : String(e)
+                this.modelList = []
+                this.modelTruncated = false
+                this.modelMsg = '拉取失败：' + msg
+                this.modelMsgErr = true
+                appLog('[settings] 拉取模型失败 ' + msg)
+            }
+            this.modelFetching = false
+            this.$forceUpdate()
+        },
+        pickModel(id) {
+            this.form.openaiModelId = String(id || '').trim()
+            this.modelMsg = '已选择：' + this.form.openaiModelId + '（记得点右上角「保存」）'
+            this.modelMsgErr = false
             this.$forceUpdate()
         },
         setDefaultMode(key) {
@@ -505,6 +598,23 @@ export default {
                         accountMsg = '已保存设置（沿用本机已配置的账号）'
                     } else {
                         accountMsg = '已保存设置（未配置 DeepSeek 账号）'
+                    }
+
+                    // 3) 调试日志开关 → 同步后端 [server] net_capture（网络抓取）。
+                    // 与进入页面时的值比较，变化才写配置+重启；同步失败不阻断设置保存，
+                    // 但要在保存弹窗里明示（否则用户以为抓取已生效，出事时没数据）。
+                    if (this._debugLogAtLoad !== !!this.form.debugLog) {
+                        const capResult = await updateDsFreeApiNetCapture(!!this.form.debugLog)
+                        appLog('[settings] 网络抓取开关联动 ok=' + capResult.ok + ' enabled=' + !!this.form.debugLog + ' msg=' + (capResult.message || ''))
+                        if (!capResult.ok) {
+                            this.saveMsg = '设置已保存，但后端抓取开关同步失败：' + capResult.message
+                            this.saved = false
+                            this.showSaveModal = true
+                            this.$forceUpdate()
+                            return
+                        }
+                        this._debugLogAtLoad = !!this.form.debugLog
+                        if (!accountMsg) accountMsg = capResult.message
                     }
                 }
 
@@ -689,6 +799,57 @@ export default {
     border-radius: 12px;
     padding: 4px 12px;
     margin-right: 8px;
+}
+
+/* 模型拉取（bug 6）：两个小按钮一行 + 可滚动的模型清单 */
+.model-actions {
+    margin-top: 8px;
+}
+.nav-btn-sm {
+    font-size: 16px;
+    color: #1a73e8;
+    text-align: center;
+    background-color: #eef4fe;
+    border-radius: 8px;
+    padding: 8px 14px;
+    margin-right: 8px;
+}
+.model-list {
+    background-color: #ffffff;
+    border-bottom-width: 1px;
+    border-bottom-color: #f0f0f0;
+}
+.model-item {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 16px;
+    border-bottom-width: 1px;
+    border-bottom-color: #f3f4f6;
+}
+.model-item-active {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 16px;
+    border-bottom-width: 1px;
+    border-bottom-color: #f3f4f6;
+    background-color: #eaf2ff;
+}
+.model-id {
+    font-size: 16px;
+    color: #222222;
+    flex: 1;
+}
+.model-id-active {
+    font-size: 16px;
+    color: #1a73e8;
+    flex: 1;
+}
+.model-owner {
+    font-size: 13px;
+    color: #999999;
+    margin-left: 8px;
 }
 
 .danger {
@@ -982,6 +1143,52 @@ export default {
     background-color: #1e2a3a;
     border-radius: 8px;
     padding: 10px 0;
+}
+.nav-btn-sm-dark {
+    font-size: 16px;
+    color: #82b1ff;
+    text-align: center;
+    background-color: #1e2a3a;
+    border-radius: 8px;
+    padding: 8px 14px;
+    margin-right: 8px;
+}
+.model-list-dark {
+    background-color: #1e1e1e;
+    border-bottom-width: 1px;
+    border-bottom-color: #2a2a2a;
+}
+.model-item-dark {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 16px;
+    border-bottom-width: 1px;
+    border-bottom-color: #262626;
+}
+.model-item-active-dark {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 16px;
+    border-bottom-width: 1px;
+    border-bottom-color: #262626;
+    background-color: #17263a;
+}
+.model-id-dark {
+    font-size: 16px;
+    color: #eeeeee;
+    flex: 1;
+}
+.model-id-active-dark {
+    font-size: 16px;
+    color: #82b1ff;
+    flex: 1;
+}
+.model-owner-dark {
+    font-size: 13px;
+    color: #888888;
+    margin-left: 8px;
 }
 
 /* ========== 诊断日志面板（#6/#11）：固定适配横屏 936×280 ========== */

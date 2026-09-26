@@ -44,6 +44,8 @@ pub enum ServerError {
     Anthropic(AnthropicCompatError),
     /// 未授权（无效 API token）
     Unauthorized,
+    /// 后端仍在启动（早绑定模式下 adapter 未就绪，bug 5）
+    Initializing,
     /// 资源不存在
     NotFound(String),
 }
@@ -54,6 +56,7 @@ impl fmt::Display for ServerError {
             Self::Adapter(e) => write!(f, "{}", e),
             Self::Anthropic(e) => write!(f, "{}", e),
             Self::Unauthorized => write!(f, "invalid api token"),
+            Self::Initializing => write!(f, "后端仍在启动，请稍候（等待账号登录完成）"),
             Self::NotFound(id) => write!(f, "模型 '{}' 不存在", id),
         }
     }
@@ -89,6 +92,8 @@ fn openai_error_response(err: &ServerError) -> Response {
                 OpenAIAdapterError::BadRequest(_) => ("invalid_request_error", "bad_request"),
                 OpenAIAdapterError::NoAccounts => ("server_error", "no_accounts_configured"),
                 OpenAIAdapterError::Overloaded => ("server_error", "overloaded"),
+                // 上游限流：独立错误码，应用侧据此停止自动续发（bug 1）
+                OpenAIAdapterError::RateLimited(_) => ("rate_limit_error", "upstream_rate_limited"),
                 OpenAIAdapterError::ProviderError(_) => ("server_error", "provider_error"),
                 OpenAIAdapterError::Internal(_) => ("server_error", "internal_error"),
                 OpenAIAdapterError::ToolCallRepairNeeded(_) => ("server_error", "internal_error"),
@@ -99,6 +104,11 @@ fn openai_error_response(err: &ServerError) -> Response {
             StatusCode::UNAUTHORIZED,
             "authentication_error",
             "invalid_api_token",
+        ),
+        ServerError::Initializing => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "initializing",
         ),
         ServerError::NotFound(_) => (
             StatusCode::NOT_FOUND,
@@ -139,6 +149,7 @@ fn anthropic_error_response(err: &AnthropicCompatError) -> Response {
         AnthropicCompatError::BadRequest(_) => "invalid_request_error",
         AnthropicCompatError::NoAccounts => "no_accounts_error",
         AnthropicCompatError::Overloaded => "overloaded_error",
+        AnthropicCompatError::RateLimited(_) => "rate_limit_error",
         AnthropicCompatError::Internal(_) => "api_error",
     };
 
@@ -151,6 +162,8 @@ fn anthropic_error_response(err: &AnthropicCompatError) -> Response {
 
     let mut resp = (status, Json(body)).into_response();
     if status == StatusCode::TOO_MANY_REQUESTS {
+        // 限流的 Retry-After 用错误里带的实际退避时长更准，但 Anthropic 兼容层
+        // 不解析具体秒数；30s 是保守下界（真实退避在 60s 起），足以压住客户端的立刻重试。
         resp.headers_mut()
             .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
     }

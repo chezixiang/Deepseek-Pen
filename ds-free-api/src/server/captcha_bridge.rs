@@ -66,11 +66,20 @@ impl CaptchaStore {
         self.inner.get(id).map(|p| p.detail.clone())
     }
 
+    /// 清理会话（等待超时/已完成后调用）。没有它，每一次验证码登录
+    /// 都会在 DashMap 里留下一条永不回收的条目，长期运行内存无限增长。
+    pub fn remove(&self, id: &str) {
+        self.inner.remove(id);
+    }
+
     /// 用户完成验证后回调；返回是否成功通知到等待方。
     pub fn submit(&self, id: &str, result: Value) -> bool {
         if let Some(mut p) = self.inner.get_mut(id) {
             if let Some(tx) = p.tx.take() {
                 let _ = tx.send(result);
+                // 通知已送达，会话使命完成
+                drop(p);
+                self.inner.remove(id);
                 return true;
             }
         }

@@ -4,6 +4,146 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.18] - 2026-09-25
+
+### Added（调试网络抓取：禁言/风控第一手报文自动留痕）
+- **`[server] net_capture` 配置项 + `server::net_capture` 模块**：开启后把发往
+  上游（DeepSeek 全部端点 + HIF 分发服务 + 数美注册 + wasm/fp 静态资源）的
+  全部 HTTP 往返逐条落盘 `$DS_DATA_DIR/logs/net-capture.jsonl`，格式与手工
+  net-export jsonl 一致（每行一个事件：`request` / `response` / `response_body`
+  / `error`，`id` 关联同一次往返），超 5MB 轮转保留 .1/.2。
+- **SSE 流全量留痕**：completion 流用 CaptureStream 包装，累计至 256KB 截断，
+  正常结束、出错、上层提前断流（drop）都会落盘已收到的部分——禁言等业务
+  失败常在首帧 biz_code 里。
+- **词典笔端联动**：设置页「启用调试日志」开关联动写入 `net_capture` 并自动
+  重启后端；诊断日志弹窗新增「网络抓取」tab 可看尾部与清空。
+  报文含 Authorization/Cookie 等真实凭据，外发前注意脱敏。
+
+## [0.2.17] - 2026-09-25
+
+### Changed（风控差异分析落地：对齐官方 web 客户端行为流）
+基于 79MB 官方抓包（FULL.har/new.har/ban.har）与本实现的全量对比，消除"非人指纹"：
+
+- **不再 create/delete 孤儿会话**：官方 79MB 抓包里 session/delete 仅 1 次（用户
+  手动删），旧实现"登录验证 + 每次冷请求"都产生 create→delete 对，是聚类
+  签名。登录验证环节整段移除；账号可用性由登录响应 mute 状态与首次真实请求验证。
+- **拟真开屏序列**：官方登录后是 settings(did) → 会话列表 的浏览行为，旧实现
+  登录后 0 静默请求直奔 completion（"登录即对话"指纹）。现在登录成功后补发
+  `client/settings?did=…` → `fetch_page`，间隔随机 1-3s；did 从账号 device_id
+  派生（稳定 UUID 形状，每账号不同）。
+- **登录串行化 + 抖动**：13 账号并发登录改为串行、账号间随机 5-15s——
+  "同 IP 同分钟 N 个新设备注册 + N 次登录"是典型批量特征。
+- **completion 链路人速抖动**：create_session 后随机 300-1200ms（官方有
+  人类间隔，旧实现机器速连发）。
+- **completion payload 形状对齐**：补显式 `"parent_message_id": null`（首条）与
+  `"action": null` 键（官方恒有；旧实现 skip 掉 None 少键）。
+- **Referer 按会话定制**：completion 的 Referer 为 `{origin}/a/chat/s/{session_id}`
+  （官方在会话页发），旧实现一律 `{origin}/`。
+- **default_search_enabled 默认 false**：100% 对话都开搜索在真实用户分布里
+  几乎不存在；联网需求由应用侧显式传 web_search_options。
+- **禁言账号跳过周期重登**：mute_until 未到期时恢复任务不再 re_login
+  （禁言期持续异常登录会延长上游观察期）。
+
+## [0.2.16] - 2026-09-25
+
+### Fixed（词典笔端 5 项 bug + 启动体验重构）
+- **早绑定启动（启动慢）**：`server::run` 先绑定端口开始服务，wasm 下载 /
+  PoW 编译 / 全账号登录移到后台任务；`/health` 新增 `ready` 字段
+  （后台初始化完成才为 true），业务 handler 在就绪前统一返回
+  503 `initializing`。应用侧（词典笔 startup 页）等待 ready 才放行进入聊天页。
+- **云端消息树剪枝（编辑/重试堆叠）**：`history_messages` 实测字段是
+  `message_id`/`parent_id`（均为数字，此前解析用 `id` 全部落空 → 整树平铺，
+  编辑/重试的所有版本堆叠显示）。现在按树剪枝：只下发活跃链（每层数组最后
+  一个子节点），被替换的兄弟版本放入 `CloudMessage.alt_texts`；应用侧映射为
+  已有的版本切换 UI（revisions/attempts）。真机数据验证：一条含两次编辑的
+  会话从 28 条平铺修正为 22 条活跃链 + alt_texts。
+- **禁言识别与停止重试（延迟封号放大器）**：真机抓到禁言空流的真实形态是
+  `biz_code:5` + `biz_msg:"user is muted"`（空格）+ `is_muted:1`——旧实现只认
+  下划线形态 `user_is_muted`，漏检后被当"空 SSE 流"**重试 3 次**，每次白烧一个
+  上游请求。现在禁言（空流/hint 两种路径）统一映射 `CoreError::Rejected`：
+  不重试、带精确到期时间直达用户。
+- **启动健康检查 completion 移除**：登录初始化不再发"test completion"健康检查
+  （每账号每次冷启动省一次真实对话请求）；create/delete session 验证保留。
+- **删除云端会话的逐账号尝试上限**：`delete_cloud_session` 最多尝试 3 个账号
+  （原先打满全账号池）。
+- **config.toml/stats.json 权限放宽 0644**：部分机型应用进程非 root，0600 的
+  root 属主文件导致应用侧 fs.readFile 失败 → "无法读取 ds-free-api 配置文件"
+  （10201）。
+- **删除云端会话路由同时挂 POST/DELETE**：笔端 Falcon http 模块不支持 DELETE
+  方法（405 的直接成因）；应用侧已改用 POST，DELETE 保留给标准调用方。
+
+## [0.2.15] - 2026-09-22
+
+### Fixed（限流被当成账号故障 + 可重试 → 账号被禁言）
+- **上游限流不再走 `mark_error`**：旧实现收到 `rate_limit_reached` 就把账号标记为
+  Error，而后台恢复任务 5 分钟后会去**重新登录**（登录本身也是上游请求），
+  叠加 `v0_chat_cold` 的 3 次重试 + 适配器的 1 次重试（每次重试都新建 session），
+  在短窗口内堆出请求洪峰 —— 上游据此判定异常客户端并升级为**禁言**。
+- **新增 `CoreError::RateLimited`**（此前限流复用 `Overloaded`，语义与处理方式都不同）：
+  - `check_hint` 把 `rate_limit` 映射为 `RateLimited`；
+  - `v0_chat_cold` / `try_chat` 对限流**永不重试**，直接透传给调用方；
+  - 错误码 `upstream_rate_limited`（HTTP 429），与"服务繁忙（overloaded）"分开。
+- **账号级限流退避**（`AccountPool::mark_rate_limited`）：连续被限流时阶梯退避
+  60s→180s→600s→1200s→1800s；退避中的账号
+  - `get_account` 不分配；
+  - `get_account_by_id`（会话亲和）**同样不放行**——否则用户连点重试会沿同一条
+    会话持续冲击上游；
+  - `get_account_with_wait` 在全池退避时立即返回，不再白等 30 秒才报错；
+  - 重登成功时清除退避（`clear_cooldown`）。
+- 新增回归单测：`check_hint_classifies_rate_limit_separately`、
+  `cooldown_ladder_escalates_and_clears`、`cooldown_account_is_not_allocated`。
+
+### Added（删除云端会话：`DELETE /v1/cloud-sessions/{id}`）
+- 应用侧删除本地对话时同步删除云端会话 —— 否则下次「同步」会把这条会话导回本地
+  （用户看到"删了又回来"）。
+- `ds_core::delete_cloud_session`：会话是**账号作用域**的，多账号池下 cloudId 未必
+  属于当前空闲账号，因此逐个空闲账号尝试删除，全部失败才报错；同时清掉本地
+  复用缓存里指向该会话的条目，避免下次续聊撞到已删除会话。
+- `AccountPool::account_count()` 辅助（有限轮询的循环上界）。
+
+### Fixed（限流仍有两处漏网路径会放大请求量 → 禁言）
+上一版把「限流不重试」做在了 `v0_chat_cold` / `try_chat`，但真机上"限流后紧接着重试"
+仍会被禁言，复查发现两条路径没堵住：
+
+- **会话复用的降级冷启动**：`v0_chat` 命中缓存后若 `v0_chat_reuse` 出错，旧实现**无条件**
+  降级到冷启动路径——而冷启动会**新建一个 session**（还可能换到别的账号）。于是用户每点
+  一次「重试」就多一轮上游请求，限流的洪峰被一次次续上。现在限流错误直接上抛
+  （`Err(e @ CoreError::RateLimited(_)) => return Err(e)`），不再降级。
+
+- **复用路径取不到目标账号时的 5 秒等待**：退避中的账号 `get_account_by_id` 返回 None，
+  旧实现会一直等到超时再降级冷启动（同上放大）。新增 `AccountPool::account_cooldown_remaining`
+  区分两种"拿不到"：在退避 → 立即以 `RateLimited` 返回（附剩余秒数）；账号已失效 → 才允许降级。
+
+- **新增 `CoreError::Rejected`**（请求级确定性拒绝）：`input_exceeds_limit` 这类错误，
+  成因不会因重试而改变，但每次重试都要新建 session + 重传文件，把 1 次用户操作放大成
+  3 次上游请求。此前它复用 `ProviderError`，会被冷路径重试循环吞掉 3 次。现在
+  `v0_chat_cold` 对它直接上抛。禁言（`user_is_muted`）**保持** `ProviderError`——它是
+  账号级状态，换号是有效恢复手段，重试循环正是靠 `mark_error` 换号来救这一单。
+
+- 新增回归单测：`account_cooldown_remaining_targets_one_account`；
+  `check_hint_classifies_rate_limit_separately` 补充断言（禁言仍为 ProviderError、
+  超长为 Rejected）。
+
+## [0.2.14] - 2026-09-22
+
+### Fixed（同一对话上下文丢失：续聊被误判成编辑重答）
+- **`plan_conversation` 的 regenerate 判据用错了比较对象**：查找键是「除最后一条 user
+  外」的上下文哈希，命中缓存后旧代码拿**本轮新消息**去比缓存里的 `last_user_text`
+  （缓存记的是该上下文之后那条 user 消息），因此**每一轮续聊都判定为编辑**，
+  走 `edit_message` 重写上一条提问并截断其后内容 —— 应用侧表现为"同一对话里模型只
+  记得最新一条消息"。设备日志实证：14 次会话复用全部 `regenerate=true`，零次续聊。
+- 改为对比「上下文里最后一条 user 消息」（新增 `context_last_user_text`）：
+  续聊 → 上下文里已有该条（相等）→ Append；编辑 → 它已被改掉（不等）→ Regenerate；
+  上下文里没有任何 user 消息（编辑/重试首条）→ 一律 Regenerate。
+  补回归单测 `context_last_user_text_tracks_context_tail`（含纯图片占位符口径）。
+
+### Added（下发云端会话 id，供应用侧去重同步）
+- **`ChatResponse.session_id` / `persistent`**：把本次对话的 `chat_session.id`
+  （即 `fetch_page` 侧栏里那条）从 `ds_core` 透传到适配器。
+- **`ds_session_id`**：持久会话在流末尾追加一个尾随 chunk（形态与 `ds_title` 一致，
+  空 choices）下发该 id，非流式响应亦携带同名字段。应用侧据此把本地会话与云端会话
+  对上号，同步时不再把同一条对话重复导入。
+
 ## [0.2.13] - 2026-09-20
 
 ### Fixed（登录失败：上游为空值字段导致反序列化中断）

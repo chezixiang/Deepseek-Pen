@@ -6,5 +6,6 @@ async fn main() -> anyhow::Result<()> {
     let log_path = format!("{}/logs/runtime.log", data_dir);
     let (config, config_path) = ds_free_api::Config::load_with_args(std::env::args())?;
     ds_free_api::server::runtime_log::init(&log_path, config.server.debug);
+    ds_free_api::server::net_capture::init(&data_dir, config.server.net_capture);
     ds_free_api::server::run(config, config_path).await
 }

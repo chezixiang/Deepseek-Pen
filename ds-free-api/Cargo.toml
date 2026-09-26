@@ -1,6 +1,6 @@
 [package]
 name = "ds-free-api"
-version = "0.2.13"
+version = "0.2.18"
 license = "GPL-3.0"
 edition = "2024"
 

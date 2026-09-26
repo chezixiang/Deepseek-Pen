@@ -100,11 +100,13 @@ function isHighEmoji(cp) {
 
 // BMP 上的零散 emoji（时钟/警示/手写区等，CJK 字体大概率没有）
 function isBmpEmoji(cp) {
-  return (cp >= 0x231A && cp <= 0x231B) || // ⌚⌛
+  return cp === 0x203C || cp === 0x2049 || // ‼ ⁉（映射表里有，旧版漏检）
+         (cp >= 0x2190 && cp <= 0x21FF) || // 箭头区（↗ 等，映射表里有）
+         (cp >= 0x231A && cp <= 0x231B) || // ⌚⌛
          (cp >= 0x23E9 && cp <= 0x23FA) || // 播放控制
          cp === 0x25AA || cp === 0x25AB ||
          (cp >= 0x25FB && cp <= 0x25FE) ||
-         (cp >= 0x2614 && cp <= 0x26FF) || // ☔☄太极等杂项符号
+         (cp >= 0x2600 && cp <= 0x26FF) || // ☀☁☑⚠ 等杂项符号（2600 起完整覆盖）
          (cp >= 0x2700 && cp <= 0x27BF) || // 印刷符号（剪刀✂等）
          (cp >= 0x2B00 && cp <= 0x2BFF) || // ⬆⭐等
          (cp >= 0x1F1E6 && cp <= 0x1F1FF)  // 区域指示（旗）
@@ -130,8 +132,10 @@ function lookupLabel(seq) {
 export function substituteEmoji(text) {
   const src = String(text === undefined || text === null ? '' : text)
   if (!src) return src
-  // 快速路径：没有任何高位面/BMP emoji 代理对或符号时原样返回
-  if (!/[\u231A-\u23FF\u2600-\u27BF\u2B00-\u2BFF]|[\uD83C-\uD83E]/.test(src)) return src
+  // 快速路径：没有任何高位面/BMP emoji 代理对或符号时原样返回。
+  // 区段必须与 isBmpEmoji 保持同步（旧版漏了 ‼⁉/箭头区/2600-2613，
+  // 导致 ↗ ‼ ☀ 这类已配标签的符号走不到替换）。
+  if (!/[\u203C\u2049\u2190-\u21FF\u2300-\u23FF\u25AA\u25AB\u25FB-\u25FE\u2600-\u27BF\u2B00-\u2BFF]|[\uD83C-\uD83E]/.test(src)) return src
 
   let out = ''
   let i = 0
@@ -160,13 +164,41 @@ export function substituteEmoji(text) {
     i += advance
     while (i < src.length) {
       const c2 = src.charCodeAt(i)
-      if (c2 === 0xFE0F || c2 === 0x200D) {
+      if (c2 === 0xFE0F) {
         seq += src.charAt(i)
         i++
-        // ZWJ 后必须再跟一个基元
-        if (c2 === 0x200D && i < src.length) {
+        continue
+      }
+      if (c2 === 0x200D) {
+        // ZWJ 只有在后随基元仍是 emoji 时才并入；后随普通文本（截断/畸形
+        // 序列，如 "👍‍ok"）就停在 ZWJ 前 —— 旧版无条件吃 2 个码元，
+        // 会把 ZWJ 后的正文一起吞进序列再整体丢弃。
+        let j = i + 1
+        let nextIsEmoji = false
+        if (j < src.length) {
+          const n = src.charCodeAt(j)
+          if (n >= 0xD800 && n <= 0xDBFF && j + 1 < src.length) {
+            const lo2 = src.charCodeAt(j + 1)
+            if (lo2 >= 0xDC00 && lo2 <= 0xDFFF) {
+              const cp2 = (n - 0xD800) * 0x400 + (lo2 - 0xDC00) + 0x10000
+              nextIsEmoji = isHighEmoji(cp2) || isBmpEmoji(cp2)
+            }
+          } else {
+            nextIsEmoji = isBmpEmoji(n)
+          }
+        }
+        if (!nextIsEmoji) break
+        seq += src.charAt(i)
+        i++
+        // 消费 ZWJ 后的基元（代理对 2 个码元，或 BMP 字符 1 个）
+        const n2 = src.charCodeAt(i)
+        if (n2 >= 0xD800 && n2 <= 0xDBFF && i + 1 < src.length &&
+            src.charCodeAt(i + 1) >= 0xDC00 && src.charCodeAt(i + 1) <= 0xDFFF) {
           seq += src.substr(i, 2)
           i += 2
+        } else {
+          seq += src.charAt(i)
+          i += 1
         }
         continue
       }

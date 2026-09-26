@@ -35,6 +35,23 @@ pub enum CoreError {
     #[error("no available account")]
     Overloaded,
 
+    /// 上游限流：账号已进入退避窗口，短期内的重试只会加重风控（bug 1）。
+    ///
+    /// 与 Overloaded 分开是必须的：Overloaded 是"当前没有空闲账号，等一会再来"，
+    /// 而这里是"上游明确在限这条链路"——继续重试（尤其换号重试、反复新建 session）
+    /// 会被判定为异常客户端并**升级为禁言**。适配层据此返回 429 且不做任何重试。
+    #[error("upstream rate limited: {0}")]
+    RateLimited(String),
+
+    /// 上游对**本次请求**的确定性拒绝：输入超长、账号禁言等。
+    ///
+    /// 必须与 ProviderError 分开，因为重试语义不同：这些错误的成因不会因为重试而
+    /// 改变（同一份输入还是超长、同一个账号还是禁言），但每一次重试都要新建一个
+    /// session、再传一遍文件、再撞一次上游——把 1 次用户操作放大成 3 次上游请求，
+    /// 与"重试把限流升级成禁言"是同一类问题（bug 1）。
+    #[error("upstream rejected: {0}")]
+    Rejected(String),
+
     /// PoW 计算失败
     #[error("proof of work failed: {0}")]
     ProofOfWorkFailed(#[from] PowError),
@@ -51,6 +68,38 @@ pub enum CoreError {
 impl From<ClientError> for CoreError {
     fn from(e: ClientError) -> Self {
         CoreError::ProviderError(e.to_string())
+    }
+}
+
+/// 返回不超过 max 字节的最近 UTF-8 字符边界，供错误信息截断使用。
+/// 上游文本大量是中文（3 字节/字符），直接 `&s[..len.min(N)]` 切在
+/// 多字节字符中间会 panic（panic=abort 下等于杀掉整个进程）。
+pub(crate) fn floor_utf8_end(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut i = max;
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+#[cfg(test)]
+mod utf8_tests {
+    use super::floor_utf8_end;
+
+    #[test]
+    fn floor_utf8_end_lands_on_char_boundary() {
+        let s = "你好ab"; // 你=3B 好=3B a=1B b=1B
+        assert_eq!(floor_utf8_end(s, 2), 0, "落在'你'中间 → 回退到串首");
+        assert_eq!(floor_utf8_end(s, 3), 3, "恰好在边界不回退");
+        assert_eq!(floor_utf8_end(s, 4), 3, "落在'好'中间 → 回退到 3");
+        assert_eq!(floor_utf8_end(s, 5), 3);
+        assert_eq!(floor_utf8_end(s, 6), 6);
+        assert_eq!(floor_utf8_end(s, 100), s.len(), "超长 → 串尾");
+        assert_eq!(floor_utf8_end("abc", 2), 2, "ASCII 不回退");
+        assert_eq!(floor_utf8_end("", 10), 0);
     }
 }
 
@@ -172,6 +221,11 @@ impl DeepSeekCore {
         session_id: &str,
     ) -> Result<Vec<crate::ds_core::client::CloudMessage>, CoreError> {
         self.completions.list_cloud_session_messages(session_id).await
+    }
+
+    /// 删除云端会话（本地删除对话时同步调用，bug 3）
+    pub async fn delete_cloud_session(&self, session_id: &str) -> Result<String, CoreError> {
+        self.completions.delete_cloud_session(session_id).await
     }
 
     /// 查询会话复用缓存（持久 DeepSeek 会话；None = 冷启动）

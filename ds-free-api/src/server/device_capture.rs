@@ -323,8 +323,16 @@ pub async fn submit(
     } else {
         updated_account.mobile.clone()
     };
-    let _ = state.adapter.remove_account(&display).await;
-    match state.adapter.add_account(&updated_account).await {
+    let Ok(adapter) = state.adapter().await else {
+        // 启动中：凭据已写入 config，后台初始化会带上新凭据登录
+        return Json(serde_json::json!({
+            "ok": true,
+            "message": "设备凭据已写入，后端启动完成后将用新凭据登录"
+        }))
+        .into_response();
+    };
+    let _ = adapter.remove_account(&display).await;
+    match adapter.add_account(&updated_account).await {
         Ok(_) => Json(serde_json::json!({
             "ok": true,
             "message": "设备凭据已写入并重新登录成功"
@@ -377,13 +385,30 @@ async fn download_and_patch_fp() -> Result<String, String> {
         .user_agent(crate::ds_core::default_user_agent())
         .build()
         .map_err(|e| format!("HTTP client: {e}"))?;
+    let cid = crate::server::net_capture::begin();
+    crate::server::net_capture::req(
+        cid,
+        "GET",
+        FP_SCRIPT_URL,
+        &wreq::header::HeaderMap::new(),
+        None,
+    );
     let resp = client
         .get(FP_SCRIPT_URL)
         .timeout(std::time::Duration::from_secs(20))
         .send()
-        .await
-        .map_err(|e| format!("下载 fp.min.js 失败: {e}"))?;
+        .await;
+    match &resp {
+        Ok(r) => crate::server::net_capture::resp(cid, r.status().as_u16(), r.headers(), false),
+        Err(e) => crate::server::net_capture::err(cid, &e.to_string()),
+    }
+    let resp = resp.map_err(|e| format!("下载 fp.min.js 失败: {e}"))?;
     let code = resp.text().await.map_err(|e| format!("读取: {e}"))?;
+    crate::server::net_capture::body(
+        cid,
+        code.as_bytes(),
+        code.len() > crate::server::net_capture::MAX_BODY_BYTES,
+    );
     apply_fp_patches(&code)
 }
 

@@ -7,12 +7,26 @@
 //   ds:active        -> 当前会话 id（字符串）
 
 import { storageSet, storageGet, storageRemove, readFile, writeFile, dsConfigPath, joinPath, dataDirBase } from './native.js'
+import { tomlStringValue, stripTomlComments, sectionBody, accountSections, accountIdFromSection } from './toml-config.js'
 import { appLog } from './app-log.js'
 import { BUILD_NUM } from './build-info.js'
+// 纯函数（normalize/uid/脱敏等）抽到 store-schema.js：无 native 依赖，可在 Node 里回归测试。
+// 这里转发导出，保持对外 API 不变。
+import {
+  uid as _uid,
+  normalizeConversation as _normalizeConversation,
+  normalizeMessages as _normalizeMessages,
+  stripImagePayloads as _stripImagePayloads,
+  maskAccountId as _maskAccountId
+} from './store-schema.js'
+
+export const uid = _uid
+export const normalizeConversation = _normalizeConversation
+export const normalizeMessages = _normalizeMessages
 
 // 应用版本号：格式 "主.次.修订 build N"。build N 由 scripts/build-wrapper.js
 // 在每次构建时对 build-info.js 的 BUILD_NUM 自动 +1（#17），便于用户确认是否更新。
-export const APP_VERSION = '0.1.2 build ' + BUILD_NUM
+export const APP_VERSION = '0.1.4 build ' + BUILD_NUM
 
 const KEY_CONVERSATIONS = 'ds:conversations'
 const KEY_SETTINGS = 'ds:settings'
@@ -35,7 +49,8 @@ export const DEFAULT_SETTINGS = {
   defaultThinking: true,
   defaultSearch: false,
   defaultExpandThinking: true,
-  sse: true,
+  // 流式输出（SSE）已固定开启，不再提供开关：非流式分支在设备上体验差
+  // （整段等完才出字），且两条路径要各自维护错误处理。旧设置里的 sse 字段被忽略。
   systemPrompt: '',
   portrait: false,
   debugMode: false,
@@ -49,23 +64,19 @@ export const DEFAULT_SETTINGS = {
 // 本机 ds-free-api 的配置文件（用户在设备上自行配置的凭据，读取而非硬编码）。
 // 已迁移到应用 data 目录（build 22），fs 可直接读取——旧 /userdisk 路径在部分设备读不到。
 
-// 去掉 TOML 中以 # 开头的注释行，避免把示例/注释误判为真实配置。
-function stripTomlComments(raw) {
-  return String(raw || '')
-    .split('\n')
-    .filter((line) => line.trim().indexOf('#') !== 0)
-    .join('\n')
-}
+// 账号显示名缓存（ds:accounts）与当前活动账号（ds:activeAccount）。
+// 声明在文件靠前位置：loadSettings 里的"配置读不到"兜底要用到 KEY_ACCOUNTS。
+const KEY_ACCOUNTS = 'ds:accounts'
+const KEY_ACTIVE_ACCOUNT = 'ds:activeAccount'
 
 async function readLocalApiKey() {
   try {
     const raw = stripTomlComments(await readFile(dsConfigPath()))
     if (!raw) return ''
-    const m = raw.match(/\[\[api_keys\]\]\s*key\s*=\s*"([^"]+)"/)
-    if (m) return m[1]
-    const m2 = raw.match(/\[\[api_keys\]\]\s*key\s*=\s*'([^']+)'/)
-    if (m2) return m2[1]
-    return ''
+    // [[api_keys]] 段可能不是第一个段：先定位段，再在段内取值
+    const seg = sectionBody(raw, '[[api_keys]]')
+    const key = tomlStringValue(seg, 'key').trim()
+    return key
   } catch (e) {
     return ''
   }
@@ -76,24 +87,56 @@ async function readLocalDsUser() {
   try {
     const raw = stripTomlComments(await readFile(dsConfigPath()))
     if (!raw) return ''
-    // 优先邮箱，其次手机号
-    const em = raw.match(/\[\[accounts\]\][\s\S]*?email\s*=\s*"([^"]*)"/)
-    const mob = raw.match(/\[\[accounts\]\][\s\S]*?mobile\s*=\s*"([^"]*)"/)
-    const email = em && em[1] ? em[1].trim() : ''
-    const mobile = mob && mob[1] ? mob[1].trim() : ''
-    return email || mobile || ''
+    const secs = accountSections(raw)
+    for (let i = 0; i < secs.length; i++) {
+      const a = accountIdFromSection(secs[i])
+      if (a.id) return a.id
+    }
+    return ''
   } catch (e) {
     return ''
   }
 }
 
 // 判断本机 ds-free-api config.toml 是否已配置账号密码（用于设置页显示"已配置"状态）。
+//
+// 判定口径从"密码非空"放宽为"有账号标识且有密码"：后端（toml crate）在密码含
+// 双引号/反斜杠时会写成**单引号字面量**、含换行时写成多行字符串，旧正则只认双引号，
+// 于是把已登录的账号读成"未配置" → 进账号页就被弹去登录页（bug 2）。
+//
+// 另外区分"读不到配置"与"确实没账号"：前者（文件暂时读不到，例如后端正在重写/
+// 部署中）不能当作未登录，否则一次瞬时读失败就会把用户踢到登录页。
 async function readLocalDsConfigured() {
+  const state = await readLocalDsConfiguredState()
+  return state.configured
+}
+
+/// 返回 { readable, configured }：readable=false 表示配置文件这次没读到（不代表没账号）
+export async function readLocalDsConfiguredState() {
   try {
-    const raw = stripTomlComments(await readFile(dsConfigPath()))
-    if (!raw) return false
-    const acc = readLocalDsPassRaw(raw)
-    return !!acc
+    const raw = await readFile(dsConfigPath())
+    if (raw === null || raw === undefined || String(raw).trim() === '') {
+      return { readable: false, configured: false }
+    }
+    const secs = accountSections(stripTomlComments(raw))
+    for (let i = 0; i < secs.length; i++) {
+      const a = accountIdFromSection(secs[i])
+      const pass = tomlStringValue(secs[i], 'password').trim()
+      if (a.id && pass) return { readable: true, configured: true }
+    }
+    return { readable: true, configured: false }
+  } catch (e) {
+    return { readable: false, configured: false }
+  }
+}
+
+// 应用侧缓存里是否还记着账号（ds:accounts）。仅用于"配置暂时读不到"时兜底判断：
+// 用户主动退出登录会走 removeAccountById 清掉这个缓存，所以它非空 =
+// 上一次确实是登录状态，不该因为一次读失败就把人踢去登录页。
+async function hasCachedAccount() {
+  try {
+    const list = await getJSON(KEY_ACCOUNTS, [])
+    return Array.isArray(list) && list.length > 0
   } catch (e) {
     return false
   }
@@ -109,18 +152,16 @@ export async function readLocalDsPass() {
   }
 }
 
+// 本机已配置的密码（原样，仅用于设置页掩码显示）。
+// 走通用取值器以兼容后端可能写出的各种字符串形态（见 tomlStringValue）。
 function readLocalDsPassRaw(raw) {
   if (!raw) return ''
-  const dq = raw.match(/\[\[accounts\]\][\s\S]*?password\s*=\s*"([^"]*)"/)
-  if (dq && dq[1]) return dq[1]
-  const sq = raw.match(/\[\[accounts\]\][\s\S]*?password\s*=\s*'([^']*)'/)
-  return sq && sq[1] ? sq[1] : ''
-}
-
-let seq = 0
-export function uid(prefix = 'id') {
-  seq += 1
-  return `${prefix}_${Date.now().toString(36)}_${seq}_${Math.floor(Math.random() * 1e6).toString(36)}`
+  const secs = accountSections(raw)
+  for (let i = 0; i < secs.length; i++) {
+    const pass = tomlStringValue(secs[i], 'password')
+    if (pass) return pass
+  }
+  return ''
 }
 
 function filePathFor(key) {
@@ -151,7 +192,17 @@ async function getJSON(key, fallback) {
 async function setJSON(key, value) {
   const text = JSON.stringify(value)
   // 文件与 storage 双写，保证重启后仍在
-  await writeFile(filePathFor(key), text)
+  let okFile = false
+  try {
+    okFile = await writeFile(filePathFor(key), text)
+  } catch (e) {
+    okFile = false
+  }
+  if (!okFile) {
+    // 文件写失败（磁盘满/权限）时清空旧文件：getJSON 是文件优先，
+    // 留着旧内容会把刚写进 storage 的新值永久遮住（读到的是过期数据）
+    try { await writeFile(filePathFor(key), '') } catch (e) { /* 尽力而为 */ }
+  }
   await storageSet(key, text)
   return true
 }
@@ -162,18 +213,11 @@ async function removeJSON(key) {
   return true
 }
 
-// 兼容旧会话：补全 mode / thinking / search 等字段，避免旧数据因字段缺失导致开关失效。
-export function normalizeConversation(c) {
-  return Object.assign({
-    mode: 'fast',
-    thinking: true,
-    search: false
-  }, c || {})
-}
+// 兼容旧会话的 normalizeConversation 已抽到 store-schema.js（文件顶部转发导出）
 
 export async function loadConversations() {
   const list = await getJSON(KEY_CONVERSATIONS, [])
-  return (Array.isArray(list) ? list : []).map(normalizeConversation)
+  return (Array.isArray(list) ? list : []).map(_normalizeConversation)
 }
 
 export async function saveConversations(list) {
@@ -182,60 +226,16 @@ export async function saveConversations(list) {
 
 export async function loadMessages(convId) {
   const list = await getJSON(msgKey(convId), [])
-  return normalizeMessages(Array.isArray(list) ? list : [])
+  return _normalizeMessages(Array.isArray(list) ? list : [])
 }
+
+// 落盘前剥图片 payload 的 stripImagePayloads 已抽到 store-schema.js
 
 export async function saveMessages(convId, list) {
-  return setJSON(msgKey(convId), list)
+  return setJSON(msgKey(convId), _stripImagePayloads(list))
 }
 
-// 兼容旧数据：给用户消息补 revisions，给助手消息补 attempts。
-// 新版「重试 / 修改」不再覆盖旧内容，而是把每次结果作为版本保存在同一气泡里。
-export function normalizeMessages(list) {
-  if (!Array.isArray(list)) return []
-  const out = []
-  for (const m of list) {
-    const msg = Object.assign({}, m)
-    if (msg.role === 'user') {
-      if (!Array.isArray(msg.revisions) || msg.revisions.length === 0) {
-        msg.revisions = [{
-          content: msg.content || '',
-          images: msg.images || [],
-          createdAt: msg.createdAt
-        }]
-      }
-      if (typeof msg.activeRevision !== 'number' || !msg.revisions[msg.activeRevision]) {
-        msg.activeRevision = msg.revisions.length - 1
-      }
-      const rev = msg.revisions[msg.activeRevision]
-      msg.content = rev.content || ''
-      msg.images = rev.images || []
-    } else if (msg.role === 'assistant') {
-      if (!Array.isArray(msg.attempts) || msg.attempts.length === 0) {
-        msg.attempts = [{
-          id: msg.id,
-          content: msg.content || '',
-          reasoning: msg.reasoning || '',
-          error: msg.error || '',
-          pending: !!msg.pending,
-          createdAt: msg.createdAt
-        }]
-      }
-      if (typeof msg.activeAttempt !== 'number' || !msg.attempts[msg.activeAttempt]) {
-        msg.activeAttempt = msg.attempts.length - 1
-      }
-      const att = msg.attempts[msg.activeAttempt]
-      if (att) {
-        msg.content = att.content || ''
-        msg.reasoning = att.reasoning || ''
-        msg.error = att.error || ''
-        msg.pending = !!att.pending
-      }
-    }
-    out.push(msg)
-  }
-  return out
-}
+// 兼容旧数据的 normalizeMessages 已抽到 store-schema.js（文件顶部转发导出）
 
 export async function deleteMessages(convId) {
   await removeJSON(msgKey(convId))
@@ -263,7 +263,19 @@ export async function loadSettings() {
     merged.dsUser = await readLocalDsUser()
   }
   // 记录本机是否已配置账号密码，供设置页显示"已配置"状态（不回填明文密码）
-  merged.dsConfigured = await readLocalDsConfigured()
+  const cfgState = await readLocalDsConfiguredState()
+  if (cfgState.readable) {
+    merged.dsConfigured = cfgState.configured
+    merged.dsConfigReadable = true
+  } else {
+    // 配置这次没读到（后端正在重写/部署中）：不能据此判定"未登录"——
+    // 那会把已登录用户踢去登录页（bug 2）。用应用侧缓存兜底：
+    // 缓存里还有账号说明上次确实是登录状态，维持"已配置"，等下次读取刷新。
+    const cached = await hasCachedAccount()
+    merged.dsConfigured = cached || !!merged.dsUser
+    merged.dsConfigReadable = false
+    appLog('[store] config.toml 本次未读到，dsConfigured 回退为 ' + merged.dsConfigured + '（缓存账号=' + cached + '）')
+  }
   return merged
 }
 
@@ -310,37 +322,21 @@ export async function loadAccountTrouble() {
 // （native.js updateDsFreeApiAccount / clearDsFreeApiAccount）只改写*第一个*段，
 // 所以登录页按「单账号」呈现——列出 config 里已有的账号、标出当前使用的一个。
 // 多账号完整增删需后端 /admin API 配合（后端已具备 add_account/remove_account 能力）。
-
-const KEY_ACCOUNTS = 'ds:accounts'
-const KEY_ACTIVE_ACCOUNT = 'ds:activeAccount'
+// KEY_ACCOUNTS / KEY_ACTIVE_ACCOUNT 两个键常量声明在文件上方（loadSettings 的兜底逻辑要用）。
 
 /// 解析 config.toml 中全部 [[accounts]] 段（只取标识字段，不读密码）
 function parseAllAccounts(raw) {
   if (!raw) return []
   const out = []
-  const sections = String(raw).split('[[accounts]]')
-  for (let i = 1; i < sections.length; i++) {
-    const seg = sections[i].split('\n[')[0]
-    const em = seg.match(/email\s*=\s*"([^"]*)"/)
-    const mo = seg.match(/mobile\s*=\s*"([^"]*)"/)
-    const email = em && em[1] ? em[1].trim() : ''
-    const mobile = mo && mo[1] ? mo[1].trim() : ''
-    const id = email || mobile
-    if (id) out.push({ id, email, mobile })
+  const secs = accountSections(raw)
+  for (let i = 0; i < secs.length; i++) {
+    const a = accountIdFromSection(secs[i])
+    if (a.id) out.push({ id: a.id, email: a.email, mobile: a.mobile })
   }
   return out
 }
 
-function maskAccountId(id) {
-  const v = String(id || '')
-  const at = v.indexOf('@')
-  if (at > 0) {
-    const name = v.slice(0, at)
-    return name.slice(0, 2) + '***' + v.slice(at)
-  }
-  if (v.length >= 7) return v.slice(0, 3) + '****' + v.slice(-4)
-  return v
-}
+// 账号显示名脱敏 maskAccountId 已抽到 store-schema.js（顶部以 _maskAccountId 引入）
 
 /// 账号列表（登录页用）：config.toml 账号 + 活动标记
 export async function loadAccountList() {
@@ -366,7 +362,7 @@ export async function loadAccountList() {
     const hit = cached.find((c) => c.id === a.id)
     return {
       id: a.id,
-      display: hit && hit.display ? hit.display : maskAccountId(a.id),
+      display: hit && hit.display ? hit.display : _maskAccountId(a.id),
       active: a.id === active,
       state: ''
     }
@@ -383,7 +379,7 @@ export async function upsertAccount(id) {
     const key = String(id || '').trim()
     if (!key) return false
     if (!arr.some((a) => a.id === key)) {
-      arr.push({ id: key, display: maskAccountId(key), addedAt: Date.now() })
+      arr.push({ id: key, display: _maskAccountId(key), addedAt: Date.now() })
       await setJSON(KEY_ACCOUNTS, arr.slice(-10))
     }
     return true

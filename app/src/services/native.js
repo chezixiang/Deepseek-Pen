@@ -8,7 +8,6 @@ import globalModule from 'global'
 import { appLog } from './app-log.js'
 import {
   openTextEditor as coreOpenTextEditor,
-  closeTextEditor,
   isAsrEnabled as coreIsAsrEnabled,
   INPUT_TYPES
 } from '@dictpen/core'
@@ -126,6 +125,21 @@ export function sleep(ms) {
 // ---------- 文件（import fs） ----------
 export async function readFile(path) {
   try { return await fs.readFile(path) } catch (e) { return null }
+}
+
+// fs.readFile 读不到（个别机型应用进程非 root，而 ds-free-api 以 root 运行，
+// 写出的 config.toml 曾带 0600 权限 → "无法读取 ds-free-api 配置文件"10201）时，
+// 用 execShell（root）cat 落到应用可读的临时文件再读。仅限小文件（配置）使用。
+export async function readFileWithShellFallback(path) {
+  const raw = await readFile(path)
+  if (raw !== null) return raw
+  const out = joinDataDir('ds-cat-' + Date.now() + '.txt')
+  await writeFile(out, '')
+  execShell('cat ' + shq(path) + ' > ' + shq(out) + ' 2>/dev/null; chmod 644 ' + shq(path) + ' 2>/dev/null; true')
+  const via = await waitForFile(out, 5000)
+  execShell('rm -f ' + shq(out) + ' 2>/dev/null || true')
+  if (via === null || String(via) === '') return null
+  return String(via)
 }
 
 export async function writeFile(path, content) {
@@ -446,14 +460,14 @@ async function truncateRuntimeLog() {
 // 这里在真正要用配置的三个入口统一兜一层，避免"配置没了 → 账号存不进去"的死局。
 async function readConfigOrRepair() {
   const DS_CONFIG = dsConfigPath()
-  const raw = await readFile(DS_CONFIG)
+  let raw = await readFileWithShellFallback(DS_CONFIG)
   if (raw !== null) return raw
-  appLog('[config] config.toml 缺失，尝试自愈重建')
+  appLog('[config] config.toml 缺失或不可读，尝试自愈重建')
   const r = await ensureDsConfig()
   if (!r.ok) return null
   // 重建后必须重启后端，否则跑着的进程仍持旧 api_key
   await restartDsFreeApi()
-  return await readFile(DS_CONFIG)
+  return await readFileWithShellFallback(DS_CONFIG)
 }
 
 /**
@@ -696,6 +710,91 @@ export async function updateDsFreeApiProxy(url) {
   }
 }
 
+// ---------- 调试网络抓取（JSONL） ----------
+// 「启用调试日志」开关联动：把 [server] net_capture 写入本机 config.toml 并重启后端。
+// 后端开启后把与 DeepSeek/数美的全部 HTTP 往返逐行落盘
+// logs/net-capture.jsonl（JSONL，见 ds-free-api/src/server/net_capture.rs），
+// 出现新的禁言/风控时无需挂代理抓包即可拿到第一手报文。
+
+// 行级改写 [server] 段的 net_capture 键（纯字符串操作）。
+// 与 [proxy] 整段替换不同：[server] 段还有 port/host 等键，只能改写单键——
+// 键存在改值；段内缺失补在段尾；无 [server] 段则追加段。无变化返回 null。
+function replaceServerNetCapture(raw, enabled) {
+  const lines = String(raw || '').split('\n')
+  const want = 'net_capture = ' + (enabled ? 'true' : 'false')
+  let inServer = false
+  let lastServerLine = -1
+  let seen = false
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim()
+    if (trimmed.startsWith('[')) {
+      if (inServer) break // 进入下一段，[server] 段结束
+      inServer = trimmed === '[server]'
+      if (inServer) lastServerLine = i
+      continue
+    }
+    if (!inServer) continue
+    const kv = lines[i].match(/^\s*([a-zA-Z_]+)\s*=/)
+    if (!kv) continue
+    lastServerLine = i
+    if (kv[1] === 'net_capture') {
+      if (lines[i].trim() === want) return null // 已是目标值，无需写盘重启
+      lines[i] = want
+      seen = true
+    }
+  }
+  if (lastServerLine < 0) {
+    return raw + (raw.endsWith('\n') ? '' : '\n') + '[server]\n' + want + '\n'
+  }
+  if (!seen) lines.splice(lastServerLine + 1, 0, want)
+  return lines.join('\n')
+}
+
+/**
+ * 更新本机 ds-free-api 的网络抓取开关并重启服务（「启用调试日志」联动）。
+ * @param {boolean} enabled true=开启抓取，false=关闭
+ * 返回 { ok, message }。写入即生效（配置已落盘 + 后端已重启 + 探活）。
+ */
+export async function updateDsFreeApiNetCapture(enabled) {
+  const DS_CONFIG = dsConfigPath()
+  try {
+    const raw = await readConfigOrRepair()
+    if (raw === null) return makeErr(10201, '无法读取 ds-free-api 配置文件（路径：' + DS_CONFIG + '）')
+    const next = replaceServerNetCapture(raw, !!enabled)
+    if (next === null) return { ok: true, message: '抓取开关未变化' }
+
+    // 备份 + 原子写入，等待 execShell 完成（与账号更新同款可靠模式）
+    const tmp = joinDataDir('dscapture.tmp.toml')
+    const resultFile = joinDataDir('dscapture-result.txt')
+    const writeOk = await writeFile(tmp, next)
+    if (!writeOk) return makeErr(10402, '写入临时配置文件失败')
+    await writeFile(resultFile, '')
+    const cmd =
+      'cp ' + shq(DS_CONFIG) + ' ' + shq(DS_CONFIG + '.bak') + ' && ' +
+      'cp ' + shq(tmp) + ' ' + shq(DS_CONFIG + '.new') + ' && ' +
+      'mv -f ' + shq(DS_CONFIG + '.new') + ' ' + shq(DS_CONFIG) + ' && ' +
+      'printf ok > ' + shq(resultFile) + ' || printf failed > ' + shq(resultFile)
+    if (!execShell(cmd)) return makeErr(10403, '启动配置更新命令失败')
+    const result = String(await waitForFile(resultFile, 10000) || '').trim()
+    execShell('rm -f ' + shq(tmp) + ' ' + shq(resultFile) + ' ' + shq(DS_CONFIG + '.new') + ' 2>/dev/null || true')
+    if (result !== 'ok') return makeErr(10403, '写入配置文件失败')
+
+    const restartResult = await restartDsFreeApi()
+    if (!restartResult.ok) return restartResult
+
+    const healthy = await healthCheck()
+    appLog('[capture] net_capture=' + !!enabled + ' health=' + healthy)
+    return {
+      ok: true,
+      message: healthy
+        ? (enabled ? '网络抓取已开启' : '网络抓取已关闭')
+        : (enabled ? '抓取已写入并重启后端，探活未通过（稍后自动恢复）' : '已写入关闭并重启后端，探活未通过')
+    }
+  } catch (e) {
+    return makeErr(10002, '更新网络抓取开关失败：' + (e && e.message ? e.message : String(e)))
+  }
+}
+
 async function restartDsFreeApi() {
   const DS_FREE_API_DIR = dsHomeDir()
   const binPath = joinPath(DS_FREE_API_DIR, 'ds-free-api')
@@ -720,8 +819,11 @@ async function restartDsFreeApi() {
   //     僵尸后端的 cwd 已被删除、名字也可能变化，只有按端口才能找到它。
   //  3) pkill（不带 -x，宽匹配）兜底，覆盖还占着非标准端口的游离进程。
   const oldPid = String(await readFile(pidFile) || '').trim()
+  // PID 会被系统复用而 pid 文件跨重启保留：重启后同号 PID 可能是任何进程。
+  // 先核对 /proc/<pid>/cmdline 仍是 ds-free-api 才 kill -9，否则跳过
+  // （还有 fuser/pkill 两条兜底路径）。
   const killOld = oldPid && /^\d+$/.test(oldPid)
-    ? 'kill -9 ' + shq(oldPid) + ' 2>/dev/null; '
+    ? 'if grep -aq ds-free-api /proc/' + oldPid + '/cmdline 2>/dev/null; then kill -9 ' + oldPid + ' 2>/dev/null; fi; '
     : ''
   const killByPort = DS_PORTS
     .map((p) => 'fuser -k -9 ' + p + '/tcp 2>/dev/null; ')
@@ -761,6 +863,8 @@ async function healthCheck() {
   // 串行探测，优先 22217（主端口）。execShell 是异步无回显的，&&/wait 等后台组合在
   // 设备上不可靠，回退到逐端口 curl + 文件轮询（build 19 验证过的可靠方式）。
   // 每端口 curl -m 1 + 1.5s 等待；端口少（主端口优先），一轮最快 ~1.5s。
+  // 新后端带 ready 字段（早绑定启动）：这里只验证服务可达，完整启动由
+  // healthCheckWithAccount / checkBackendHealth(waitForReady) 等待。
   const order = [DS_PORTS[0], ...DS_PORTS.slice(1)] // 22217 优先
   for (let i = 0; i < 3; i++) {
     for (const port of order) {
@@ -780,10 +884,12 @@ async function healthCheck() {
   return false
 }
 
-// 健康检查 + 等待账号就绪：/health 返回 ok 且 accounts.total > 0 才算成功。
-// 用于"保存账号"后验证——仅端口绑定不代表 DeepSeek 登录成功，账号池空时对话会"未认证"。
+// 健康检查 + 等待账号就绪：/health 返回 ok 且 ready=true（账号登录完成）
+// 且 accounts.total > 0 才算成功。用于"保存账号"与启动页"完全启动"等待——
+// 早绑定模式下端口秒通但登录在后台进行，不能拿端口连通当就绪。
 async function healthCheckWithAccount(timeoutMs) {
   const deadline = Date.now() + (timeoutMs || 30000)
+  let sawNotReady = false
   while (Date.now() < deadline) {
     for (const port of DS_PORTS) {
       const probe = joinDataDir('dshealth_acc_' + Date.now() + '_' + port + '.txt')
@@ -792,8 +898,15 @@ async function healthCheckWithAccount(timeoutMs) {
       const out = await waitForFile(probe, 1500)
       execShell('rm -f ' + shq(probe) + ' 2>/dev/null || true')
       if (out !== null && String(out).indexOf('"status":"ok"') >= 0) {
+        const text = String(out)
+        // 旧后端无 ready 字段 → 视为已就绪
+        const ready = text.indexOf('"ready"') < 0 || /"ready"\s*:\s*true/.test(text)
+        if (!ready) {
+          sawNotReady = true
+          continue
+        }
         // 端口通了，检查账号池
-        const m = String(out).match(/"total"\s*:\s*(\d+)/)
+        const m = text.match(/"total"\s*:\s*(\d+)/)
         const total = m ? parseInt(m[1], 10) : 0
         if (total > 0) {
           appLog('[health] ok+账号 port=' + port + ' total=' + total)
@@ -804,7 +917,7 @@ async function healthCheckWithAccount(timeoutMs) {
     }
     await sleep(1500)
   }
-  appLog('[health] 等待账号就绪超时')
+  appLog('[health] 等待账号就绪超时' + (sawNotReady ? '（期间后端未完成初始化）' : ''))
   return false
 }
 
@@ -873,10 +986,57 @@ async function deployedBackendMatches() {
 //
 // 返回 { ok, existed, changed }：existed=false 表示本次新建；changed=true 表示写盘了
 // （新建或被修正），调用方据此决定要不要重启后端让新配置生效。
+//
+// tryWriteConfig：fs.writeFile 失败（root 属主/只读属主）时经 execShell 以 root
+// 写入。内容先落应用可写的 tmp，再由 root cp 到目标——execShell 参数转义用 shq。
+async function tryWriteConfig(path, content) {
+  if (await writeFile(path, content)) return true
+  const tmp = joinDataDir('dsconfig-root-' + Date.now() + '.toml')
+  if (!(await writeFile(tmp, content))) return false
+  const resultFile = joinDataDir('dsconfig-root-result.txt')
+  await writeFile(resultFile, '')
+  execShell('cp ' + shq(tmp) + ' ' + shq(path) + ' && chmod 644 ' + shq(path) + '; printf ok > ' + shq(resultFile))
+  const out = String(await waitForFile(resultFile, 8000) || '').trim()
+  execShell('rm -f ' + shq(tmp) + ' ' + shq(resultFile) + ' 2>/dev/null || true')
+  return out === 'ok'
+}
+
 async function ensureDsConfig() {
   const DS_CONFIG = dsConfigPath()
 
-  if (await exists(DS_CONFIG)) {
+  // 存在性判断必须能识别"fs 读不到但文件实际存在"的机型（非 root 应用进程
+  // 遇到 root 写出的 0600 文件）：exists+readFile 都失败时再用 execShell cat 兜底，
+  // 否则会误判为缺失并重建空配置，把已登录账号抹掉。
+  let shellProbe = null
+  if (!(await exists(DS_CONFIG))) {
+    shellProbe = await readFileWithShellFallback(DS_CONFIG)
+    if (shellProbe === null) {
+      // 真缺失：走重建
+    } else {
+      const repairedPerms = shellProbe
+      // 文件存在但 fs 读不到：立即放宽权限，之后按已有内容继续走修复逻辑
+      execShell('chmod 644 ' + shq(DS_CONFIG) + ' 2>/dev/null; chown $(id -u):$(id -g) ' + shq(DS_CONFIG) + ' 2>/dev/null; true')
+      const before = String(repairedPerms || '')
+      let raw = before
+      const fixed = fixFingerprint(raw)
+      if (fixed && fixed !== raw) {
+        raw = fixed
+        debugLog('DS | 已修复 config.toml 指纹字段（UA/version/platform/bundle_id/timezone）')
+      }
+      const fixedTypes = fixModelTypes(raw)
+      if (fixedTypes && fixedTypes !== raw) {
+        raw = fixedTypes
+        debugLog('DS | 已把 config.toml model_types 收敛为合并后的 ["default"]')
+      }
+      if (raw !== before) {
+        // fs.writeFile 可能同样写不进 root 属主文件——先夺回属主再写
+        const w = await tryWriteConfig(DS_CONFIG, raw)
+        appLog('[deploy] config.toml 已自动修复（shell 兜底路径）ok=' + w)
+        return { ok: !!w, existed: true, changed: !!w }
+      }
+      return { ok: true, existed: true, changed: false }
+    }
+  } else {
     const before = String(await readFile(DS_CONFIG) || '')
     let raw = before
     // 指纹修复无条件跑：除了替换旧值，还要补齐新增字段（旧的 indexOf 判断会漏掉这类配置）
@@ -941,7 +1101,7 @@ async function ensureDsConfig() {
     'password = ""',
     ''
   ].join('\n')
-  const configOk = await writeFile(DS_CONFIG, minConfig)
+  const configOk = await tryWriteConfig(DS_CONFIG, minConfig)
   appLog('[deploy] config.toml 缺失，已重建最小配置 ok=' + configOk)
   return { ok: !!configOk, existed: false, changed: !!configOk }
 }
@@ -978,7 +1138,20 @@ function supportedArch() {
 }
 
 // 确保 ds-free-api 后端已部署到应用 data 目录（$dataDir/ds-free-api）
-export async function deployBackend() {
+//
+// single-flight：startup/index 走 ensureBackendRunning（内部会调 deploy），
+// settings 页又直接调 deployBackend——两条并发路径写同一个 ds-free-api.b64
+// 临时文件、跑同一条解码/替换命令，交错时会产生截断的 b64 和失败的部署。
+// 与 ensureBackendRunning 一样共享同一个 Promise。
+let _deployPromise = null
+
+export function deployBackend() {
+  if (_deployPromise) return _deployPromise
+  _deployPromise = doDeployBackend().finally(() => { _deployPromise = null })
+  return _deployPromise
+}
+
+async function doDeployBackend() {
   const targetDir = dsHomeDir()
   const targetBin = joinPath(targetDir, 'ds-free-api')
   const targetLogDir = joinPath(targetDir, 'logs')
@@ -1208,8 +1381,12 @@ export async function checkDeviceCredentials() {
   }
 }
 
-// 系统输入法编辑器统一走 @dictpen/core 封装，确保与 SDK 新版输入法/语音识别逻辑一致。
-export { closeTextEditor, INPUT_TYPES }
+// 系统输入法编辑器：本模块直接调用原生 Global（不再走 @dictpen/core 的封装）。
+// 原因（bug 4，真机取证）：预填充文本的字段名与 SDK 用的 `contents` 不同——
+// 在本机 X7 Pro 的有道输入法 2.9.12 上按候选字段逐个打标记实测，只有 **text**
+// 会被编辑器采用（contents / defaultText / inputText / value … 均被忽略，
+// 编辑器一片空白）。这里把值放 text，并保留 contents 以兼容按该名字实现的固件。
+export { INPUT_TYPES }
 
 export function isAsrEnabled() {
   try {
@@ -1219,9 +1396,167 @@ export function isAsrEnabled() {
   }
 }
 
-export function openTextEditor(inputType, initialText) {
-  // 透传预填充文本：修改消息/设置项时把当前值带回 IME（Bug 4）
-  return coreOpenTextEditor(inputType, initialText)
+// 上一次编辑会话：用于防泄漏（页面隐藏/关闭时按取消结算）
+let _editSettle = null
+let _editCleanup = null
+
+function editGlobal() {
+  try {
+    return g()
+  } catch (e) {
+    return null
+  }
+}
+
+export function closeTextEditor() {
+  const gg = editGlobal()
+  try { if (gg) gg.closeTextEdit() } catch (e) { /* 忽略 */ }
+  if (_editCleanup) {
+    try { _editCleanup() } catch (e) { /* 忽略 */ }
+    const settle = _editSettle
+    _editSettle = null
+    _editCleanup = null
+    if (settle) settle(null)
+  }
+}
+
+// IME 回传结果里的文本字段名（不同版本/语音输入形态不同，逐个兜底）
+const EDIT_TEXT_KEYS = ['contents', 'jsonData', 'text', 'inputText', 'currentText', 'content', 'data', 'result', 'value', 'textContent', 'editContent']
+
+function findEditText(j, depth) {
+  if (depth > 3) return ''
+  if (!j || typeof j !== 'object') return ''
+  for (let i = 0; i < EDIT_TEXT_KEYS.length; i++) {
+    const k = EDIT_TEXT_KEYS[i]
+    if (j[k] === undefined || j[k] === null) continue
+    if (typeof j[k] === 'string') return j[k]
+    if (typeof j[k] === 'object') {
+      const nested = findEditText(j[k], depth + 1)
+      if (nested) return nested
+    }
+  }
+  return ''
+}
+
+function extractEditResult(j) {
+  if (!j || typeof j !== 'object') return { text: '', canceled: false, found: false }
+  const canceled = !!(j.editCanceled || j.canceled || j.cancel)
+  let hasKey = false
+  for (let i = 0; i < EDIT_TEXT_KEYS.length; i++) {
+    if (j[EDIT_TEXT_KEYS[i]] !== undefined && j[EDIT_TEXT_KEYS[i]] !== null) {
+      hasKey = true
+      break
+    }
+  }
+  if (!hasKey) return { text: '', canceled, found: false }
+  return { text: findEditText(j, 0), canceled, found: true }
+}
+
+function extractEditFromArgs(args) {
+  for (let i = 0; i < args.length; i++) {
+    let v = args[i]
+    // FalconEvent 包装 {type,timestamp,data}
+    if (v && typeof v === 'object' && 'data' in v) v = v.data
+    if (v === null || v === undefined) continue
+    if (typeof v === 'string') {
+      if (/^[0-9a-fA-F]{32}$/.test(v)) continue // 纯 uuid 不是文本
+      try {
+        const j = JSON.parse(v)
+        if (j && typeof j === 'object') {
+          const r = extractEditResult(j)
+          if (r.found) return r
+          continue
+        }
+      } catch (e) { /* 非 JSON，按纯文本 */ }
+      return { text: v, canceled: false, found: true }
+    }
+    if (typeof v === 'object') {
+      const r = extractEditResult(v)
+      if (r.found) return r
+    }
+  }
+  return { text: '', canceled: false, found: false }
+}
+
+/**
+ * 打开系统原生输入法编辑当前文本。
+ * @param {string} inputType 键盘模式（见 INPUT_TYPES）
+ * @param {string} initialText 预填充文本（用户能直接看到并继续编辑）
+ * @returns {Promise<?string>} 确认后的文本；null=取消；''=确认清空
+ */
+export function openTextEditor(inputType = INPUT_TYPES.ZH_CN_PREFERRED, initialText = '') {
+  return new Promise((resolve) => {
+    const gg = editGlobal()
+    if (!gg || typeof gg.startTextEdit !== 'function') {
+      // 原生不可用：退回 SDK 封装（至少能把键盘拉起来）
+      try {
+        resolve(coreOpenTextEditor(inputType, initialText))
+      } catch (e) {
+        resolve(null)
+      }
+      return
+    }
+
+    let settled = false
+    // 上一次会话残留：先按取消结算，避免重复订阅
+    if (_editCleanup) {
+      try { _editCleanup() } catch (e) { /* 忽略 */ }
+      const prev = _editSettle
+      _editSettle = null
+      _editCleanup = null
+      if (prev) prev(null)
+    }
+
+    const cleanup = () => {
+      try { gg.textEditFinished.off(handler) } catch (e) { /* 忽略 */ }
+      try { $falcon.off('textEditFinished', falconHandler) } catch (e) { /* 忽略 */ }
+    }
+
+    const settle = (args) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      if (_editCleanup === cleanup) {
+        _editSettle = null
+        _editCleanup = null
+      }
+      const r = extractEditFromArgs(args)
+      // found=false（诊断钩子等无有效载荷）按取消处理，不覆盖调用方原值
+      resolve(!r.found ? null : (r.canceled ? null : r.text))
+    }
+
+    const handler = function () {
+      settle(Array.prototype.slice.call(arguments))
+    }
+    const falconHandler = function (e) {
+      settle([e])
+    }
+
+    gg.textEditFinished.on(handler)
+    try { $falcon.on('textEditFinished', falconHandler) } catch (e) { /* 忽略 */ }
+    _editSettle = settle
+    _editCleanup = cleanup
+
+    try {
+      const text = String(initialText === undefined || initialText === null ? '' : initialText)
+      // text 是实测生效的预填充字段（见上方注释）；contents 一并带上做兼容。
+      const config = {
+        inputType,
+        placeholder: '',
+        autofocus: true,
+        maxlength: 2000,
+        showCursor: true,
+        confirmButtonDisabledOnTextEmpty: true,
+        multiLinesEditVisible: true,
+        enterButtonText: '完成',
+        text,
+        contents: text
+      }
+      gg.startTextEdit(JSON.stringify(config))
+    } catch (e) {
+      settle([])
+    }
+  })
 }
 
 // ---------- 持久化（$falcon.jsapi.storage） ----------

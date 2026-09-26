@@ -1,4 +1,4 @@
-// ds-free-api 的 OpenAI 兼容客户端（非流式）。
+// ds-free-api 的 OpenAI 兼容客户端（流式 SSE；应用侧始终走 chatStream）。
 // 会话是「无状态」的：每次请求都把完整历史作为 messages 发给后端，
 // 因此「重试 / 修改」只需本地裁剪历史后重新请求。
 
@@ -7,23 +7,14 @@ import { readImageDataUrl } from './images.js'
 import { execShell, writeFile, readFile, sleep, shq, stopStream, joinPath, dataDirBase } from './native.js'
 
 import { getActiveBackendBaseUrl } from './backend-health.js'
+import { isRateLimitCode, isRateLimitText, isAccountSuspension } from './error-classify.js'
+// 纯文本/解析函数抽到 ds-text.js（无设备依赖，可在 Node 里回归测试）
+import { apiUrl as _apiUrl, stripInternalTags as _stripInternalTags } from './ds-text.js'
+
+export const apiUrl = _apiUrl
+export const stripInternalTags = _stripInternalTags
 
 export const DEFAULT_BASE_URL = 'https://api.deepseek.com/v1'
-
-/**
- * 把用户填写的服务地址拼成完整接口 URL。
- *
- * 用户填的地址两种写法都常见：`http://host:22217` 和 `http://host:22217/v1`
- * （设置页默认值本身就带 /v1）。旧代码无条件再拼一个 `/v1/...`，
- * 结果是 `…/v1/v1/chat/completions` → 404，并被错报成"接口不存在，请检查服务地址"。
- * 这里检测尾部是否已有 /v1 再决定是否补。
- */
-export function apiUrl(baseUrl, path) {
-  const base = String(baseUrl || '').replace(/\/+$/, '')
-  const suffix = String(path || '').replace(/^\/+/, '')
-  const root = /\/v1$/.test(base) ? base : base + '/v1'
-  return root + '/' + suffix
-}
 
 // 模型模式。
 //
@@ -52,27 +43,7 @@ export function isVisionMode(key) {
 // 移除模型回复中可能泄露的内部协议标签，防止发给 DeepSeek 官方 API 或展示给用户导致封号。
 // 注意：标签替换为空串，且只折叠水平空白（[ \t]），不能吞掉换行——
 // 旧版 /\s{2,}/g 会把模型的空行/段落分隔符一并压成空格，导致换行丢失（#14）。
-export function stripInternalTags(text) {
-  if (!text) return text
-  return String(text)
-    .replace(/<\|tool_calls_begin\|>/gi, '')
-    .replace(/<\|tool_calls_end\|>/gi, '')
-    .replace(/<\|tool_call_begin\|>/gi, '')
-    .replace(/<\|tool_call_end\|>/gi, '')
-    .replace(/<\|begin_of_function\|>/gi, '')
-    .replace(/<\|end_of_function\|>/gi, '')
-    .replace(/<\|tool▁calls▁begin\|>/gi, '')
-    .replace(/<\|tool▁calls▁end\|>/gi, '')
-    .replace(/<\|tool▁call▁begin\|>/gi, '')
-    .replace(/<\|tool▁call▁end\|>/gi, '')
-    .replace(/<\|[^|]{1,40}\|>/g, '')
-    .replace(/<invoke>/gi, '')
-    .replace(/<\/invoke>/gi, '')
-    .replace(/<parameter>/gi, '')
-    .replace(/<\/parameter>/gi, '')
-    .replace(/<\/tool_call>/gi, '')
-    .replace(/[ \t]{2,}/g, ' ')
-}
+// stripInternalTags / collapseOutsideFences 已抽到 ds-text.js（文件顶部转发导出）
 
 // 把应用内消息转成 OpenAI messages；跳过占位/错误消息；图片按需转 data URL。
 // assistant 内容在发送前清洗内部协议标签，避免把 <|begin_of_function|> 等标记
@@ -117,6 +88,56 @@ class DsError extends Error {
 }
 
 /**
+ * 探测后端是否可达、账号池是否就绪（不走鉴权，/health 是公开端点）。
+ *
+ * 用途：401 有两类完全不同的成因，处理方式也完全相反 ——
+ *  1) 上游账号真的被封禁/禁言（错误码来自 DeepSeek）；
+ *  2) 应用与本机后端没对上：key 未同步、后端没起来、账号池是空的。
+ * 旧实现把所有 401 都写成"账号可能已被封禁，请更换账号"，把第 2 类用户
+ * 引向换账号（白折腾，还会把一个好账号从池子里误判掉）。报错前先问一次
+ * /health，用后端自己的状态说话。
+ */
+async function probeBackend({ authMode, baseUrl, apiKey, timeout = 5000 }) {
+  const root = authMode === 'builtin'
+    ? getActiveBackendBaseUrl()
+    : String(baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, '')
+  const headers = {}
+  if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey
+  try {
+    const resp = await httpRequest({ url: root + '/health', method: 'GET', headers, timeout })
+    if (resp.statusCode === 0) return { reachable: false, error: resp.error || '连接失败' }
+    if (resp.statusCode !== 200 || !resp.data) return { reachable: true, ok: false, statusCode: resp.statusCode }
+    const accounts = (resp.data && resp.data.accounts) || {}
+    return { reachable: true, ok: true, total: accounts.total || 0, idle: accounts.idle || 0 }
+  } catch (e) {
+    return { reachable: false, error: e && e.message ? e.message : String(e) }
+  }
+}
+
+/**
+ * 把一次 401/403 翻译成"该去修哪里"的提示（见 probeBackend 的成因说明）。
+ * 只在真的收到鉴权失败状态码时调用——正常路径不产生额外请求。
+ */
+async function describeAuthFailure({ authMode, baseUrl, apiKey, statusCode, payload }) {
+  const apiMsg = payload && payload.error && (payload.error.code || payload.error.message)
+  if (authMode !== 'builtin') {
+    return '服务端返回 ' + statusCode + '（未授权）：请检查服务地址与 API Key' +
+      (apiMsg ? '（' + apiMsg + '）' : '')
+  }
+  const probe = await probeBackend({ authMode, baseUrl, apiKey })
+  if (!probe.reachable) {
+    return '无法连接本机后端服务（' + (probe.error || '连接失败') + '）：这会导致鉴权失败，请先在设置页确认后端已启动'
+  }
+  if (!probe.ok) {
+    return '本机后端健康检查异常（HTTP ' + (probe.statusCode || '?') + '）：请到登录页重新保存账号以重启后端'
+  }
+  if (!probe.total) {
+    return '本机后端没有可用的 DeepSeek 账号（未登录或登录失败）：请到登录页重新登录，而不是更换账号'
+  }
+  return '本机后端未接受当前 API Key（应用配置与后端不一致，后端现有账号 ' + probe.total + ' 个）：请到登录页重新保存账号以同步密钥'
+}
+
+/**
  * 拉取云端会话列表（#10 同步已有对话）。
  * 后端 /v1/cloud-sessions → ds-free-api GET /chat_session/fetch_page（无 PoW，仅鉴权）。
  * 返回 [{ id, title, updated_at }]，仅会话元信息（消息内容需要额外的历史接口，暂不拉取）。
@@ -137,7 +158,10 @@ export async function listCloudSessions({ baseUrl, apiKey, authMode, timeout = 2
     throw new DsError('NETWORK', resp.error || '无法连接服务器，请检查网络')
   }
   if (resp.statusCode === 401 || resp.statusCode === 403) {
-    throw new DsError('HTTP_' + resp.statusCode, '账号可能已被封禁或限制（HTTP ' + resp.statusCode + '）：请到设置页更换账号')
+    // 401 不等于封号：先分辨是"后端没连上/没账号/key 失配"还是上游真限制（bug 4）
+    throw new DsError('HTTP_' + resp.statusCode, await describeAuthFailure({
+      authMode, baseUrl, apiKey, statusCode: resp.statusCode, payload: resp.data
+    }))
   }
   if (resp.statusCode >= 400) {
     const apiMsg = resp.data && resp.data.error && resp.data.error.message
@@ -148,6 +172,54 @@ export async function listCloudSessions({ baseUrl, apiKey, authMode, timeout = 2
     throw new DsError('PARSE', '同步失败：响应格式异常')
   }
   return list
+}
+
+/**
+ * 拉取远端声明的模型列表（自定义端点的模型选择，bug 6）。
+ * 标准 OpenAI 兼容端点提供 GET /v1/models；部分自建服务只在根路径挂 /models，
+ * 因此先试 /v1/models，404 时回退到 /models，避免"服务明明可用却报接口不存在"。
+ * 返回 [{ id, ownedBy }]。
+ */
+export async function listRemoteModels({ baseUrl, apiKey, authMode = 'openai', timeout = 20000 }) {
+  const effectiveBaseUrl = authMode === 'builtin' ? getActiveBackendBaseUrl() : (baseUrl || DEFAULT_BASE_URL)
+  const base = String(effectiveBaseUrl || '').replace(/\/+$/, '')
+  const v1Url = apiUrl(base, 'models')
+  const candidates = /\/v1$/.test(base) ? [v1Url] : [v1Url, base + '/models']
+  const headers = {}
+  if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey
+
+  let lastErr = null
+  for (const url of candidates) {
+    if (authMode === 'openai') {
+      const err = validateExternalUrl(url)
+      if (err) throw new DsError('BAD_URL', err)
+    }
+    const resp = await httpRequest({ url, method: 'GET', headers, timeout })
+    if (resp.statusCode === 0) {
+      throw new DsError('NETWORK', resp.error || '无法连接服务器，请检查网络与服务地址')
+    }
+    if (resp.statusCode === 404) {
+      lastErr = new DsError('HTTP_404', '接口不存在（已尝试 ' + candidates.join('、') + '）：请确认服务地址是否为 OpenAI 兼容端点')
+      continue
+    }
+    if (resp.statusCode === 401 || resp.statusCode === 403) {
+      throw new DsError('HTTP_' + resp.statusCode, await describeAuthFailure({
+        authMode, baseUrl, apiKey, statusCode: resp.statusCode, payload: resp.data
+      }))
+    }
+    if (resp.statusCode >= 400) {
+      const apiMsg = resp.data && resp.data.error && resp.data.error.message
+      throw new DsError('HTTP_' + resp.statusCode, apiMsg || mapHttpStatus(resp.statusCode, authMode))
+    }
+    const list = resp.data && resp.data.data
+    if (!Array.isArray(list)) {
+      throw new DsError('PARSE', '模型列表响应格式异常（应为 { data: [{ id }] }）')
+    }
+    return list
+      .map((m) => ({ id: String((m && m.id) || '').trim(), ownedBy: String((m && m.owned_by) || '') }))
+      .filter((m) => m.id)
+  }
+  throw lastErr || new DsError('PARSE', '模型列表拉取失败')
 }
 
 /**
@@ -170,7 +242,9 @@ export async function listCloudSessionMessages({ baseUrl, apiKey, authMode, sess
     throw new DsError('NETWORK', resp.error || '无法连接服务器，请检查网络')
   }
   if (resp.statusCode === 401 || resp.statusCode === 403) {
-    throw new DsError('HTTP_' + resp.statusCode, '账号可能已被封禁或限制（HTTP ' + resp.statusCode + '）：请到设置页更换账号')
+    throw new DsError('HTTP_' + resp.statusCode, await describeAuthFailure({
+      authMode, baseUrl, apiKey, statusCode: resp.statusCode, payload: resp.data
+    }))
   }
   if (resp.statusCode >= 400) {
     const apiMsg = resp.data && resp.data.error && resp.data.error.message
@@ -183,10 +257,43 @@ export async function listCloudSessionMessages({ baseUrl, apiKey, authMode, sess
   return list
 }
 
+/**
+ * 删除云端会话（bug 3：删除本地对话时必须连带删云端）。
+ * 后端 /v1/cloud-sessions/{id} → ds-free-api POST /chat_session/delete。
+ * 不删的话，下次「同步」会把这条会话重新导回本地（用户看到"删了又回来"）。
+ */
+export async function deleteCloudSession({ baseUrl, apiKey, authMode, sessionId, timeout = 20000 }) {
+  const effectiveBaseUrl = authMode === 'builtin' ? getActiveBackendBaseUrl() : (baseUrl || DEFAULT_BASE_URL)
+  const url = apiUrl(effectiveBaseUrl, 'cloud-sessions/' + encodeURIComponent(sessionId))
+  if (authMode === 'openai') {
+    const err = validateExternalUrl(url)
+    if (err) throw new DsError('BAD_URL', err)
+  }
+  const headers = {}
+  if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey
+  // 用 POST 而非 DELETE：笔端 Falcon http 模块不支持 DELETE（发出去得到 405），
+  // 后端 /v1/cloud-sessions/{id} 同时接受 DELETE 与 POST（语义同官方 /chat_session/delete）。
+  const resp = await httpRequest({ url, method: 'POST', headers, data: {}, timeout })
+  if (resp.statusCode === 0) {
+    throw new DsError('NETWORK', resp.error || '无法连接服务器，请检查网络')
+  }
+  if (resp.statusCode === 401 || resp.statusCode === 403) {
+    throw new DsError('HTTP_' + resp.statusCode, await describeAuthFailure({
+      authMode, baseUrl, apiKey, statusCode: resp.statusCode, payload: resp.data
+    }))
+  }
+  if (resp.statusCode >= 400) {
+    const apiMsg = resp.data && resp.data.error && resp.data.error.message
+    throw new DsError('HTTP_' + resp.statusCode, apiMsg || mapHttpStatus(resp.statusCode, authMode))
+  }
+  return true
+}
+
 function authError(authMode) {
-  // 内置 ds-free-api：401 通常是账号未登录/过期；OpenAI 端点：检查 key
+  // 401 的两种成因必须分清：本机后端 key 失配（重新保存账号即可）与上游账号被封禁
+  // （才需要换账号）。旧文案一律说"账号异常"，把前者也推去换账号。
   return authMode === 'builtin'
-    ? '未认证：请到设置页配置 DeepSeek 账号和密码'
+    ? '未认证：本机后端未接受当前请求（API Key 未同步或账号池为空）。请到登录页重新保存账号；仍失败再查账号是否被限制'
     : '鉴权失败：请检查 API Key'
 }
 
@@ -196,7 +303,7 @@ function mapHttpStatus(code, authMode) {
     401: authError(authMode),
     403: '没有访问权限（403）',
     404: '接口不存在，请检查服务地址是否正确',
-    429: '请求过于频繁，请稍后再试',
+    429: '请求过于频繁：请等待一段时间再发送，不要连续重试（连续发送会导致账号被禁言）',
     500: '服务端内部错误，请稍后重试',
     502: '服务网关错误（502），请稍后重试',
     503: authMode === 'builtin' ? '后端未配置 DeepSeek 账号，请到设置页填写账号密码' : '服务暂时不可用（503），请稍后重试',
@@ -215,6 +322,12 @@ function mapApiError(payload, authMode) {
   if (code === 'no_accounts_configured' || code === 'no_accounts' || msg.indexOf('no accounts configured') >= 0) {
     return '未配置 DeepSeek 账号：请到设置页填写账号密码'
   }
+  // 上游限流（账号已进入退避）：必须明确告诉用户"别再发了"。
+  // 旧文案"服务繁忙，请稍后重试"会被理解成"再试一下就好"，而连点发送正是
+  // 账号被上游升级为禁言的直接原因（bug 1）。这里给出退避提示 + 明确劝阻。
+  if (code === 'upstream_rate_limited' || msg.indexOf('rate limited') >= 0) {
+    return e.message || '上游限流中：请等待一段时间再发送（连续发送会被判定为异常客户端，可能导致账号被禁言）'
+  }
   // 禁言提示原文直通（后端已提取"由于违反用户使用规范，你的账号已被禁言至 …"，含到期时间）
   if (msg.indexOf('禁言') >= 0) {
     return e.message || e.type || '账号已被禁言'
@@ -226,10 +339,18 @@ function mapApiError(payload, authMode) {
   if (code === 'invalid_api_token' || code === 'authentication_error' || msg.indexOf('invalid api token') >= 0) {
     return authError(authMode)
   }
-  if (msg.indexOf('overload') >= 0 || msg.indexOf('rate') >= 0 || msg.indexOf('busy') >= 0 || msg.indexOf('limit') >= 0) {
-    return '服务繁忙或触发限流，请稍后重试'
+  // 限流/繁忙判定用词边界（\b），避免子串误伤：'rate' 曾匹配 "gene**rate**"，
+  // 'key' 曾匹配 "mon**key**"，把普通错误误报成限流/鉴权问题
+  if (
+    code === 'overloaded' ||
+    /\boverload/.test(msg) ||
+    /\brate\b/.test(msg) ||
+    /\bbusy\b/.test(msg) ||
+    /\blimit(ed)?\b/.test(msg)
+  ) {
+    return '服务繁忙或触发限流：请等待一段时间再发送，不要连续重试（连续发送会被判定为异常客户端，可能导致账号被禁言）'
   }
-  if (msg.indexOf('auth') >= 0 || msg.indexOf('key') >= 0 || msg.indexOf('token') >= 0 || msg.indexOf('unauthorized') >= 0 || msg.indexOf('invalid') >= 0) {
+  if (/\bauth\b/.test(msg) || /\bkey\b/.test(msg) || /\btoken\b/.test(msg) || /unauthorized/.test(msg) || /invalid/.test(msg)) {
     return authError(authMode)
   }
   if (msg.indexOf('model') >= 0) {
@@ -238,34 +359,15 @@ function mapApiError(payload, authMode) {
   return e.message || e.type || '服务返回了错误'
 }
 
-// 解析 SSE 文本流：按空行切分完整事件，返回已完成事件列表和剩余未完成 buffer。
-function parseSse(buffer) {
-  const events = []
-  let rest = String(buffer || '').replace(/\r\n/g, '\n')
-  let idx
-  while ((idx = rest.indexOf('\n\n')) >= 0) {
-    const part = rest.slice(0, idx)
-    rest = rest.slice(idx + 2)
-    const dataLines = []
-    const lines = part.split('\n')
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i]
-      if (line.indexOf('data:') === 0) {
-        dataLines.push(line.slice(5).replace(/^ /, ''))
-      }
-    }
-    if (dataLines.length > 0) {
-      events.push(dataLines.join('\n'))
-    }
-  }
-  return { events, rest }
-}
+// parseSse 已抽到 ds-text.js；这里引入使用（喂着每一条流式消息）
+import { parseSse } from './ds-text.js'
 
 /**
  * 流式（SSE）对话请求。
  * 设备框架的 $falcon.jsapi.http 不支持增量回调，因此这里用后台 curl -N 写文件 +
  * 轮询文件的方式实现逐字/逐段渲染。
- * @param {Object} opts 同 chat()
+ * @param {Object} opts { baseUrl, apiKey, modeKey, messages, thinking, search, timeout,
+ *                        authMode, modelId, conversationId }
  * @param {Object} handlers { onDelta(text, full), onReasoning(text, full) }
  * @returns {Promise<{content, reasoning, finishReason, usage}>}
  */
@@ -323,11 +425,65 @@ export async function chatStream(opts, handlers = {}) {
   let content = ''
   let reasoning = ''
   let dsTitle = null
+  let dsSessionId = null
   let done = false
   let raw = null
   const start = Date.now()
 
   try {
+    // 事件处理抽成闭包：finish 之后还可能跟着 usage / ds_title / ds_session_id 等
+    // 尾随 chunk（空 choices），它们到达时往往已在本批次之外——循环退出后要再读一次，
+    // 否则这些尾巴会被丢掉（会话 id 丢了，同步就会重复导入，bug 3）。
+    const handleEvents = (events) => {
+      for (let i = 0; i < events.length; i++) {
+        const data = events[i]
+        if (data === '[DONE]') {
+          done = true
+          continue
+        }
+        let obj = null
+        try {
+          obj = JSON.parse(data)
+        } catch (e) {
+          continue
+        }
+        if (obj && obj.error) {
+          // 上游限流用独立错误码，调用方据此停止自动续发（bug 1）
+          const errCode = String(obj.error.code || '')
+          if (isRateLimitCode(errCode) || isRateLimitText(obj.error.message)) {
+            const err = new DsError('RATE_LIMITED', mapApiError(obj, authMode), obj.error)
+            err.rateLimited = true
+            throw err
+          }
+          throw new DsError('API', mapApiError(obj, authMode), obj.error)
+        }
+        // DeepSeek 自动生成的会话标题（会话首条消息时下发，#9）
+        if (obj && obj.ds_title) {
+          dsTitle = obj.ds_title
+          continue
+        }
+        // 本对话的云端会话 id（后端在流末尾以尾随 chunk 下发，用于同步去重）
+        if (obj && obj.ds_session_id) {
+          dsSessionId = obj.ds_session_id
+          continue
+        }
+        const choice = obj && obj.choices && obj.choices[0]
+        if (!choice) continue
+        const delta = choice.delta || {}
+        if (delta.reasoning_content) {
+          reasoning += delta.reasoning_content
+          if (handlers.onReasoning) handlers.onReasoning(delta.reasoning_content, reasoning)
+        }
+        if (delta.content) {
+          content += delta.content
+          if (handlers.onDelta) handlers.onDelta(delta.content, content)
+        }
+        if (choice.finish_reason) {
+          done = true
+        }
+      }
+    }
+
     while (!done && !isCancelled() && Date.now() - start < timeout) {
       await sleep(200)
       raw = await readFile(outFile)
@@ -344,42 +500,7 @@ export async function chatStream(opts, handlers = {}) {
 
         const parsed = parseSse(buffer)
         buffer = parsed.rest
-
-        for (let i = 0; i < parsed.events.length; i++) {
-          const data = parsed.events[i]
-          if (data === '[DONE]') {
-            done = true
-            break
-          }
-          let obj = null
-          try {
-            obj = JSON.parse(data)
-          } catch (e) {
-            continue
-          }
-          if (obj && obj.error) {
-            throw new DsError('API', mapApiError(obj, authMode), obj.error)
-          }
-          // DeepSeek 自动生成的会话标题（仅 thinking=OFF 且 search=OFF 时下发，#9）
-          if (obj && obj.ds_title) {
-            dsTitle = obj.ds_title
-            continue
-          }
-          const choice = obj && obj.choices && obj.choices[0]
-          if (!choice) continue
-          const delta = choice.delta || {}
-          if (delta.reasoning_content) {
-            reasoning += delta.reasoning_content
-            if (handlers.onReasoning) handlers.onReasoning(delta.reasoning_content, reasoning)
-          }
-          if (delta.content) {
-            content += delta.content
-            if (handlers.onDelta) handlers.onDelta(delta.content, content)
-          }
-          if (choice.finish_reason) {
-            done = true
-          }
-        }
+        handleEvents(parsed.events)
       }
 
       // curl 已把错误信息写进文件且没有任何 SSE 数据时，提前结束而不是傻等超时
@@ -389,16 +510,32 @@ export async function chatStream(opts, handlers = {}) {
           if (txt.indexOf('curl:') >= 0) {
             throw new DsError('NETWORK', txt.replace(/^curl:\s*/, '').split('\n')[0] || '无法连接服务器，请检查服务地址')
           }
-          // 某些后端在 stream:true 下仍可能直接返回 JSON 错误
+          // 某些后端在 stream:true 下仍可能直接返回 JSON 错误（curl -s 不保留
+          // HTTP 状态码，所以从 body 里的 '{' 起尝试解析，不再要求首字符是 '{'）
           const trimmed = txt.trim()
-          if (trimmed.indexOf('{') === 0) {
+          const brace = trimmed.indexOf('{')
+          if (brace >= 0) {
+            let obj = null
             try {
-              const obj = JSON.parse(trimmed)
-              if (obj && obj.error) {
-                throw new DsError('API', mapApiError(obj, authMode), obj.error)
-              }
+              obj = JSON.parse(trimmed.slice(brace))
             } catch (e) {
-              if (e instanceof DsError) throw e
+              obj = null
+            }
+            if (obj && obj.error) {
+              const errCode = String(obj.error.code || '')
+              // 鉴权类错误同样要走成因诊断：本机后端 key 失配 / 账号池为空 / 真被封
+              if (/invalid_api_token|authentication_error|unauthorized/i.test(errCode)) {
+                throw new DsError('HTTP_401', await describeAuthFailure({
+                  authMode, baseUrl, apiKey, statusCode: 401, payload: obj
+                }))
+              }
+              // 上游限流用独立错误码，调用方据此停止自动续发（bug 1）
+              if (isRateLimitCode(errCode) || isRateLimitText(obj.error.message)) {
+                const err = new DsError('RATE_LIMITED', mapApiError(obj, authMode), obj.error)
+                err.rateLimited = true
+                throw err
+              }
+              throw new DsError('API', mapApiError(obj, authMode), obj.error)
             }
           }
         }
@@ -412,94 +549,41 @@ export async function chatStream(opts, handlers = {}) {
       throw new DsError('STREAM_TIMEOUT', '请求超时，请重试')
     }
 
-    return { content: stripInternalTags(content), reasoning: stripInternalTags(reasoning), dsTitle, finishReason: 'stop', usage: null }
+    // 收尾补读：finish 之后写入的尾随 chunk（usage / ds_title / ds_session_id）
+    // 可能落在下一次 200ms 轮询才可见的位置。旧版只补读一次，curl 落盘稍慢
+    // 就把 ds_session_id 丢了（会话对不上号 → 同步重复导入，bug 3）。
+    // 这里连续读到文件长度稳定两轮为止（至多 5 轮 ≈ 1s）。
+    let stableReads = 0
+    for (let i = 0; i < 5 && stableReads < 2; i++) {
+      await sleep(200)
+      try {
+        const tailRaw = await readFile(outFile)
+        const txt = tailRaw ? String(tailRaw) : ''
+        if (txt.length === lastLen) {
+          stableReads++
+          continue
+        }
+        if (txt.length < lastLen) {
+          // 文件被清理/重建：忽略残余，避免尾部重放
+          continue
+        }
+        stableReads = 0
+        const chunk = txt.slice(lastLen)
+        lastLen = txt.length
+        if (chunk) {
+          const parsed = parseSse(buffer + chunk)
+          buffer = parsed.rest
+          handleEvents(parsed.events)
+        }
+      } catch (e) { /* 补读失败不影响已有结果 */ }
+    }
+
+    return { content: stripInternalTags(content), reasoning: stripInternalTags(reasoning), dsTitle, dsSessionId, finishReason: 'stop', usage: null }
   } finally {
     stopStream(token)
     try { execShell('rm -f ' + shq(reqFile) + ' ' + shq(outFile) + ' || true') } catch (e) { /* 忽略 */ }
   }
 }
 
-/**
- * 发送一次对话请求。
- * @param {Object} opts
- *  - baseUrl, apiKey, modeKey, messages(已由 buildMessages 构建), thinking, search, timeout
- *  - modelId: OpenAI 兼容端点的自定义模型 ID（可选，留空使用 modeKey 对应默认模型）
- * @returns {Promise<{content, reasoning, finishReason, usage}>}
- */
-export async function chat({ baseUrl, apiKey, modeKey, messages, thinking, search, timeout = 120000, authMode = 'builtin', modelId = '', conversationId = '' }) {
-  const mode = getMode(modeKey)
-  const effectiveBaseUrl = authMode === 'builtin' ? getActiveBackendBaseUrl() : (baseUrl || DEFAULT_BASE_URL)
-  const url = apiUrl(effectiveBaseUrl, 'chat/completions')
-
-  // 校验用户填写的端点：仅 http/https、需可用主机名；局域网地址允许（自建服务的正常形态）
-  if (authMode === 'openai') {
-    const err = validateExternalUrl(url)
-    if (err) {
-      throw new DsError('BAD_URL', err)
-    }
-  }
-
-  // OpenAI 兼容端点：优先用设置的自定义模型 ID，缺省回退 deepseek-v4-flash；
-  // 内置端点始终用模式默认模型（deepseek-*，走 ds-free-api 账号池）
-  const model = authMode === 'openai' ? (modelId || 'deepseek-v4-flash') : mode.model
-  const body = {
-    model,
-    messages,
-    stream: false
-  }
-  // 会话标识：后端据此做持久会话复用（同 chatStream）
-  if (conversationId) body.user = String(conversationId)
-
-  // 深度思考：后端默认开启，仅当关闭时显式传 none
-  if (thinking === false) {
-    body.reasoning_effort = 'none'
-  }
-
-  // 联网搜索：显式开启/关闭，避免依赖后端默认值
-  body.web_search_options = { search_context_size: search ? 'high' : 'none' }
-
-  const headers = { 'Content-Type': 'application/json' }
-  if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey
-
-  const resp = await httpRequest({ url, method: 'POST', headers, data: JSON.stringify(body), timeout })
-
-  if (resp.statusCode === 0) {
-    throw new DsError('NETWORK', resp.error || '无法连接服务器，请检查网络与服务地址')
-  }
-
-  let payload = resp.data
-  if (typeof payload === 'string') {
-    try {
-      payload = JSON.parse(payload)
-    } catch (e) {
-      throw new DsError('PARSE', '响应解析失败，请重试')
-    }
-  }
-
-  if (payload && payload.error) {
-    throw new DsError('API', mapApiError(payload, authMode), payload.error)
-  }
-
-  if (resp.statusCode >= 400) {
-    throw new DsError('HTTP_' + resp.statusCode, mapHttpStatus(resp.statusCode, authMode))
-  }
-
-  const choice = payload && payload.choices && payload.choices[0]
-  if (!choice || !choice.message) {
-    throw new DsError('EMPTY', '模型未返回内容，请重试')
-  }
-
-  const content = choice.message.content || ''
-  const reasoning = choice.message.reasoning_content || choice.message.reasoning || ''
-  if (!content && !reasoning) {
-    throw new DsError('EMPTY', '模型未返回内容，请重试')
-  }
-
-  return {
-    content: stripInternalTags(content),
-    reasoning: stripInternalTags(reasoning),
-    dsTitle: (payload && payload.ds_title) || null,
-    finishReason: choice.finish_reason,
-    usage: payload.usage
-  }
-}
+// 兼容既有引用：这些判定原先定义在本文件，现移到 error-classify.js（便于宿主单测）
+export { isRateLimitCode, isRateLimitText, isAccountSuspension }

@@ -25,6 +25,7 @@ fn make_usage_chunk(usage: Usage, model: &str) -> ChatCompletionsResponseChunk {
         service_tier: None,
         system_fingerprint: None,
         ds_title: None,
+        ds_session_id: None,
     }
 }
 
@@ -58,6 +59,7 @@ pub(crate) fn make_chunk(
         service_tier: None,
         system_fingerprint: None,
         ds_title: None,
+        ds_session_id: None,
     }
 }
 
@@ -73,6 +75,27 @@ fn make_title_chunk(model: &str, title: String) -> ChatCompletionsResponseChunk 
         service_tier: None,
         system_fingerprint: None,
         ds_title: Some(title),
+        ds_session_id: None,
+    }
+}
+
+/// 会话 id 尾随 chunk：形态与 ds_title 一致（空 choices）。
+/// 应用侧收到即记下本地会话 ↔ 云端会话的对应关系，同步时据此去重（bug 3）。
+pub(crate) fn make_session_chunk(
+    model: &str,
+    session_id: String,
+) -> ChatCompletionsResponseChunk {
+    ChatCompletionsResponseChunk {
+        id: next_chatcmpl_id(),
+        object: "chat.completion.chunk",
+        created: now_secs(),
+        model: model.to_string(),
+        choices: vec![],
+        usage: None,
+        service_tier: None,
+        system_fingerprint: None,
+        ds_title: None,
+        ds_session_id: Some(session_id),
     }
 }
 
