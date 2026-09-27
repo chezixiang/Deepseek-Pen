@@ -4,7 +4,7 @@
 - **执行角色**：重构流程首个工作 Agent；已确认 `重构计划\【上一阶段交接文件】` 不存在。
 - **代码冻结点**：`main` @ `2c8d2bbb9b9d1259fd40b3497646de65cfb12c01`（2026-09-27 14:31:03 +0800，提交名「修了一堆bug，自己看吧」）；冻结时 `git status --porcelain` 输出为空。
 - **本阶段文档提交**：`232b405`（本文件）、`17b6e4d`（`重构计划\【本阶段文件】.md`）。
-- **追加核查**：2026-09-27 核查外部参考仓库 Pen-LVGL（见第九节），并按其结论修订了 G-1/G-2/G-3 的状态。
+- **追加核查**：2026-09-27 核查外部参考仓库 Pen-LVGL（第九节）与真机只读状态（第十节），并据此修订 G-1/G-2/G-3/G-10 的状态、新增 G-11/G-12。
 - **依据文件**：《总体重构路线.md》《下一步开发计划.md》（已通读）。未读取任何历史会话记录，全部结论来自上述文件与当前工作区。
 - **本轮范围**：只读核对与记录。未修改业务代码、未实施阶段 0、未迁移、未删除任何文件。
 - **用途**：后续阶段（阶段 0—5）引用同一份基线、同一种交接格式；缺口统一以「待补项」列明，不代替阶段放行。
@@ -205,7 +205,7 @@ UI 页面（app/src/pages/{startup,login,index,settings}）
 
 | 编号 | 缺口 | 阻塞级别 | 备注 |
 |---|---|---|---|
-| G-1 | `app/libs/` 不存在；`libs→.falcon_→amr` 链路有代码证据，**arch 目录名需在 X7 Pro 上确认**（本地固件 strings 为 `arm64`，参考仓库用 `arm64-orange`）；解包后 import 解析仍待真机验证 | **阻塞阶段 0** | 证据：`aiot-vue-cli/src/steps/{build,pack,manifest}.js`、第九节 |
+| G-1 | `app/libs/` 不存在；`libs→.falcon_→amr` 链路有代码证据；**arch 目录名已由真机确认为 `arm64-popcorn`**（第十节）；仅剩真机 import / 卸载 / 升级行为待验证 | 阶段 0（已大幅收窄） | 证据：`aiot-vue-cli/src/steps/{build,pack,manifest}.js`、第九、十节 |
 | G-2 | 无 JSAPI SDK 头文件本地副本、ABI 核验路径未定 | **阶段 0 前需复核**（已有外部 SDK 来源，见第九节） | 设备 strings + Pen-LVGL vendored SDK（Apache-2.0/LGPL 混合，需确认兼容性） |
 | G-3 | Probe 命名（`asyncEcho` vs `echo`）未冻结；命名/导入约定已可从参考实现推出（`libjsapi_<name>.so` ↔ `import … from '<name>'`） | 阻塞阶段 0 验收口径（收窄） | 见 U3、第九节 |
 | G-4 | 无 PoW 固定回归样本（无 `*.wasm`、无 challenge/answer 对） | 阻塞阶段 2 验收 | 需用现有后端导出 |
@@ -214,6 +214,9 @@ UI 页面（app/src/pages/{startup,login,index,settings}）
 | G-7 | Transport 契约（U1/U6）与 Runtime 退出（U2）未冻结 | 阻塞阶段 1/3 开工 | 规划文档已列，本阶段不代决 |
 | G-8 | 阶段 1 mock 验收用例未成套 | 阻塞阶段 1 验收 | 可复用 `mock_http.rs` 思路扩展 |
 | G-9 | `app/package.json` 硬编码 `file:D:/codes/youdao/sdk/...`；本机构建依赖该绝对路径存在 | 非阻塞（本机存在） | CI 已绕开，本地换机需注意 |
+| G-10 | X7 Pro 固件的 arch 目录名 | **已关闭**（真机确认为 `arm64-popcorn`） | 见第十节；通用回退 `arm64` 亦被系统包使用 |
+| G-11 | 参考 SDK 与本机固件的 ABI 兼容性未验证 | 阶段 0 | 需符号集比对或最小 `.so` 真机 dlopen |
+| G-12 | 真机已安装的 `libs/libjsapi_*.so` 与包内 `.so` 不一致：文件名多 `_<salt>` 后缀、内容与时间戳不同，存在独立的原生库下发/更新步骤 | 阶段 0 首迭代 | 见第十节 |
 
 **停止条件判定**：G-1～G-3 未解决前不进入阶段 0 实施；本轮按约定停在基线冻结，未开展任何阶段 0 动作。
 
@@ -222,10 +225,10 @@ UI 页面（app/src/pages/{startup,login,index,settings}）
 ## 八、下一阶段（阶段 0）进入条件
 
 1. G-2：登记 JSAPI SDK 来源与版本（优先使用第九节给出的外部 SDK 副本 + 设备侧符号集复核），并在本机完成“能编译出空模块并导出 `custom_init_jsapis`”的最小验证；取不到可用 SDK 时只允许环境诊断，不猜 ABI。
-2. G-1：确认探针投放目录名（`app/libs/<arch>/`，候选 `arm64` 与 `arm64-orange`，以 X7 Pro 固件为准），并约定构建后核验 `.falcon_/libs/…` 与 amr `manifest.json` 中确实出现该文件。
+2. G-1：探针投放目录名已确认为 `app/libs/arm64-popcorn/`（第十节），阶段 0 只需在构建产物中核验 `.falcon_/libs/arm64-popcorn/libjsapi_ds_probe.so` 与 amr `manifest.json` 条目，并用真机验证 import 与 `custom_init_jsapis` 调用链。
 3. G-3：冻结探针接口命名（`version()` 同步、异步回显、事件回调三者各一，参照第九节的同步/Promise/发布订阅三种绑定方式），并写进阶段 0 交接。
 4. 回滚准备：保留现有 `app/*.amr` 与 `app/backend/linux-aarch64-gnu/ds-free-api`；探针引入失败时可删除 `app/libs/` 并重建旧包。
-5. 真机通道：本阶段已确认 adb 在线（`G:\youdao\others\adb.exe`，设备脱敏 `MEC17****3678`）；阶段 0 开工前复核 `miniapp_cli` 可用与 PMS 安装/卸载方式。
+5. 真机通道：本阶段已确认 adb 在线（`G:\youdao\others\adb.exe`，设备脱敏 `MEC17****3678`）且设备自带 `/bin/miniapp_cli`（支持 `install {amrPath}` / `uninstall {appid}` / `start {appId} --{page}` / `capture {path}` / `debugApp`，root shell 可读 `/etc/miniapp` 与各 app 包目录）；阶段 0 直接复用该通道。
 6. 验收记录口径：同步返回、Promise、事件回调、重复加载、退出/升级五类证据分开记录；mock 与真机证据不得互相替代。
 
 ---
@@ -286,6 +289,7 @@ extract arch libs from %s
 | U3/U6（接口契约） | 有新输入：事件回调形态可参考 `publish(topic, bson)` + JS `on/off`，但**本阶段不代决**，留给阶段 0/1 契约冻结 |
 | 新增 G-10 | X7 Pro 固件的 arch 目录名未定，需在阶段 0 首个迭代内确认（本地固件 strings 指向 `arm64`） |
 | 新增 G-11 | 参考 SDK 与本地固件 ABI 兼容性未验证：需比对 `jsapi_proxy`/`libfalcon` 导出符号与 SDK 头文件版本，必要时以“空模块 + `custom_init_jsapis`”最小产物做真机 dlopen 验证 |
+| 后续更新 | G-10 已由真机只读核查关闭（设备 arch 目录 = `arm64-popcorn`），见第十节；同时新增 G-12（已安装 `.so` 与包内 `.so` 不一致） |
 
 ### 9.5 阶段 0 建议动作（不构成本轮实施）
 
@@ -293,6 +297,57 @@ extract arch libs from %s
 2. 以参考脚本为模板产出探针构建脚本（保持 `-Wl,--unresolved-symbols=ignore-all`、无宿主 RPATH、导出 `custom_init_jsapis`、产物名 `libjsapi_ds_probe.so`）。
 3. 在 X7 Pro 上用两种 arch 目录名各打一个探针包（或先查设备已装小程序包内 `libs/` 的实际目录名），以真机 import 结果定名，不靠猜测。
 4. 保留参考仓库子集副本（忽略目录）作为离线依据；若后续需要完整仓库（含 LVGL、docs 全量），再单独拉取。
+
+---
+
+## 十、真机只读核查（adb，2026-09-27 追加）
+
+### 10.1 查询环境与边界
+
+| 项 | 值 |
+|---|---|
+| 通道 | `G:\youdao\others\adb.exe` → 设备脱敏 `MEC17****3678`；`adb shell` 为 root（`uid=0`） |
+| 系统 | `Linux YoudaoDictionaryPen-678 5.10.160 #18 SMP Tue Jul 28 18:14:54 CST 2026 aarch64`；无 `getprop`；平台代号 `popcorn`（libfalcon 构建路径含 `product/popcorn-release`） |
+| 设备工具 | `/bin/miniapp_cli`（`install {amrPath}` / `uninstall {appid}` / `start {appId} --{page}` / `startService` / `capture {path}` / `debugApp`）、`/bin/unzip`、`/bin/busybox`、`/bin/tar`；无 python |
+| 本轮操作 | 全部只读：`ls` / `cat` / `grep` / `find` / `md5sum` / `od` / `unzip -l`、`unzip -p`（stdout）/ `adb devices`；未安装、未卸载、未写入任何设备文件 |
+
+### 10.2 系统侧原生库位置
+
+| 路径 | 大小 | 说明 |
+|---|---|---|
+| `/usr/lib/libfalcon.so` | 10,985,728 B | 框架本体（含 JSAPI 动态加载与 PMS 逻辑） |
+| `/usr/lib/libjsapi_proxy.so` | 657,304 B | JSAPI 代理 |
+| `/etc/miniapp/jsapis/libjsapi_export_core.so` | 1,533,864 B | 框架级 jsapi（与 `.probe/export_core.so` 对应） |
+| `/etc/miniapp/resources/framework/js_modules/` | — | 框架 JS 模块目录 |
+
+### 10.3 小程序原生库：包内声明 vs 实际安装
+
+- 包内声明（AMR `manifest.cert` 的键）形如 `libs/<archDir>/libjsapi_<module>.so`；也允许平坦形式 `libs/libjsapi_<module>.so`。
+- 本机全部已安装包 manifest 的 `<archDir>` 直方图：**`arm64-popcorn` 79 条**、`arm64` 3、`arm` 3、`arm64-cherry3566` 2、`arm64-orange` 1（跨机型遗留）⇒ **本机 arch 目录名 = `arm64-popcorn`**。
+- 示例（单词本 `8080212246010681`）：manifest 声明 `libs/arm64-popcorn/libbusiness_wordbook.so` 与 `libs/arm64-popcorn/libjsapi_wordbook.so`。
+- 安装后落盘形态：`/userdisk/secondary/miniapp/data/mini_app/pkg/<appid>/<slot>/libs/libjsapi_<module>_<salt>.so`（arch 目录已被 PMS `processArchLibs` 归并到 `libs/`）。
+- 通用回退示例：`8001771940015915` 的 manifest 同时声明 `libs/arm`、`libs/arm64`、`libs/arm64-cherry3566`（**不含** `arm64-popcorn`），本机仍安装了 `libs/libjsapi_shell_*.so` 与 `libs/libjsapi_fileserver_*.so` ⇒ 缺少机型专属目录时会回退到通用目录（本机表现为接受 `arm64`），但同一包内多目录的选取规则未验证。
+- 包内 `.so` 确认为 ELF64 AArch64（对 `bilibili.amr` 与 `loli_v1.14.1.amr` 的条目做首字节校验，均为 `7f 45 4c 46 … 03 00 b7 00`）。
+
+### 10.4 加载链证据（与第九节一致）
+
+`libfalcon.so` strings 与 PMS 行为吻合：`libjsapi_` + `libs/` 动态加载 → `dlsym custom_init_jsapis`；PMS 侧 `extract arch libs from %s`、`[PMS]processArchLibs rename archLibs to libs failed`。设备实测：浏览器小程序 `8001779591038449` 安装目录同时存在
+
+- `libs/arm64-orange/libjsapi_browser.so`（6,934,672 B，md5 `692451…`，与 manifest cert **完全一致**，时间戳 Jul 29）
+- `libs/libjsapi_browser_12345_1649439548.so`（7,142,144 B，md5 `38e0b0…`，时间戳 Sep 1）
+
+### 10.5 新发现 G-12：已安装库与包内库不一致
+
+已安装的 `libs/*.so` 并非包内文件的直接拷贝：文件名多出 `_<salt>` 后缀，内容与时间戳也不同。例：loli（`8001687764241341`，版本 1.12.23）包内 `libs/libjsapi_bridge.so` = 2,150,456 B / md5 `83640b…`，安装后 `libs/libjsapi_bridge_1592736819.so` = 2,267,040 B / md5 `1c2aa9…`（Sep 15）。
+
+结论：系统存在**独立的原生库下发/更新步骤**（PMS 或应用商店侧），其与包内 `libs/` 的关系、以及加载器如何解析 `_<salt>` 后缀，必须用自研探针在阶段 0 验证（自研包内只有我们自己的 `.so`，验证点：是否被原样保留或重命名、`import` 是否成功、`custom_init_jsapis` 是否被调用）。
+
+### 10.6 对基线与阶段 0 的结论
+
+1. **G-10 关闭**：探针投放目录采用 `app/libs/arm64-popcorn/`（推荐）；如担心机型差异，可同时提供通用回退 `app/libs/arm64/`——系统包已证明该目录在本机可用，但同包多目录的选择规则未验证。
+2. **G-1 收窄**：打包路径、arch 目录名、安装落盘形态均已明确；剩余为真机 import 与卸载/升级行为。
+3. **G-12 新增**：自研探针必须验证安装后文件名/内容变化对加载的影响。
+4. 设备操作通道就绪：`miniapp_cli install/uninstall/start/capture` 可直接用于阶段 0 的安装与回滚验证；探针包可用 `adb push` 到 `/tmp` 后 `miniapp_cli install`。
 
 ---
 
@@ -314,6 +369,12 @@ git clone --depth 1 github.com/Magniswan/Pen-LVGL → 成功（临时目录）�
 rg 'jqutil|libjsapi|custom_init_jsapis' <clone>   → SDK/模块注册/构建样板齐备（见第九节）
 rg 'libjsapi_|libs/|archLibs|arm64' .probe/libfalcon.txt → 固件加载链与 PMS arch 目录证据
 参照子集拷贝 .probe/refs/Pen-LVGL/        → 121 个文件 ≈ 705 KB（忽略目录，不入 git）
+adb devices -l                             → 1 台设备（脱敏 MEC17****3678），adb shell uid=0
+uname -a                                   → YoudaoDictionaryPen-678 5.10.160 aarch64（2026-07-28 构建）
+command -v miniapp_cli / unzip / busybox   → /bin/miniapp_cli、/bin/unzip、/bin/busybox（无 python）
+find <pkg> -name 'libjsapi_*.so'           → 已安装原生库约 90 个，落盘于 <pkg>/<slot>/libs/
+manifest cert 直方图                        → arm64-popcorn 79 / arm64 3 / arm 3 / arm64-cherry3566 2 / arm64-orange 1
+已安装库 md5 与包内 cert 对比                → 文件名多 _<salt>、内容与时间戳不同（G-12）
 ```
 
 ## 附录 B：本轮明确未做的事
