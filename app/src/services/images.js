@@ -2,7 +2,7 @@
 // 发送前用 ffmpeg 压缩到合理尺寸，再 base64 转 data URL（避免大图在 QuickJS 里内存爆掉导致设备卡死/重启）。
 // 不再依赖 langningchen（本设备不存在该模块）。
 
-import { readdir, execShell, waitForFile, sleep, mkdir, joinPath, dataDirBase, statSize, exists } from './native.js'
+import { readdir, execShell, waitForFile, sleep, mkdir, joinPath, dataDirBase, statSize, exists, shq } from './native.js'
 
 const ALBUM = '/userdisk/Pictures'
 const IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp']
@@ -21,6 +21,24 @@ function ext(name) {
 const MAX_IMAGE_BYTES = 900 * 1024
 const MAX_BASE64_CHARS = 1280 * 1024
 
+// 相册缩略图是串行生成的，但用户可以在转换中途进入相机。
+// 保存每个 ffmpeg 的 pid 文件，以便切换页面时精确终止当前任务，
+// 不用 pkill 全局 ffmpeg。
+let thumbGeneration = 0
+const activeThumbJobs = new Set()
+
+function stopThumbJob(pidFile) {
+  execShell(
+    'if [ -s ' + shq(pidFile) + ' ]; then kill -TERM "$(cat ' + shq(pidFile) + ')" 2>/dev/null || true; fi; rm -f ' +
+      shq(pidFile) + ' 2>/dev/null || true'
+  )
+}
+
+export function cancelThumbJobs() {
+  thumbGeneration += 1
+  for (const pidFile of activeThumbJobs) stopThumbJob(pidFile)
+}
+
 export function isImage(name) {
   return IMAGE_EXTS.indexOf(ext(name)) >= 0
 }
@@ -36,10 +54,6 @@ export async function listAlbum() {
   return names
     .filter((n) => isImage(n))
     .map((n) => ({ name: n, path: ALBUM + '/' + n }))
-}
-
-function shq(s) {
-  return "'" + String(s).replace(/'/g, "'\\''") + "'"
 }
 
 // 把源路径映射成稳定的压缩缓存名（djb2）：同一张图会被反复发送
@@ -64,16 +78,30 @@ export async function ensureThumb(srcPath) {
   if (await exists(dst) && (await statSize(dst)) > 0) return dst
 
   const okFile = dst + '.ok'
-  const cmd = 'ffmpeg -y -i ' + shq(srcPath) +
+  const pidFile = dst + '.pid'
+  const generation = thumbGeneration
+  activeThumbJobs.add(pidFile)
+  const cmd =
+    "( printf '%s\\n' \"$$\" > " + shq(pidFile) + '; ' +
+    'ffmpeg -y -i ' + shq(srcPath) +
     ' -vf ' + shq('scale=256:256:force_original_aspect_ratio=decrease') +
     ' -q:v 5 ' + shq(dst) +
-    ' > /dev/null 2>&1; echo done > ' + shq(okFile)
+    ' > /dev/null 2>&1 & child=$!; ' +
+    "trap 'kill -9 \"$child\" 2>/dev/null || true' TERM INT; " +
+    'wait $child; rc=$?; if [ $rc -eq 0 ]; then echo done > ' + shq(okFile) + '; fi )'
   execShell(cmd)
-  const ok = await waitForFile(okFile, 15000)
-  execShell('rm -f ' + shq(okFile) + ' 2>/dev/null || true')
-  if (ok === null) return srcPath
-  await sleep(80)
-  return dst
+  try {
+    const ok = await waitForFile(okFile, 15000, () => generation !== thumbGeneration)
+    if (generation !== thumbGeneration || ok === null) {
+      stopThumbJob(pidFile)
+      return srcPath
+    }
+    await sleep(80)
+    return dst
+  } finally {
+    activeThumbJobs.delete(pidFile)
+    execShell('rm -f ' + shq(okFile) + ' ' + shq(pidFile) + ' 2>/dev/null || true')
+  }
 }
 
 /**

@@ -127,7 +127,7 @@
             <div :class="dc('field')">
                 <text :class="dc('label')">启用调试日志</text>
                 <text :class="form.debugLog ? dc('chip-active') : dc('chip')" @click="form.debugLog = !form.debugLog">{{ form.debugLog ? '开启' : '关闭' }}</text>
-                <text :class="dc('field-hint')">开启后同步抓取本机后端与 DeepSeek/数美的全部网络往返（JSONL，在「查看诊断日志 → 网络抓取」可看尾部，完整文件 logs/net-capture.jsonl）。禁言/风控发生时即有第一手报文可查。注意：报文含账号凭据，外发前自行脱敏；切换后点「保存」，会自动重启后端生效</text>
+                <text :class="dc('field-hint')">开启后双向抓取全部网络报文（app→后端、后端→DeepSeek/数美，JSONL；「查看诊断日志 → 网络抓取」可看尾部，完整文件 logs/net-capture.jsonl 单份 128MB、最多留 3 份）。禁言/风控发生时即有第一手报文可查。注意：报文含账号凭据，外发前自行脱敏；切换后点「保存」，会自动重启后端生效</text>
             </div>
             <div :class="dc('field')">
                 <text :class="dc('label')">Emoji 字体（实验，联网下载约 10MB）</text>
@@ -196,8 +196,8 @@
 <script>
 import { MODES, listRemoteModels } from '../../services/ds.js'
 import { DEFAULT_SETTINGS, APP_VERSION, loadSettings, saveSettings, loadConversations, saveConversations, deleteMessages, saveActiveId, readLocalDsPass, loadAccountTrouble } from '../../services/store.js'
-import { openTextEditor, updateDsFreeApiAccount, readDsFreeApiProxy, updateDsFreeApiProxy, validateProxyUrl, updateDsFreeApiNetCapture, INPUT_TYPES, deployBackend, ensureBackendRunning } from '../../services/native.js'
-import { appLog, appLogTail, appLogClear, backendLogTail, backendLogClear, netCaptureTail, netCaptureClear } from '../../services/app-log.js'
+import { openTextEditor, updateDsFreeApiAccount, readDsFreeApiProxy, updateDsFreeApiProxy, validateProxyUrl, updateDsFreeApiNetCapture, readNetCaptureTail, INPUT_TYPES, deployBackend, ensureBackendRunning } from '../../services/native.js'
+import { appLog, appLogTail, appLogClear, backendLogTail, backendLogClear, netCaptureClear } from '../../services/app-log.js'
 import { ensureEmojiFont } from '../../services/emoji-font.js'
 
 // 首帧主题预读：与 index.vue 一致，从 $falcon.__dsTheme 同步读取，避免深色用户闪浅色（#7）
@@ -362,8 +362,9 @@ export default {
             if (this.logSource === 'app') {
                 this.logContent = await appLogTail(this.logLines, this.logGen)
             } else if (this.logSource === 'capture') {
-                // 网络抓取是 JSONL，行较长，app-log 内部已按 600 字符/行截断展示
-                this.logContent = await netCaptureTail(this.logLines, this.logGen)
+                // 网络抓取是 JSONL 且文件可达 20MB：走 shell tail（native.js），
+                // 行展示层截断 600 字符，不整读进 JS 内存
+                this.logContent = await readNetCaptureTail(this.logLines, this.logGen)
             } else {
                 this.logContent = await backendLogTail(this.logLines, this.logGen)
             }

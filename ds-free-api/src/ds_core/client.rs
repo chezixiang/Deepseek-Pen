@@ -531,8 +531,8 @@ impl<S: Stream<Item = Result<Bytes, ClientError>>> Stream for CaptureStream<S> {
         }
         match self.inner.as_mut().poll_next(cx) {
             std::task::Poll::Ready(Some(Ok(bytes))) => {
-                if self.buf.len() < net_capture::MAX_STREAM_BYTES {
-                    let take = (net_capture::MAX_STREAM_BYTES - self.buf.len()).min(bytes.len());
+                if self.buf.len() < net_capture::MAX_BODY_BYTES {
+                    let take = (net_capture::MAX_BODY_BYTES - self.buf.len()).min(bytes.len());
                     self.buf.extend_from_slice(&bytes[..take]);
                     if take < bytes.len() {
                         self.truncated = true;
@@ -594,6 +594,13 @@ pub struct DsClient {
     hif_static_dliq: String,
     /// Origin/Referer 用的站点根（由 api_base 去掉 `/api/v0` 推导）
     web_origin: String,
+    /// 共享 cookie jar 句柄（运行时补写 smidV2 用）
+    jar: std::sync::Arc<wreq::cookie::Jar>,
+    /// 主客户端代理（mint 等附属链路对齐出口用）
+    proxy_url: Option<String>,
+    /// jar 里是否已绑定 smidV2（设备级 cookie，单 jar 只绑一个设备身份；
+    /// Arc 使克隆的 DsClient 与本体共享同一状态，与共享 jar 一致）
+    smid_in_jar: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// 从 api_base（如 `https://chat.deepseek.com/api/v0`）推导站点 Origin。
@@ -655,6 +662,31 @@ pub fn preloaded_cookies_from_accounts(accounts: &[crate::config::Account]) -> V
     }
 }
 
+/// 共享 HTTP 底座：浏览器 TLS/HTTP2 仿真 + 统一 UA + 可选代理 + 连接超时。
+///
+/// DsClient（业务链路）与 mint（设备注册链路）必须同源：同一 device_id 身份的
+/// 注册与登录若呈不同 TLS 指纹或不同出口（代理），即是风控可交叉校验的层间矛盾。
+pub(crate) fn base_http_builder(
+    user_agent: &str,
+    proxy_url: Option<&str>,
+) -> wreq::ClientBuilder {
+    let mut builder = wreq::Client::builder()
+        .emulation(Emulation::Chrome136)
+        // 客户端级 UA：覆盖 emulation 的默认值（其 profile 默认 OS 为 macOS，
+        // 会发 "Macintosh; Intel Mac OS X" UA）。所有链路必须与身份一致
+        // （Linux aarch64 Chrome 136）。
+        .user_agent(user_agent.to_string())
+        // 连接阶段超时：wreq 默认不设超时，上游 IP 黑洞/半开连接会让
+        // 请求永不返回。只限 connect 阶段，不影响 SSE 长流式读
+        // （读空闲由 completions 的 IdleTimeoutStream 兜底）。
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .redirect(wreq::redirect::Policy::limited(10));
+    if let Some(url) = proxy_url.and_then(|u| wreq::Proxy::all(u).ok()) {
+        builder = builder.proxy(url);
+    }
+    builder
+}
+
 impl DsClient {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -672,30 +704,18 @@ impl DsClient {
         hif_static_dliq: String,
         hif_auto_fetch: bool,
     ) -> Self {
-        let mut builder = wreq::Client::builder()
-            .emulation(Emulation::Chrome136)
-            // 客户端级 UA：覆盖 emulation 的默认值（其 profile 默认 OS 为 macOS，
-            // 会发 "Macintosh; Intel Mac OS X" UA）。HIF token 拉取、wasm 下载等
-            // 未逐请求覆盖 UA 的请求也必须与身份一致（Linux aarch64 Chrome 136）。
-            .user_agent(user_agent.clone())
-            // 连接阶段超时：wreq 默认不设超时，上游 IP 黑洞/半开连接会让
-            // 请求永不返回，账号被占死在 Busy。只限 connect 阶段，不影响
-            // SSE 长流式读（读空闲由 completions 的 IdleTimeoutStream 兜底）。
-            .connect_timeout(std::time::Duration::from_secs(15))
-            .redirect(wreq::redirect::Policy::limited(10))
-            // 浏览器行为对齐（new.jsonl 抓包实证）：真实客户端带 Cookie 头——
-            // HWWAFSESID/HWWAFSESTIME（华为云 WAF）、ds_session_id、smidV2（数美）
-            // 均随响应 Set-Cookie 累积并在后续请求回传。此前未启用 cookie store，
-            // 请求链上完全无 cookie 是一个可识别的自动化特征。
-            .cookie_provider(std::sync::Arc::new(build_cookie_jar(
-                &api_base,
-                preloaded_cookies,
-            )));
-        if let Some(url) = proxy_url.and_then(|u| wreq::Proxy::all(u).ok()) {
-            builder = builder.proxy(url);
-        }
+        // 浏览器行为对齐（new.jsonl 抓包实证）：真实客户端带 Cookie 头——
+        // HWWAFSESID/HWWAFSESTIME（华为云 WAF）、ds_session_id、smidV2（数美）
+        // 均随响应 Set-Cookie 累积并在后续请求回传。此前未启用 cookie store，
+        // 请求链上完全无 cookie 是一个可识别的自动化特征。
+        let had_preloaded_smid = !preloaded_cookies.is_empty();
+        let jar = std::sync::Arc::new(build_cookie_jar(&api_base, preloaded_cookies));
+        let http = base_http_builder(&user_agent, proxy_url)
+            .cookie_provider(jar.clone())
+            .build()
+            .expect("构建 HTTP 客户端失败");
+
         let web_origin = origin_of(&api_base);
-        let http = builder.build().expect("构建 HTTP 客户端失败");
 
         // HIF token 动态获取（x-hif-leim / x-hif-dliq）：bundle 逆向证实这是
         // DeepSeek 分发服务下发的公开凭据（非本地生成），用后台任务定期拉取。
@@ -718,6 +738,11 @@ impl DsClient {
             hif_static_leim,
             hif_static_dliq,
             web_origin,
+            jar,
+            proxy_url: proxy_url.map(str::to_string),
+            smid_in_jar: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                had_preloaded_smid,
+            )),
         }
     }
 
@@ -795,6 +820,31 @@ impl DsClient {
         self.user_agent.clone()
     }
 
+    /// 主客户端代理配置（mint 等附属链路对齐出口用）
+    pub fn proxy_url(&self) -> Option<&str> {
+        self.proxy_url.as_deref()
+    }
+
+    /// 运行时 mint 出新设备身份后，把配对的 smidV2 补进共享 cookie jar。
+    ///
+    /// device_id（登录 body）与 smidV2（Cookie）是同一设备身份的两半，真实浏览器
+    /// 两者同源。smidV2 是设备级 cookie：单 jar 只绑一个身份，已有值（构造时预置
+    /// 或已补写过）时拒绝再次绑定，与 `preloaded_cookies_from_accounts` 的
+    /// "取第一个非空"策略一致。返回是否实际写入。
+    pub fn set_smid_cookie(&self, smid: &str) -> bool {
+        use std::sync::atomic::Ordering;
+        if smid.is_empty() || self.smid_in_jar.load(Ordering::SeqCst) {
+            return false;
+        }
+        let Ok(url) = wreq::Url::parse(&format!("{}/", self.web_origin)) else {
+            return false;
+        };
+        self.jar
+            .add_cookie_str(&format!("smidV2={smid}"), &url);
+        self.smid_in_jar.store(true, Ordering::SeqCst);
+        true
+    }
+
     fn auth_headers(&self, token: &str) -> Result<wreq::header::HeaderMap, ClientError> {
         let mut h = self.web_base_headers()?;
         h.insert(
@@ -859,6 +909,7 @@ impl DsClient {
         }
         net_capture::req(
             cid,
+            "out",
             method,
             url,
             &rec_headers,
@@ -996,6 +1047,7 @@ impl DsClient {
         // 抓取记录的 URL 手工补 query（实际发送仍走 .query()，行为不变）
         net_capture::req(
             cid,
+            "out",
             "GET",
             &format!(
                 "{}{}?did={}&scope=main/model/web_upgrade",
@@ -1039,7 +1091,7 @@ impl DsClient {
         if let Some(ts) = before_updated_at {
             url_cap.push_str(&format!("&lte_cursor.updated_at={:.3}", ts));
         }
-        net_capture::req(cid, "GET", &url_cap, &headers, None);
+        net_capture::req(cid, "out", "GET", &url_cap, &headers, None);
         let mut rb = self
             .http
             .get(base)
@@ -1088,6 +1140,7 @@ impl DsClient {
         let headers = self.auth_headers(token)?;
         net_capture::req(
             cid,
+            "out",
             "GET",
             &format!(
                 "{}{}?chat_session_id={}",
@@ -1397,6 +1450,7 @@ impl DsClient {
         let cid = net_capture::begin();
         net_capture::req(
             cid,
+            "out",
             "POST",
             &format!("{}{}", self.api_base, ENDPOINT_FILE_UPLOAD),
             &h,
@@ -1511,6 +1565,7 @@ impl DsClient {
         let cid = net_capture::begin();
         net_capture::req(
             cid,
+            "out",
             "GET",
             &self.wasm_url,
             &wreq::header::HeaderMap::new(),
@@ -1651,8 +1706,8 @@ fn prune_message_tree(nodes: Vec<(String, TreeNode)>, has_tree: bool) -> Vec<Clo
 #[cfg(test)]
 mod tests {
     use super::{
-        prune_message_tree, origin_of, ChatMute, CloudMessage, CreateSessionWrapper, Envelope,
-        LoginData, TreeNode, UserInfo,
+        origin_of, prune_message_tree, ChatMute, CloudMessage, CreateSessionWrapper, DsClient,
+        Envelope, LoginData, LoginPayload, TreeNode, UserInfo,
     };
 
     fn node(id: &str, parent: Option<&str>, role: &str, content: &str) -> (String, TreeNode) {
@@ -1855,5 +1910,53 @@ mod tests {
         ];
         let out = prune_message_tree(nodes, true);
         assert_eq!(texts(&out), vec!["q1", "a1", "q2", "a2"]);
+    }
+
+    /// 修复②回归：运行时 mint 出新设备身份后补写的 smidV2 必须真的随请求发出，
+    /// 且设备级 cookie 只允许绑定一次。登录响应解析失败没关系，只验证请求头。
+    #[tokio::test]
+    async fn set_smid_cookie_flows_into_outgoing_requests() {
+        let (addr, captured) = crate::ds_core::mock_http::spawn(200, r#"{"code":-1}"#);
+        let client = DsClient::new(
+            format!("http://{addr}/api/v0"),
+            format!("http://{addr}/wasm"),
+            crate::ds_core::default_user_agent(),
+            "1.0.0".to_string(),
+            "Linux aarch64".to_string(),
+            "zh_CN".to_string(),
+            "test.bundle".to_string(),
+            480,
+            None,
+            vec![],
+            String::new(),
+            String::new(),
+            false,
+        );
+        assert!(client.set_smid_cookie("smid-test-123"), "首次写入应成功");
+        assert!(
+            !client.set_smid_cookie("smid-other"),
+            "设备级 cookie 二次写入必须被拒绝（单 jar 只绑一个设备身份）"
+        );
+
+        let payload = LoginPayload {
+            email: Some("a@b.c".to_string()),
+            mobile: None,
+            password: "pw".to_string(),
+            area_code: None,
+            device_id: "Bdevice".to_string(),
+            os: "web".to_string(),
+        };
+        let _ = client.login(&payload).await;
+
+        let req = tokio::time::timeout(std::time::Duration::from_secs(5), captured)
+            .await
+            .expect("mock 未收到登录请求（超时）")
+            .expect("mock 任务失败");
+        let cookie = req.header("cookie").unwrap_or_default();
+        assert!(
+            cookie.contains("smidV2=smid-test-123"),
+            "smidV2 必须随登录请求发送，实际 cookie: {cookie}"
+        );
+        assert!(!cookie.contains("smid-other"), "二次写入的值不得出现");
     }
 }

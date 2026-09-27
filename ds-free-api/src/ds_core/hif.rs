@@ -154,7 +154,7 @@ async fn fetch_token(
     headers.insert("Accept", HeaderValue::from_static("*/*"));
 
     let cid = crate::server::net_capture::begin();
-    crate::server::net_capture::req(cid, "GET", url, &headers, None);
+    crate::server::net_capture::req(cid, "out", "GET", url, &headers, None);
     let resp = http
         .get(url)
         .headers(headers)

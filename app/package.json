@@ -1,6 +1,6 @@
 {
   "name": "Deepseek",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Deepseek 聊天客户端（有道词典笔版，对接 ds-free-api）",
   "appid": "8000000000182376",
   "icon": "app_icon.png",
@@ -22,8 +22,9 @@
     "audit:template": "node scripts/audit-text-nesting.js",
     "test:latex": "node scripts/test-latex.mjs",
     "test:config": "node scripts/test-config-parse.mjs",
-    "test": "node scripts/test-latex.mjs && node scripts/test-config-parse.mjs && node scripts/test-ratelimit.mjs && node scripts/test-ds-text.mjs && node scripts/test-markdown.mjs && node scripts/test-store-schema.mjs && node scripts/test-emoji.mjs",
-    "test:ratelimit": "node scripts/test-ratelimit.mjs"
+    "test": "node scripts/test-latex.mjs && node scripts/test-config-parse.mjs && node scripts/test-ratelimit.mjs && node scripts/test-ds-text.mjs && node scripts/test-markdown.mjs && node scripts/test-store-schema.mjs && node scripts/test-emoji.mjs && node scripts/test-camera-layer.mjs && node scripts/test-camera-regression.mjs",
+    "test:ratelimit": "node scripts/test-ratelimit.mjs",
+    "test:camera": "node scripts/test-camera-layer.mjs && node scripts/test-camera-regression.mjs"
   },
   "dependencies": {
     "falcon-ui": "^2.0.2",

@@ -308,7 +308,20 @@ fn chrono_rw_string() -> String {
 /// device_id 为服务端签发的 base64 体（调用方负责加 'B' 前缀，
 /// 见 device_bootstrap::is_issued）；smid 为注册流程中本地生成的 smidV2，
 /// 与 device_id 构成同一设备身份的两半（真实浏览器两者同源）。
-pub async fn mint_device_id(user_agent: &str) -> Result<(String, String), String> {
+pub async fn mint_device_id(
+    user_agent: &str,
+    proxy_url: Option<&str>,
+) -> Result<(String, String), String> {
+    mint_device_id_to(user_agent, proxy_url, SM_API_URL).await
+}
+
+/// 可注入 API URL 的注册实现：生产走 `SM_API_URL`；测试指向本地 mock，
+/// 用于验证仿真头、代理路由与协议编解码（见 mod tests）。
+pub(crate) async fn mint_device_id_to(
+    user_agent: &str,
+    proxy_url: Option<&str>,
+    api_url: &str,
+) -> Result<(String, String), String> {
     let uid = uuid_v4();
     let smid = gen_smid_v2();
 
@@ -382,18 +395,20 @@ pub async fn mint_device_id(user_agent: &str) -> Result<(String, String), String
         );
         crate::server::net_capture::req(
             cid,
+            "out",
             "POST",
-            SM_API_URL,
+            api_url,
             &rec_headers,
             Some(Value::String(body.to_string())),
         );
     }
-    let client = wreq::Client::builder()
-        .user_agent(user_agent.to_string())
+    // 与主链路（DsClient）共用浏览器仿真底座 + 代理：同一 device_id 的注册与
+    // 登录若呈不同 TLS/头部指纹或不同出口，即是风控可交叉校验的层间矛盾。
+    let client = crate::ds_core::client::base_http_builder(user_agent, proxy_url)
         .build()
         .map_err(|e| format!("HTTP client: {e}"))?;
     let resp = client
-        .post(SM_API_URL)
+        .post(api_url)
         .header("Origin", "https://chat.deepseek.com")
         .header("Referer", "https://chat.deepseek.com/")
         .json(&body)
@@ -432,6 +447,98 @@ pub async fn mint_device_id(user_agent: &str) -> Result<(String, String), String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ds_core::mock_http;
+    use std::time::Duration;
+
+    async fn captured(
+        handle: tokio::task::JoinHandle<mock_http::CapturedRequest>,
+    ) -> mock_http::CapturedRequest {
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("mock 未收到请求（超时）")
+            .expect("mock 任务失败")
+    }
+
+    /// 修复①回归：mint 注册请求必须与主链路同一浏览器身份——
+    /// 同一 device_id 的注册若呈非浏览器 TLS/头部指纹，即是风控可交叉校验的层间矛盾。
+    #[tokio::test]
+    async fn mint_client_applies_browser_emulation_and_pen_ua() {
+        let (addr, handle) =
+            mock_http::spawn(200, r#"{"code":1100,"detail":{"deviceId":"mock"}}"#);
+        let api = format!("http://{addr}/deviceprofile/v4");
+        let _ = mint_device_id_to(PEN_UA, None, &api).await;
+        let req = captured(handle).await;
+        assert_eq!(
+            req.header("user-agent"),
+            Some(PEN_UA),
+            "UA 必须是笔端身份（与主链路一致），而非 wreq 默认"
+        );
+        let sec_ch = req.header("sec-ch-ua").expect(
+            "缺 sec-ch-ua：mint 客户端未启用浏览器仿真，注册流量的 TLS/头部指纹与登录链路不一致",
+        );
+        assert!(
+            sec_ch.contains("136"),
+            "sec-ch-ua 版本必须与 Chrome136 仿真同大版本: {sec_ch}"
+        );
+    }
+
+    /// 修复①回归：mint 必须走主客户端配置的代理——注册与登录出口 IP 不同
+    /// 同样是可关联的层间矛盾。目标端口不可达：只有真的经过代理，mock 才会收到请求。
+    #[tokio::test]
+    async fn mint_client_routes_through_configured_proxy() {
+        let (proxy_addr, handle) =
+            mock_http::spawn(200, r#"{"code":1100,"detail":{"deviceId":"mock"}}"#);
+        let api = "http://127.0.0.1:1/deviceprofile/v4";
+        let proxy = format!("http://{proxy_addr}");
+        let _ = mint_device_id_to(PEN_UA, Some(&proxy), api).await;
+        let req = captured(handle).await;
+        assert!(
+            req.uri.starts_with("http://"),
+            "经 HTTP 代理的请求应为绝对形式 URI，实际: {}",
+            req.uri
+        );
+        assert!(
+            req.uri.contains("/deviceprofile/v4"),
+            "代理收到的目标路径错误: {}",
+            req.uri
+        );
+    }
+
+    /// 协议管线特征测试：真实 payload 构造 → 加密 → POST → 解析 1100/B 前缀。
+    #[tokio::test]
+    async fn mint_protocol_roundtrip_over_mock() {
+        let (addr, handle) =
+            mock_http::spawn(200, r#"{"code":1100,"detail":{"deviceId":"abc"}}"#);
+        let api = format!("http://{addr}/deviceprofile/v4");
+        let (device_id, smid) = mint_device_id_to(PEN_UA, None, &api)
+            .await
+            .expect("注册应成功");
+        assert_eq!(device_id, "Babc", "成功响应必须加 B 前缀");
+        assert_eq!(smid.len(), 63, "smidV2 长度与真实格式一致");
+        let req = captured(handle).await;
+        assert_eq!(req.method, "POST");
+        assert_eq!(
+            req.header("origin"),
+            Some("https://chat.deepseek.com"),
+            "Origin 必须是站点根（数美 SDK 在 deepseek 页面内运行）"
+        );
+        assert_eq!(
+            req.header("content-type"),
+            Some("application/json"),
+            "请求体必须为 JSON"
+        );
+    }
+
+    /// 非 1100 响应必须报错，不得返回未签发的值。
+    #[tokio::test]
+    async fn mint_rejects_error_code_response() {
+        let (addr, _handle) = mock_http::spawn(200, r#"{"code":1902,"msg":"bad"}"#);
+        let api = format!("http://{addr}/deviceprofile/v4");
+        assert!(
+            mint_device_id_to(PEN_UA, None, &api).await.is_err(),
+            "code!=1100 必须返回 Err"
+        );
+    }
 
     #[test]
     fn smid_matches_captured_format() {

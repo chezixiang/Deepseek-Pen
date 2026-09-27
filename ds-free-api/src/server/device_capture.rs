@@ -388,6 +388,7 @@ async fn download_and_patch_fp() -> Result<String, String> {
     let cid = crate::server::net_capture::begin();
     crate::server::net_capture::req(
         cid,
+        "out",
         "GET",
         FP_SCRIPT_URL,
         &wreq::header::HeaderMap::new(),

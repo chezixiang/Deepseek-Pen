@@ -33,9 +33,9 @@
             <text :class="dc('backend-error-text')">⚠️ 后端连接已断开（如果是安装/更新后第一次打开软件可以通过配置账号的方式重启服务试试）</text>
         </div>
 
-        <!-- 消息区。scroller 绝不能套 v-if：Falcon 引擎对被 v-if 三元包装的
-             scroller 渲染异常（整个内容区空白，欢迎语/消息全丢，真机实证）。
-             相机模式下改为清空内容数组（chatMessages）来隐藏消息。 -->
+        <!-- 消息区。scroller 绝不能套 v-if：Falcon 对被 v-if 包装的 scroller 会渲染空白。
+             相机模式下由后面的 cam-stage 黑色窗口覆盖，不销毁消息节点，避免进入
+             取景页时同步重建/销毁整棵消息树造成输入卡顿。 -->
         <scroller class="msgs" scroll-direction="vertical">
             <div class="empty" v-if="!camMode && messages.length === 0">
                 <text v-if="cloudLoadingId === activeId" :class="dc('empty-tip')">正在加载云端对话…</text>
@@ -168,40 +168,10 @@
             </div>
         </div>
 
-        <!-- 相机取景（帧循环预览）：
-             kmssink overlay"透明洞"方案不可用（Falcon 跳过透明区域绘制，相册
-             残影留在洞里，真机实证）。改为：洞区不透明黑底 + video29 每 400ms
-             抓帧转 JPG，image 组件轮换刷新（camera.js startFramePreview）。 -->
-        <div class="cam-stage" v-if="showCamera && !showConfirm">
-            <div :class="dc('cam-side')"></div>
-            <div class="cam-gap">
-                <image class="cam-frame" v-if="previewFrame" resize="contain" :src="previewFrame" />
-            </div>
-            <div :class="dc('cam-side-r')">
-                <image :class="dc('cam-close')" resize="contain" :src="closeIconSrc()" @click="closeCamera" />
-                <div class="cam-spacer"></div>
-                <div :class="dc('shutter-outer')" @click="shoot">
-                    <div :class="dc('shutter-inner')"></div>
-                </div>
-            </div>
-        </div>
-
-        <!-- 拍照确认浮层：预览图 + 比例标签 + 重拍/裁剪/确认（悬浮圆钮） -->
-        <div class="camera-view" v-if="showConfirm">
-            <image class="camera-preview" resize="contain" :src="confirmSrc" />
-            <text :class="dc('crop-label')">{{ cropRatio || '全图' }}</text>
-            <div :class="dc('confirm-btn-redo')" @click="retakeShot">
-                <image class="confirm-icon" resize="contain" :src="redoIconSrc()" />
-            </div>
-            <div :class="dc('confirm-btn-crop')" @click="cycleCrop">
-                <image class="confirm-icon" resize="contain" :src="cropIconSrc()" />
-            </div>
-            <div :class="dc('confirm-btn-ok')" @click="confirmShot">
-                <image class="confirm-icon" resize="contain" :src="checkIconSrc()" />
-            </div>
-        </div>
-
-        <!-- 竖屏旋转画布到此为止：遮罩/抽屉/选择器保持不旋转，绝对定位于 pwrap -->
+        <!-- 竖屏旋转画布到此为止：遮罩/抽屉/选择器/相机浮层保持不旋转，绝对定位于 pwrap。
+             相机取景/确认也移出旋转画布：相机永远横屏铺满（936x280），与相册选择器
+             同一坐标系 —— 竖屏模式下选择器本就不旋转，取景若留在旋转画布里会被
+             220px 侧板挤爆且触摸坐标无法对应。 -->
         </div>
 
         <!-- 会话抽屉：全屏遮罩挡住穿透点击（#8），点遮罩关闭。
@@ -233,7 +203,8 @@
             <text :class="dc('drawer-close')" @click="closeDrawer">关闭</text>
         </div>
 
-        <!-- 相册选择器：竖向滚动网格（新图在上），底部"去拍照"引导 -->
+        <!-- 相册选择器：竖向滚动网格（新图在上），底部"去拍照"引导。
+             进入相机后停止相册后台缩略图更新，避免 picker 与相机层同时参与重排。 -->
         <div class="picker" v-if="showPicker && !camMode">
             <div :class="dc('picker-head')">
                 <text :class="dc('picker-title')">相册（/userdisk/Pictures）</text>
@@ -259,6 +230,48 @@
                 </div>
             </scroller>
         </div>
+
+        <!-- 相机取景：video29 帧循环转 JPEG，显示区域 700x280；
+             相册节点在进入相机时卸载，右侧保留关闭按钮和快门。 -->
+        <div class="cam-stage" v-if="showCamera && !showConfirm">
+            <image class="cam-frame" v-if="previewMode === 'frames' && previewFrame" resize="contain" :src="previewFrame" />
+            <text class="cam-hint" v-if="camHintText">{{ camHintText }}</text>
+            <text class="cam-err" v-if="camError">{{ camError }}</text>
+            <image class="cam-close" resize="contain" :src="closeIconSrc()" @click="closeCamera(true)" />
+            <div class="shutter-outer" @click="shoot">
+                <div class="shutter-inner"></div>
+            </div>
+        </div>
+
+        <!-- 拍照确认浮层：全屏带图 + 可拖拽裁剪框（官方同款：自己拖，不是预设比例） -->
+        <div class="camera-view" v-if="showConfirm">
+            <image class="camera-preview" resize="contain" :src="confirmSrc" />
+            <div class="crop-mask" :style="cropMaskStyle('top')"></div>
+            <div class="crop-mask" :style="cropMaskStyle('bottom')"></div>
+            <div class="crop-mask" :style="cropMaskStyle('left')"></div>
+            <div class="crop-mask" :style="cropMaskStyle('right')"></div>
+            <div class="crop-border" :style="cropBoxStyle"></div>
+            <div class="crop-grab" :style="cropBoxStyle"
+                 @touchstart="cropTouchStart('move', $event)"
+                 @touchmove="cropTouchMove"
+                 @touchend="cropTouchEnd"></div>
+            <div class="crop-handle crop-h-tl" :style="cropHandleStyle('tl')"
+                 @touchstart="cropTouchStart('tl', $event)" @touchmove="cropTouchMove" @touchend="cropTouchEnd"></div>
+            <div class="crop-handle crop-h-tr" :style="cropHandleStyle('tr')"
+                 @touchstart="cropTouchStart('tr', $event)" @touchmove="cropTouchMove" @touchend="cropTouchEnd"></div>
+            <div class="crop-handle crop-h-bl" :style="cropHandleStyle('bl')"
+                 @touchstart="cropTouchStart('bl', $event)" @touchmove="cropTouchMove" @touchend="cropTouchEnd"></div>
+            <div class="crop-handle crop-h-br" :style="cropHandleStyle('br')"
+                 @touchstart="cropTouchStart('br', $event)" @touchmove="cropTouchMove" @touchend="cropTouchEnd"></div>
+            <text class="crop-hint">拖白框选区域 · 拖四角调大小</text>
+            <text class="cam-err" v-if="camError">{{ camError }}</text>
+            <div class="confirm-btn-redo" @click="retakeShot">
+                <image class="confirm-icon" resize="contain" :src="redoIconSrc()" />
+            </div>
+            <div class="confirm-btn-ok" @click="confirmShot">
+                <image class="confirm-icon" resize="contain" :src="checkIconSrc()" />
+            </div>
+        </div>
         </div>
     </div>
 </template>
@@ -271,8 +284,8 @@ import {
     deleteMessages, loadSettings, loadActiveId, saveActiveId, uid, DEFAULT_SETTINGS,
     recordAccountTrouble
 } from '../../services/store.js'
-import { listAlbum, readImageDataUrl, ensureThumb } from '../../services/images.js'
-import { startFramePreview, stopFramePreview, capturePhoto, cropFrame } from '../../services/camera.js'
+import { listAlbum, readImageDataUrl, ensureThumb, cancelThumbJobs } from '../../services/images.js'
+import { startPreview, stopPreview, startFramePreview, stopFramePreview, capturePhoto, cropFrame, PHOTO_W, PHOTO_H } from '../../services/camera.js'
 import { openTextEditor, setDebugLogEnabled, stopStream, INPUT_TYPES, ensureBackendRunning } from '../../services/native.js'
 import { markdownToBlocks, inlineSpans, splitEmojiRuns, latexToText, splitMathSegments, canTypesetMath, bracesBalanced } from '../../services/markdown.js'
 import { ensureEmojiFont } from '../../services/emoji-font.js'
@@ -318,17 +331,28 @@ export default {
             albumImages: [],
             albumError: '',
             albumLoading: false,
+            // 相册缩略图生成序号：进入取景/关闭相册后，使旧的后台任务失效，
+            // 避免每张缩略图完成时继续对整页 forceUpdate。
+            albumLoadSeq: 0,
             // 现场拍摄进行中（services/camera.js）
             takingPhoto: false,
-            // 相机取景浮层（帧循环预览：video29 抓帧转 JPG 轮换刷新）
+            // 相机取景浮层（JPEG 帧循环 ~7fps；避免把黑色 kmssink plane 误判为有效预览）
             showCamera: false,
-            // 取景帧路径（/tmp 双文件轮换，见 camera.js startFramePreview）
+            // 取景模式：''=启动中，'frames'=黑底+image
+            previewMode: '',
+            // 取景帧路径（仅 frames 模式使用，/tmp 双文件轮换）
             previewFrame: '',
-            // 拍照确认浮层：预览图 + 确认/重拍/裁剪（比例循环）
+            // 拍照确认浮层：预览图 + 确认/重拍/可拖拽裁剪框
             showConfirm: false,
             confirmSrc: '',
             confirmPath: '',
-            cropRatio: null,
+            // 裁剪框（屏幕坐标 px，相对相机浮层）：拖动/缩放见 cropTouch* 方法。
+            // 初始占满（不拖 = 全带直接发），与官方"自己拖一个框"一致。
+            cropBox: { x: 0, y: 0, w: 0, h: 0 },
+            // 进行中的拖拽：模式（move/tl/tr/bl/br）+ 上一个触摸点
+            cropDrag: { mode: '', x: 0, y: 0 },
+            // 相机流程内的错误提示（取景/确认页都可见；相册页的 albumError 互不影响）
+            camError: '',
             // 图片过大无法发送时的提示（见 images.js 的体积上限）
             imageWarn: '',
             // 请求序号（用于丢弃过期响应 / 停止）
@@ -348,18 +372,20 @@ export default {
     },
     computed: {
         pageClass() {
-            // 相机模式不再需要页面透明（预览已改为帧循环 image，不再依赖
-            // DRM overlay 从页面底下透出）
+            // 相机模式页面保持不透明：预览由 image 帧循环绘制，
+            // 不依赖透明洞或 DRM plane 的层级顺序。
             return this.isDark ? 'page page-dark' : 'page'
         },
         // 相机相关浮层是否激活（取景或确认）
         camMode() {
             return this.showCamera || this.showConfirm
         },
-        // 消息区的消息列表：相机模式下清空（scroller 本体不能套 v-if，
-        // 否则 Falcon 渲染异常；用内容数组切换来隐藏消息）
+        // 消息区：相机模式由后面的 cam-stage 黑色层覆盖显示，**不再把消息数组
+        // 替换为空数组**。清空 chatMessages 会让 Falcon 在点击拍照格时同步销毁
+        // 整棵消息 scroller（长消息/图片多时表现为整机卡顿，输入事件排队），
+        // 这是进入取景页卡顿的根因。scroller 保持稳定，只切换上层相机控件。
         chatMessages() {
-            return this.camMode ? [] : this.messages
+            return this.messages
         },
         isDark() {
             // 深色模式：'dark' 深色，其余浅色（词典笔无系统深色；兼容旧设置里的 'auto' 视为浅色）
@@ -408,6 +434,45 @@ export default {
         // 不再依赖"识图模式"，所以任何时候都能传图。
         canUploadImage() {
             return true
+        },
+        // ===== 相机浮层几何 =====
+        // 屏幕尺寸：取框架环境宽高（X7 Pro 实测 936x280 横屏），取不到回退实测值。
+        // 相机浮层已移出旋转画布，永远按横屏布局（与相册选择器一致）。
+        stageW() {
+            try {
+                const env = weex.config.env
+                return Math.max(env.deviceWidth, env.deviceHeight) || 936
+            } catch (e) { return 936 }
+        },
+        stageH() {
+            try {
+                const env = weex.config.env
+                return Math.min(env.deviceWidth, env.deviceHeight) || 280
+            } catch (e) { return 280 }
+        },
+        // 确认页预览图（PHOTO_W x PHOTO_H 的带图）resize=contain 后实际铺出的
+        // 矩形：image 节点占满整个浮层，contain 会在剩余横向空间内居中；
+        // 裁剪框必须使用同一矩形，否则会整体偏左而无法贴合照片边框。
+        dispRect() {
+            const W = this.stageW
+            const H = this.stageH
+            const s = Math.min(W / PHOTO_W, H / PHOTO_H)
+            const w = PHOTO_W * s
+            const h = PHOTO_H * s
+            return { x: (W - w) / 2, y: (H - h) / 2, w: w, h: h }
+        },
+        cropBoxStyle() {
+            const b = this.cropBox
+            return {
+                left: b.x + 'px',
+                top: b.y + 'px',
+                width: b.w + 'px',
+                height: b.h + 'px'
+            }
+        },
+        camHintText() {
+            if (this.previewMode === 'frames' && this.previewFrame) return ''
+            return '相机启动中…'
         }
     },
     created() {
@@ -423,6 +488,12 @@ export default {
     destroyed() {
         this.$page.off('show', this.onPageShow)
         this.stopBackendMonitor()
+        // 相机预览是常驻 gst 管道 + JS 轮询，页面销毁必须一并停掉，
+        // 否则相机节点被占、回调持有组件引用
+        cancelThumbJobs()
+        ++this.albumLoadSeq
+        stopPreview()
+        if (this._errTimer) { clearTimeout(this._errTimer); this._errTimer = null }
         // 清理节流的渲染/滚动定时器，避免页面销毁后回调仍持有组件引用
         if (this._renderTimer) { clearTimeout(this._renderTimer); this._renderTimer = null }
         if (this._scrollTimer) { clearTimeout(this._scrollTimer); this._scrollTimer = null }
@@ -1599,6 +1670,8 @@ export default {
 
         // ---------- 图片 ----------
         async openPicker() {
+            cancelThumbJobs()
+            const loadSeq = ++this.albumLoadSeq
             this.showPicker = true
             this.albumLoading = true
             this.albumError = ''
@@ -1606,13 +1679,17 @@ export default {
             this.$forceUpdate()
             try {
                 const list = await listAlbum()
+                // 如果用户已经进入相机/关闭相册，旧任务只退出，不再触发任何更新。
+                if (loadSeq !== this.albumLoadSeq || !this.showPicker) return
                 // 逐张后台生成缩略图（原图 12MP 直接进 image 会堵死渲染线程，
-                // 真机表现为相册浮层全黑）：每张就绪立即刷新，列表渐进显示
+                // 真机表现为相册浮层全黑）：每张就绪立即刷新，列表渐进显示。
                 this.albumImages = list
                 this.albumLoading = false
                 this.$forceUpdate()
                 for (const img of list) {
+                    if (loadSeq !== this.albumLoadSeq || !this.showPicker) return
                     const thumb = await ensureThumb(img.path)
+                    if (loadSeq !== this.albumLoadSeq || !this.showPicker) return
                     if (thumb !== img.path) {
                         const item = this.albumImages.find((i) => i.path === img.path)
                         if (item) {
@@ -1622,102 +1699,260 @@ export default {
                     }
                 }
             } catch (e) {
+                if (loadSeq !== this.albumLoadSeq || !this.showPicker) return
                 this.albumError = e && e.message ? e.message : '无法访问相册'
                 this.albumLoading = false
             }
-            this.$forceUpdate()
+            if (loadSeq === this.albumLoadSeq && this.showPicker) this.$forceUpdate()
         },
         closePicker() {
+            cancelThumbJobs()
+            ++this.albumLoadSeq
             this.showPicker = false
             this.$forceUpdate()
         },
         pickImage(img) {
+            cancelThumbJobs()
+            ++this.albumLoadSeq
             this.addDraftImage(img.name, img.path)
             this.showPicker = false
             this.$forceUpdate()
         },
-        // ---------- 相机取景浮层（对齐手机选图体验：预览 → 快门 → 占一位待发）----------
+        // ---------- 相机取景浮层（对齐手机选图体验：预览 → 快门 → 裁剪 → 待发）----------
         async openCamera() {
-            if (this.showCamera) return
-            // 关掉相册浮层（camMode 也会隐藏它；显式关掉避免状态残留）
+            if (this.showCamera || this.showConfirm) return
+            // 先使相册缩略图任务失效；否则每张图完成时都会在相机层上方
+            // 继续触发整页 forceUpdate，导致触摸事件排队。
+            cancelThumbJobs()
+            ++this.albumLoadSeq
             this.showPicker = false
+            this.camError = ''
+            this.previewFrame = ''
+            this.previewMode = ''
             this.showCamera = true
             this.$forceUpdate()
-            // 帧循环取景：video29 抓帧转 JPG（与拍照同路径，方向一致横画面）
-            startFramePreview((jpg) => {
+            // 让相机层先提交一次布局，再启动 native 取景管道；避免点击回调里
+            // 同步叠加相册卸载、历史消息重排和相机初始化。
+            setTimeout(() => {
+                if (this.showCamera && !this.showConfirm) this.startCameraPreview()
+            }, 0)
+        },
+        // 使用已验证可见的 JPEG 帧循环（~7fps）；不把 kmssink 进程存活误判为画面可见
+        async startCameraPreview() {
+            const mode = await startPreview((jpg) => {
                 this.previewFrame = 'file://' + jpg
                 this.$forceUpdate()
             })
+            if (mode === 'dead') return // 期间已被关闭/重启，丢弃
+            this.previewMode = mode
+            appLog('[camera] preview mode=' + mode)
+            this.$forceUpdate()
         },
-        closeCamera() {
+        // 拍照失败后的取景重启，与正常启动共用 active 状态。
+        restartFramePreview() {
+            this.startCameraPreview()
+        },
+        // backToPicker=true（取景页 ×）：回相册选择页；false（确认页确认后）：回主聊天页
+        closeCamera(backToPicker) {
             this.showCamera = false
             this.showConfirm = false
             this.previewFrame = ''
-            stopFramePreview()
+            this.previewMode = ''
+            this.camError = ''
+            stopPreview()
+            if (backToPicker) {
+                // 回相册选择页（openPicker 自带重载列表）
+                this.openPicker()
+            }
             this.$forceUpdate()
         },
-        // 快门：抓一帧 → 确认浮层（可裁剪，勾收进待发 / 环形箭头重拍）
+        // 快门：抓一帧 → 确认浮层（可拖框裁剪，勾收进待发 / 环形箭头重拍）
         async shoot() {
             if (this.takingPhoto || !this.showCamera) return
             this.takingPhoto = true
-            // 暂停取景循环：与拍照共用 video29，避免设备占用冲突
-            stopFramePreview()
+            this.camError = ''
             this.$forceUpdate()
             try {
+                // 取景与拍照共用 video29，必须先暂停帧循环避免相机节点冲突
+                if (this.previewMode === 'frames') stopFramePreview()
                 const r = await capturePhoto()
                 if (!r.ok) {
-                    this.albumError = r.error || '拍照失败'
-                    this.$forceUpdate()
+                    // 失败提示必须可见：视频 plane 在 UI 之上会盖住提示，
+                    // 先停预览露出黑底+提示，2.5 秒后按原模式自动恢复取景
+                    const wasFrames = this.previewMode === 'frames'
+                    stopPreview()
+                    this.camError = r.error || '拍照失败'
+                    if (this._errTimer) clearTimeout(this._errTimer)
+                    this._errTimer = setTimeout(() => {
+                        if (!this.showCamera || this.showConfirm) return
+                        if (wasFrames) this.restartFramePreview()
+                        else this.startCameraPreview()
+                    }, 2500)
                     return
                 }
+                // 进确认页（JPEG 黑底浮层）：预览没用了，停掉省电
+                stopPreview()
                 this.confirmPath = r.path
-                // 确认页用 640 宽小图预览（全图 1920x1080 解码会堵渲染线程）
+                // 确认页用 640 宽小图预览（全图解码会堵渲染线程）
                 this.confirmSrc = 'file://' + (r.preview || r.path)
-                this.cropRatio = null
+                this.resetCropBox()
                 this.showConfirm = true
             } catch (e) {
-                this.albumError = (e && e.message) || '拍照失败'
+                this.camError = (e && e.message) || '拍照失败'
             } finally {
                 this.takingPhoto = false
                 this.$forceUpdate()
             }
         },
-        // 裁剪比例循环：全图 → 1:1 → 4:3 → 16:9 → 全图
-        cycleCrop() {
-            const order = [null, '1:1', '4:3', '16:9']
-            const i = order.indexOf(this.cropRatio)
-            this.cropRatio = order[(i + 1) % order.length]
-            this.$forceUpdate()
-        },
-        // 确认：按比例裁剪后收进待发图片，退出相机
+        // 确认：把屏幕上的裁剪框映射回源图像素（1920x768 带），裁剪后收进待发，回主聊天页
         async confirmShot() {
             if (this.takingPhoto) return
             this.takingPhoto = true
             this.$forceUpdate()
             try {
-                const path = await cropFrame(this.confirmPath, this.cropRatio)
+                const disp = this.dispRect
+                const b = this.clampCropBox(this.cropBox)
+                const sx = (b.x - disp.x) * PHOTO_W / disp.w
+                const sy = (b.y - disp.y) * PHOTO_H / disp.h
+                const sw = b.w * PHOTO_W / disp.w
+                const sh = b.h * PHOTO_H / disp.h
+                const path = await cropFrame(this.confirmPath, { x: sx, y: sy, w: sw, h: sh })
                 const name = String(path).split('/').pop()
                 this.addDraftImage(name, path)
-                this.closeCamera()
+                this.closeCamera(false)
             } finally {
                 this.takingPhoto = false
                 this.$forceUpdate()
             }
         },
-        // 重拍：关确认浮层回取景（重启取景帧循环）
+        // 重拍：关确认浮层回取景（重启取景）
         retakeShot() {
             this.showConfirm = false
             this.confirmSrc = ''
             this.confirmPath = ''
-            this.cropRatio = null
+            this.camError = ''
             this.$forceUpdate()
-            startFramePreview((jpg) => {
-                this.previewFrame = 'file://' + jpg
-                this.$forceUpdate()
-            })
+            this.startCameraPreview()
         },
-        cropIconSrc() {
-            return this.isDark ? 'icons/crop-dark.png' : 'icons/crop.png'
+        // ===== 裁剪框（官方同款：一个可拖可缩的白框，取代旧"比例循环"）=====
+        // 真机实测（2026-09-26 事件日志取证）：Falcon 的 touch 事件对象顶层有
+        // changedTouches[0]，其中 **screenX/screenY 是绝对页面坐标（936x280
+        // 横屏空间，与布局一一对应）**，pageX/pageY 是**元素相对**坐标——
+        // 拖动中元素跟着动，用 page 系算增量会自相抵消，必须用 screen 系。
+        // 偶发杂散事件（坐标跳到几百 px 外）用跳变保护忽略。
+        extractTouchXY(e) {
+            let d = e
+            if (d && d.data !== undefined && d.data !== null) d = d.data
+            const cands = []
+            if (d && typeof d === 'object') {
+                if (d.changedTouches && d.changedTouches.length) cands.push(d.changedTouches[0])
+                if (d.touches && d.touches.length) cands.push(d.touches[0])
+                cands.push(d)
+                if (d.touch && typeof d.touch === 'object') cands.push(d.touch)
+            }
+            for (let i = 0; i < cands.length; i++) {
+                const t = cands[i]
+                if (!t || typeof t !== 'object') continue
+                // screen 系优先（绝对坐标）；page/client 系仅作兜底
+                const x = t.screenX !== undefined ? t.screenX : (t.pageX !== undefined ? t.pageX : (t.clientX !== undefined ? t.clientX : (t.x !== undefined ? t.x : null)))
+                const y = t.screenY !== undefined ? t.screenY : (t.pageY !== undefined ? t.pageY : (t.clientY !== undefined ? t.clientY : (t.y !== undefined ? t.y : null)))
+                if (x !== null && y !== null) return { x: x, y: y }
+            }
+            return null
+        },
+        cropTouchStart(mode, e) {
+            const p = this.extractTouchXY(e)
+            if (!this._cropTouchLogged) {
+                this._cropTouchLogged = true
+                try { appLog('[crop] touchstart ' + JSON.stringify(e).slice(0, 400)) } catch (err) { /* 忽略 */ }
+            }
+            if (!p) return
+            this.cropDrag = { mode: mode, x: p.x, y: p.y }
+        },
+        cropTouchMove(e) {
+            const drag = this.cropDrag
+            if (!drag || !drag.mode) return
+            const p = this.extractTouchXY(e)
+            if (!p) return
+            const dx = p.x - drag.x
+            const dy = p.y - drag.y
+            if (dx === 0 && dy === 0) return
+            // 杂散事件保护：单次增量超过半屏基本是引擎毛刺，只重新锚定不移动
+            if (Math.abs(dx) > 468 || Math.abs(dy) > 280) {
+                this.cropDrag = { mode: drag.mode, x: p.x, y: p.y }
+                return
+            }
+            this.cropDrag = { mode: drag.mode, x: p.x, y: p.y }
+            this.applyCropDelta(dx, dy)
+        },
+        cropTouchEnd() {
+            try { appLog('[crop] touchend box=' + JSON.stringify(this.clampCropBox(this.cropBox))) } catch (e) { /* 忽略 */ }
+            this.cropDrag = { mode: '', x: 0, y: 0 }
+        },
+        applyCropDelta(dx, dy) {
+            const b = this.cropBox
+            const m = this.cropDrag.mode
+            if (m === 'move') {
+                this.cropBox = this.clampCropBox({ x: b.x + dx, y: b.y + dy, w: b.w, h: b.h })
+                return
+            }
+            // 角缩放：固定对角，动被拖的角。min 尺寸 ~ 屏幕上 60x40（≈源图 123x82，够发图用）
+            const disp = this.dispRect
+            const minW = 60
+            const minH = 40
+            let x = b.x
+            let y = b.y
+            let w = b.w
+            let h = b.h
+            if (m === 'tl' || m === 'bl') {
+                const nx = Math.max(disp.x, Math.min(b.x + dx, b.x + b.w - minW))
+                w = b.w + (b.x - nx)
+                x = nx
+            } else if (m === 'tr' || m === 'br') {
+                w = Math.min(disp.x + disp.w - b.x, Math.max(minW, b.w + dx))
+            }
+            if (m === 'tl' || m === 'tr') {
+                const ny = Math.max(disp.y, Math.min(b.y + dy, b.y + b.h - minH))
+                h = b.h + (b.y - ny)
+                y = ny
+            } else if (m === 'bl' || m === 'br') {
+                h = Math.min(disp.y + disp.h - b.y, Math.max(minH, b.h + dy))
+            }
+            this.cropBox = { x: x, y: y, w: w, h: h }
+        },
+        clampCropBox(b) {
+            const disp = this.dispRect
+            const minW = 60
+            const minH = 40
+            let w = Math.min(Math.max(b.w, minW), disp.w)
+            let h = Math.min(Math.max(b.h, minH), disp.h)
+            let x = Math.max(disp.x, Math.min(b.x, disp.x + disp.w - w))
+            let y = Math.max(disp.y, Math.min(b.y, disp.y + disp.h - h))
+            return { x: x, y: y, w: w, h: h }
+        },
+        resetCropBox() {
+            const disp = this.dispRect
+            // 默认框就是照片实际显示区域；用户不调整时确认结果等同于原图。
+            // 之前缩进到 92% 会在四周留下未选中的边，和照片边框不贴合。
+            this.cropBox = { x: disp.x, y: disp.y, w: disp.w, h: disp.h }
+        },
+        // 裁剪框外的四块半透明遮罩（上/下/左/右），聚焦框内区域
+        cropMaskStyle(pos) {
+            const W = this.stageW
+            const H = this.stageH
+            const b = this.clampCropBox(this.cropBox)
+            if (pos === 'top') return { left: '0px', top: '0px', width: W + 'px', height: Math.max(0, b.y) + 'px' }
+            if (pos === 'bottom') return { left: '0px', top: (b.y + b.h) + 'px', width: W + 'px', height: Math.max(0, H - b.y - b.h) + 'px' }
+            if (pos === 'left') return { left: '0px', top: b.y + 'px', width: Math.max(0, b.x) + 'px', height: b.h + 'px' }
+            return { left: (b.x + b.w) + 'px', top: b.y + 'px', width: Math.max(0, W - b.x - b.w) + 'px', height: b.h + 'px' }
+        },
+        // 四角 L 形手柄：以角为中心的小方块，拖动改变对应角
+        cropHandleStyle(corner) {
+            const b = this.clampCropBox(this.cropBox)
+            const s = 36
+            const cx = corner === 'tl' || corner === 'bl' ? b.x : b.x + b.w
+            const cy = corner === 'tl' || corner === 'tr' ? b.y : b.y + b.h
+            return { left: (cx - s / 2) + 'px', top: (cy - s / 2) + 'px', width: s + 'px', height: s + 'px' }
         },
         checkIconSrc() {
             // 确认钮是蓝底：用白色勾（蓝底蓝勾不可见）
@@ -2568,58 +2803,84 @@ export default {
     line-height: 24px;
 }
 
-/* ========== 相机取景（计算器同款硬件预览：两侧板 + 中间透明洞） ========== */
-/* UI 层只画左右两侧（各 220px），中间 496px 完全不画——kmssink 的
-   DRM overlay 画面从中间透出。洞的几何 = 硬件 plane 输出区域
-   （面板中央 497x280），与计算器 camera-hole 同原理。 */
+/* ========== 相机浮层（JPEG 帧循环 + 右侧按钮条；永远横屏） ========== */
+/* 取景器：全屏黑底。左侧 0..700 是预览图区域，右侧 236px 是按钮条。
+   首帧生成前显示黑底，避免相册页面残留；图片就绪后由 image 组件轮换刷新。 */
 .cam-stage {
     position: absolute;
     top: 0;
     bottom: 0;
     left: 0;
     right: 0;
-    flex-direction: row;
-}
-.cam-side {
-    width: 220px;
     background-color: #0d0d0d;
 }
-/* 中间"洞"区：不透明黑底（残影防护）+ 帧循环 image 铺满。
-   绝不能用透明背景——Falcon 跳过透明区域绘制会把进取景前的
-   旧画面（相册浮层）留在 UI surface 上。 */
-.cam-gap {
-    flex: 1;
-    position: relative;
-    background-color: #0d0d0d;
-}
+/* 帧循环兜底模式：预览图与视频窗口同位同尺寸（左 700px，contain 正好铺满） */
 .cam-frame {
     position: absolute;
     top: 0;
     bottom: 0;
     left: 0;
-    right: 0;
+    width: 700px;
 }
-.cam-side-r {
-    width: 220px;
-    background-color: #0d0d0d;
-    flex-direction: column;
-    align-items: center;
-    padding: 14px 0 20px 0;
+.cam-hint {
+    position: absolute;
+    top: 10px;
+    left: 0;
+    right: 0;
+    text-align: center;
+    font-size: 18px;
+    color: #ffffff;
+    background-color: rgba(0, 0, 0, 0.45);
+    padding: 4px 0;
+}
+.cam-err {
+    position: absolute;
+    top: 48px;
+    left: 80px;
+    right: 80px;
+    text-align: center;
+    font-size: 17px;
+    color: #ffd7d7;
+    background-color: rgba(130, 20, 20, 0.8);
+    padding: 6px 8px;
+    border-radius: 6px;
 }
 .cam-close {
+    position: absolute;
+    top: 12px;
+    right: 12px;
     width: 46px;
     height: 46px;
 }
-.cam-spacer {
-    flex: 1;
+/* 快门：右侧竖直居中（横握笔时拇指位；计算器同款右列布局） */
+.shutter-outer {
+    position: absolute;
+    right: 36px;
+    top: 104px;
+    width: 72px;
+    height: 72px;
+    border-radius: 36px;
+    border-width: 5px;
+    border-color: #ffffff;
+    background-color: rgba(0, 0, 0, 0.25);
+    align-items: center;
+    justify-content: center;
 }
+.shutter-inner {
+    width: 54px;
+    height: 54px;
+    border-radius: 27px;
+    background-color: #ffffff;
+}
+/* 确认页：全屏带图 + 裁剪框（遮罩/边框/抓取层/四角手柄全部绝对定位，
+   几何由 cropMaskStyle/cropBoxStyle/cropHandleStyle 内联提供） */
 .camera-view {
     position: absolute;
     top: 0;
     bottom: 0;
     left: 0;
     right: 0;
-    background-color: #101418;
+    background-color: #0d0d0d;
 }
 .camera-preview {
     position: absolute;
@@ -2629,38 +2890,39 @@ export default {
     right: 0;
     background-color: #000000;
 }
-.crop-label {
+.crop-mask {
     position: absolute;
-    top: 12px;
-    left: 0;
-    right: 0;
-    text-align: center;
-    font-size: 18px;
-    color: #ffffff;
-    background-color: rgba(0, 0, 0, 0.45);
-    padding: 4px 0;
+    background-color: rgba(0, 0, 0, 0.55);
 }
-/* 三个操作钮各自绝对定位（Weex flex row 对混合尺寸子项布局不稳定，
-   绝对定位是唯一确定的行为）。竖排一列（右侧，自下而上：确认/裁剪/重拍），
-   预览图 contain 后居中约 498 宽，右侧留黑正好放按钮列 */
+/* 只有边框的 div（内部透明）——shutter-outer 同款已验证可渲染 */
+.crop-border {
+    position: absolute;
+    border-width: 3px;
+    border-color: #ffffff;
+    background-color: transparent;
+}
+/* 抓取层：透明但绑定触摸（绑定事件的容器会拦截触摸——抽屉遮罩同款结论），
+   铺在框内用于整体拖动 */
+.crop-grab {
+    position: absolute;
+    background-color: transparent;
+}
+/* 四角手柄：白色小方块（36px，几何内联），拖动改对应角 */
+.crop-handle {
+    position: absolute;
+    background-color: rgba(255, 255, 255, 0.25);
+    border-width: 4px;
+    border-color: #ffffff;
+}
+/* 两个操作钮各自绝对定位（Weex flex row 对混合尺寸子项布局不稳定，
+   绝对定位是唯一确定的行为）。放左右下角，避开中间的裁剪框 */
 .confirm-btn-redo {
     position: absolute;
-    right: 22px;
-    bottom: 190px;
-    width: 68px;
-    height: 68px;
-    border-radius: 34px;
-    background-color: rgba(255, 255, 255, 0.92);
-    align-items: center;
-    justify-content: center;
-}
-.confirm-btn-crop {
-    position: absolute;
-    right: 22px;
-    bottom: 106px;
-    width: 68px;
-    height: 68px;
-    border-radius: 34px;
+    left: 22px;
+    bottom: 18px;
+    width: 64px;
+    height: 64px;
+    border-radius: 32px;
     background-color: rgba(255, 255, 255, 0.92);
     align-items: center;
     justify-content: center;
@@ -2668,10 +2930,10 @@ export default {
 .confirm-btn-ok {
     position: absolute;
     right: 22px;
-    bottom: 22px;
-    width: 68px;
-    height: 68px;
-    border-radius: 34px;
+    bottom: 18px;
+    width: 64px;
+    height: 64px;
+    border-radius: 32px;
     background-color: #1a73e8;
     align-items: center;
     justify-content: center;
@@ -2680,24 +2942,18 @@ export default {
     width: 34px;
     height: 34px;
 }
-.shutter-outer {
-    width: 84px;
-    height: 84px;
-    border-radius: 42px;
-    border-width: 5px;
-    border-color: #ffffff;
-    align-items: center;
-    justify-content: center;
-}
-.shutter-inner {
-    width: 62px;
-    height: 62px;
-    border-radius: 31px;
-    background-color: #ffffff;
-}
-/* 相机模式页面背景：不再透明（帧循环预览不依赖 overlay 透出） */
-.page-cam {
-    background-color: transparent;
+/* 确认页操作提示：底部居中（顶部被裁剪框占满，两个圆钮之间下方留白） */
+.crop-hint {
+    position: absolute;
+    bottom: 36px;
+    left: 110px;
+    right: 110px;
+    text-align: center;
+    font-size: 16px;
+    color: #ffffff;
+    background-color: rgba(0, 0, 0, 0.4);
+    padding: 4px 0;
+    border-radius: 6px;
 }
 /* 相册第一格：拍照入口（图标格，无文字） */
 .pick-camera {
@@ -3010,117 +3266,6 @@ export default {
     color: #5f747f;
     text-align: center;
     line-height: 24px;
-}
-.cam-stage-dark {
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    flex-direction: row;
-}
-.cam-side-dark {
-    width: 220px;
-    background-color: #0d0d0d;
-}
-.cam-gap-dark {
-    flex: 1;
-}
-.cam-side-r-dark {
-    width: 220px;
-    background-color: #0d0d0d;
-    flex-direction: column;
-    align-items: center;
-    padding: 14px 0 20px 0;
-}
-.cam-close-dark {
-    width: 46px;
-    height: 46px;
-}
-.cam-spacer-dark {
-    flex: 1;
-}
-.camera-view-dark {
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    background-color: #101418;
-}
-.camera-preview-dark {
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    background-color: #000000;
-}
-.crop-label-dark {
-    position: absolute;
-    top: 12px;
-    left: 0;
-    right: 0;
-    text-align: center;
-    font-size: 18px;
-    color: #ffffff;
-    background-color: rgba(0, 0, 0, 0.45);
-    padding: 4px 0;
-}
-.confirm-btn-redo-dark {
-    position: absolute;
-    right: 186px;
-    bottom: 22px;
-    width: 68px;
-    height: 68px;
-    border-radius: 34px;
-    background-color: rgba(255, 255, 255, 0.92);
-    align-items: center;
-    justify-content: center;
-}
-.confirm-btn-crop-dark {
-    position: absolute;
-    right: 104px;
-    bottom: 22px;
-    width: 68px;
-    height: 68px;
-    border-radius: 34px;
-    background-color: rgba(255, 255, 255, 0.92);
-    align-items: center;
-    justify-content: center;
-}
-.confirm-btn-ok-dark {
-    position: absolute;
-    right: 22px;
-    bottom: 22px;
-    width: 68px;
-    height: 68px;
-    border-radius: 34px;
-    background-color: #82b1ff;
-    align-items: center;
-    justify-content: center;
-}
-.confirm-icon-dark {
-    width: 34px;
-    height: 34px;
-}
-.shutter-outer-dark {
-    width: 84px;
-    height: 84px;
-    border-radius: 42px;
-    border-width: 5px;
-    border-color: #ffffff;
-    align-items: center;
-    justify-content: center;
-}
-.shutter-inner-dark {
-    width: 62px;
-    height: 62px;
-    border-radius: 31px;
-    background-color: #ffffff;
-}
-.page-cam-dark {
-    background-color: transparent;
 }
 .pick-camera-dark {
     width: 218px;

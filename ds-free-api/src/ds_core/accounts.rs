@@ -943,12 +943,36 @@ async fn try_init_account(
     // 设备凭据兜底（用户无感）：缺有效 device_id 时即时 mint。
     // 启动路径已由 device_bootstrap 批量补齐；此处覆盖运行时新增账号
     // （管理面板/应用添加）与历史配置的漏网情况。
-    let (device_id, _smid) = crate::device_bootstrap::ensure_one(
+    let (device_id, smid, minted) = crate::device_bootstrap::ensure_one(
         &client.user_agent(),
+        client.proxy_url(),
         &creds.device_id,
         &creds.smid,
     )
     .await;
+    if minted {
+        // 新 mint 的 device_id+smid 必须回写持久化：否则重启后重新 mint，
+        // 同一账号的设备身份漂移；共享 jar 也补上配对的 smidV2（设备级 cookie），
+        // 让登录请求的 device_id 与 Cookie 恢复真实浏览器的"双绑定"。
+        match crate::device_bootstrap::config_path() {
+            Some(path) => {
+                crate::device_bootstrap::persist_account_credentials(
+                    path,
+                    &creds.email,
+                    &creds.mobile,
+                    &device_id,
+                    &smid,
+                );
+            }
+            None => warn!(
+                target: "ds_core::accounts",
+                "运行时 mint 了新设备凭据但配置路径未知，重启后该账号将重新 mint（设备身份漂移）"
+            ),
+        }
+        if client.set_smid_cookie(&smid) {
+            info!(target: "ds_core::accounts", "已将配对 smidV2 写入共享 cookie jar");
+        }
+    }
 
     let login_payload = LoginPayload {
         email: if creds.email.is_empty() {

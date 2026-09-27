@@ -1,0 +1,146 @@
+tools_camera.js
+bridge
+/dev/video29
+/dev/video30$/userdisk/Pictures
+setsar=1(transpose=1,setsar=1(hflip,vflip,setsar=1(transpose=2,setsar=1
+created
+mounted
+beforeDestroy
+initBridge.getRenderRectangleParam getRotationParam$parseSelectionRect,buildCentered16By9Crop$applyCropForDevice
+startPreview"getRecordFileName(formatRecordDuration&updateRecordElapsed startRecordTimer clearRecordTimer
+toggleRecording
+startRecording
+stopRecording
+takePhoto
+execCmd
+normalizeOutput
+stopPreview
+checkStorage
+ensureDirectory"getTimestampParts0getCaptureRotationFilter.getCaptureRotationLabel(cycleCaptureRotation sanitizeDeviceId
+loadDeviceId
+showInfo
+showError
+onShow
+onHide
+methods
+_withStripped
+render
+staticRenderFns
+_compiled
+data-v-3bc05a64
+_scopeId
+themes
+assign
+absolute
+position
+height
+#000000
+backgroundColor camera-container
+rgba(0,0,0,0)
+camera-hole
+zIndex
+opacity
+flash-overlay
+column
+flexDirection
+center
+justifyContent
+alignItems
+rgba(0,0,0,0.3)
+controls-area
+marginTop&btn-shutter-wrapper
+borderWidth
+borderStyle*rgba(255,255,255,0.7)
+borderColor
+borderRadius,rgba(255,255,255,0.08)$btn-rotate-wrapper
+#ffffff
+fontSize
+textAlign btn-rotate-label
+#9999992btn-rotate-label-disabled$btn-record-wrapper
+#ff4d4f&rgba(255,77,79,0.1) btn-record-outer
+17px btn-record-inner(rgba(255,77,79,0.25)
+btn-recording
+btn-record-stop
+record-label
+#ffb3b4
+record-time
+#FFFFFF
+transform$transitionProperty$transitionDuration
+ease-out0transitionTimingFunction"btn-shutter-outer
+property
+duration
+timingFunction
+@TRANSITION
+scale(0.85)$btn-shutter-active
+25px"btn-shutter-inner
+#6666664btn-shutter-outer-disabled4btn-shutter-inner-disabled,rgba(102,102,102,0.15)2btn-record-outer-disabled2btn-record-inner-disabled0btn-record-stop-disabled
+style4src/pages/tools/camera.vue
+__file
+previewPid
+recordPid
+recordPath
+isPreviewing
+isRecording
+recordElapsedMs
+recordStartedAt
+recordTimer
+bridgeReady
+isCapturing
+showFlash
+isAnimating(captureRotationIndex
+UNKNOWN
+deviceId
+deviceIdLoaded
+requireModule
+setTimeout
+getScreenSize
+console
+error$Bridge init failed
+round&render-rectangle="<
+>"Nvideoflip video-direction=90l qos=false
+parseInt
+v4l2-ctl -d F --get-selection=target=crop_bounds.crop-bounds-unavailable  --set-crop top=
+,left=
+,width=
+,height=<gst-launch-1.0 v4l2src device=
+ ! video/x-raw,width=640,height=360,framerate=30/1,pixel-aspect-ratio=1/1 ! 
+ ! videoscale ! video/x-raw,width=360,height=640,pixel-aspect-ratio=1/1 ! kmssink plane-id=75 sync=false driver-name=rockchip force-aspect-ratio=true d > /userdata/applog/gst_preview.log 2>&1 & echo $!
+padStart
+setInterval
+clearInterval
+/Bgst-launch-1.0 -e v4l2src device=
+video/x-raw,format=NV12,width=1280,height=720,framerate=30/1,pixel-aspect-ratio=1/1R ! jpegenc ! avimux ! filesink location="d" > /userdata/applog/gst_record.log 2>&1 & echo $!$record-pid-invalid
+"sh -c 'kill -INT j 2>/dev/null || true; for i in 1 2 3 4 5; do kill -0 d 2>/dev/null || exit 0; sleep 1; done; kill -TERM b 2>/dev/null || true; for i in 1 2 3; do kill -0 ^ 2>/dev/null || exit 0; sleep 1; done; kill -9 * 2>/dev/null || true'
+ls -l "
+P\Pbk1Y%
+ --silent --set-fmt-video=width=1920,height=1080,pixelformat=UYVY --stream-skip=1 --stream-mmap=1 --stream-poll --stream-count=1 --stream-to=/tmp/gc.yuv
+ffmpeg -y -f rawvideo -video_size 1920x1080 -pixel_format uyvy422 -i /tmp/gc.yuv -vf "," -frames:v 1 -q:v 2 "
+bgq1Y%
+Shell not ready
+output
+kill -9 
+df -m 
+ 2>/dev/null | awk 'NR==2 {print $4}' || df -m /userdisk | awk 'NR==2 {print $4}'
+mkdir -p "
+getFullYear
+getMonth
+getDate
+getHours
+getMinutes
+getSeconds
+getMilliseconds
+replace
+toUpperCase^cat /proc/device-tree/serial-number 2>/dev/null
+cat /proc/cpuinfo 2>/dev/null | awk -F': ' '/Serial/ {print $2; exit}'>cat /etc/machine-id 2>/dev/null
+$createElement
+staticClass
+btn-disabled
+|Left\s+(\d+),\s*Top\s+(\d+),\s*Width\s+(\d+),\s*Height\s+(\d+)
+ ( ) / / _ _ 
+ ( ) / / _ _ 
+ ( ) / / _ _ 
+ ( ) / / _ _ 
+ ( ) / / _ _ 
+ ( ) / / _ _ 
+ ( ) / / _ _ 
+[^0-9A-Za-z]

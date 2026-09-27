@@ -10,6 +10,9 @@ mod mint;
 mod pow;
 mod fingerprint;
 
+#[cfg(test)]
+mod mock_http;
+
 pub use accounts::AccountStatus;
 pub use accounts::PoolError;
 pub use fingerprint::{default_user_agent, DeviceFingerprint, submit_fingerprint};

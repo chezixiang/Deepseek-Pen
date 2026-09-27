@@ -15,15 +15,18 @@ mod store;
 mod stream;
 
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::Request,
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
+use bytes::Bytes;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
@@ -127,6 +130,8 @@ pub async fn run(mut config: Config, config_path: PathBuf) -> anyhow::Result<()>
 
     // 设备凭据补齐（用户无感）：账号缺数美签发的 device_id 时自动 mint 并持久化。
     // 详见 docs/deepseek-verification-analysis.md §5f。
+    // 先记录配置路径：运行时 mint（新增账号/重登补漏）回写凭据需要它。
+    crate::device_bootstrap::init_config_path(&config_path);
     crate::device_bootstrap::ensure_device_credentials(&mut config, &config_path).await;
 
     let config = Arc::new(tokio::sync::RwLock::new(config));
@@ -239,6 +244,154 @@ pub async fn run(mut config: Config, config_path: PathBuf) -> anyhow::Result<()>
     Ok(())
 }
 
+// ========== 调试网络抓取（入站方向；出站在 ds_core::client 等，见 net_capture 模块） ==========
+
+/// 入站响应体抓取包装：全量透传（截断只影响记录，不影响转发内容），累计前
+/// MAX_BODY_BYTES 字节落盘；流结束/出错/被丢弃（客户端提前断开）都会记录
+/// 已收到的部分——禁言等业务失败常在 SSE 首帧 biz_code 里。
+struct InboundCaptureStream<B> {
+    inner: Pin<Box<B>>,
+    cid: u64,
+    buf: Vec<u8>,
+    truncated: bool,
+    done: bool,
+}
+
+impl<B> InboundCaptureStream<B> {
+    fn finish(&mut self) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+        net_capture::body(self.cid, &self.buf, self.truncated);
+    }
+}
+
+impl<B> futures::Stream for InboundCaptureStream<B>
+where
+    B: futures::Stream<Item = Result<Bytes, axum::Error>>,
+{
+    type Item = Result<Bytes, axum::Error>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.done {
+            return std::task::Poll::Ready(None);
+        }
+        match self.inner.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => {
+                if self.buf.len() < net_capture::MAX_BODY_BYTES {
+                    let take = (net_capture::MAX_BODY_BYTES - self.buf.len()).min(bytes.len());
+                    self.buf.extend_from_slice(&bytes[..take]);
+                    if take < bytes.len() {
+                        self.truncated = true;
+                    }
+                } else if !bytes.is_empty() {
+                    self.truncated = true;
+                }
+                std::task::Poll::Ready(Some(Ok(bytes)))
+            }
+            std::task::Poll::Ready(Some(Err(e))) => {
+                self.finish();
+                std::task::Poll::Ready(Some(Err(e)))
+            }
+            std::task::Poll::Ready(None) => {
+                self.finish();
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl<B> Drop for InboundCaptureStream<B> {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+/// 响应体是否二进制（决定 tee 记原文还是记说明）
+fn resp_body_is_binary(headers: &axum::http::HeaderMap) -> bool {
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    !(ct.is_empty()
+        || ct.contains("json")
+        || ct.contains("text")
+        || ct.contains("xml")
+        || ct.contains("x-www-form-urlencoded")
+        || ct.contains("javascript")
+        || ct.contains("event-stream"))
+}
+
+/// 入站抓取中间件（挂在最外层：被 auth 拒掉的 401、限流的 503 同样是证据）。
+/// /admin 静态资源（面板 HTML/JS/CSS）跳过——与风控取证无关且体积大，刷一次
+/// 面板几十个 chunk 会淹没真实流量；/admin/api/* 与其余全部路由照抓。
+/// 请求体全量缓冲后透传（本服务只面向本机/局域网自用客户端），读取上限
+/// MAX_READ_BYTES（超出 413）；记录超 MAX_BODY_BYTES 打 truncated 标记。
+async fn net_capture_middleware(req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    if path == "/admin" || (path.starts_with("/admin/") && !path.starts_with("/admin/api")) {
+        return next.run(req).await;
+    }
+    if !net_capture::enabled() {
+        return next.run(req).await;
+    }
+    let cid = net_capture::begin();
+    let (parts, body) = req.into_parts();
+    let method = parts.method.as_str().to_owned();
+    let uri = parts.uri.to_string();
+    let headers = parts.headers.clone();
+    let content_type = parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned());
+
+    let body_bytes = match axum::body::to_bytes(body, net_capture::MAX_READ_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            net_capture::err(
+                cid,
+                &format!("request body 读取失败（超 {} 上限？）: {e}", net_capture::MAX_READ_BYTES),
+            );
+            return axum::http::StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        }
+    };
+    net_capture::req(
+        cid,
+        "in",
+        &method,
+        &uri,
+        &headers,
+        Some(net_capture::body_record(&body_bytes, content_type.as_deref())),
+    );
+
+    let req = Request::from_parts(parts, Body::from(body_bytes));
+    let resp = next.run(req).await;
+    let binary = resp_body_is_binary(resp.headers());
+    net_capture::resp(cid, resp.status().as_u16(), resp.headers(), !binary);
+
+    let (parts, body) = resp.into_parts();
+    if binary {
+        // 二进制响应体（PNG 验证码等）不落内容，记说明闭环；body 原样透传
+        net_capture::body_note(cid, "二进制响应体不落盘");
+        return Response::from_parts(parts, body);
+    }
+    let tee = InboundCaptureStream {
+        inner: Box::pin(body.into_data_stream()),
+        cid,
+        buf: Vec::new(),
+        truncated: false,
+        done: false,
+    };
+    Response::from_parts(parts, Body::from_stream(tee))
+}
+
 /// 构建路由器
 fn build_router(state: AppState, cors_origins: Vec<String>) -> Router {
     let store = state.store.clone();
@@ -332,6 +485,8 @@ fn build_router(state: AppState, cors_origins: Vec<String>) -> Router {
     router
         .with_state(state)
         .layer(build_cors_layer(&cors_origins))
+        // 入站抓取挂最外层：CORS 拒绝、auth 401 等全部可见（抓取未启用时零成本直通）
+        .layer(middleware::from_fn(net_capture_middleware))
 }
 
 fn build_cors_layer(origins: &[String]) -> CorsLayer {

@@ -4,20 +4,57 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.19] - 2026-09-26
+
+### Fixed（设备身份链路一致性：分层排查清单的两处确认缺口）
+
+- **mint 注册链路对齐主客户端身份**（修复①）：`mint_device_id` 原先自建
+  `wreq::Client` 只设 UA——注册请求的 TLS/JA4 指纹是 wreq 默认**非浏览器**
+  指纹，且不走主客户端代理。同一 device_id 的注册（非浏览器指纹）与紧随的
+  登录（Chrome136 指纹）来自不同出口时，是风控可直接交叉校验的层间矛盾。
+  现在抽出 `client::base_http_builder`（Chrome136 仿真 + 统一 UA + 代理 +
+  连接超时）供 DsClient 与 mint 共用，代理配置经 `device_bootstrap` 全链透传。
+- **运行时 mint 凭据回写持久化**（修复②）：`try_init_account` 原先丢弃
+  mint 出的 smid、新 device_id 也不写回 config——运行时新增的账号重启后会
+  重新 mint，设备身份漂移；且登录 device_id 与共享 jar 的 smidV2 配对断裂。
+  现在 `ensure_one` 返回 `(device_id, smid, minted)`；minted 时经
+  `device_bootstrap::persist_account_credentials` 按 email/mobile 回写
+  config.toml（幂等），并经 `DsClient::set_smid_cookie` 把配对 smidV2 补进
+  共享 jar（设备级 cookie，已有值时拒绝再绑，与预置策略一致）。
+  server 启动时经 `init_config_path` 记录配置路径供回写。
+
+### Added（测试）
+- `ds_core::mock_http` 测试基础设施：本地单连接 HTTP 捕获服务（仅 cfg(test)）。
+- 7 个新测试，TDD 红→绿闭环（先证明测试能抓住 bug，再修复）：
+  - mint 必须携带 Chrome136 仿真头（sec-ch-ua 版本一致）与笔端 UA；
+  - mint 必须真实经过配置的代理（绝对形式 URI 断言）；
+  - mint 协议管线往返（payload→加密→POST→1100/B 前缀）与非 1100 报错；
+  - 凭据回写 roundtrip（匹配回写/幂等/不匹配不动/不破坏其它字段）；
+  - `ensure_one` 已有凭据时短路且不 mint；
+  - `set_smid_cookie` 补写的 smidV2 真实随登录请求发出、二次绑定被拒。
+  宿主全量 220/220 通过。
+
 ## [0.2.18] - 2026-09-25
 
-### Added（调试网络抓取：禁言/风控第一手报文自动留痕）
-- **`[server] net_capture` 配置项 + `server::net_capture` 模块**：开启后把发往
-  上游（DeepSeek 全部端点 + HIF 分发服务 + 数美注册 + wasm/fp 静态资源）的
-  全部 HTTP 往返逐条落盘 `$DS_DATA_DIR/logs/net-capture.jsonl`，格式与手工
-  net-export jsonl 一致（每行一个事件：`request` / `response` / `response_body`
-  / `error`，`id` 关联同一次往返），超 5MB 轮转保留 .1/.2。
-- **SSE 流全量留痕**：completion 流用 CaptureStream 包装，累计至 256KB 截断，
+### Added（调试网络抓取：双向全量报文自动留痕，禁言/风控第一手证据）
+- **`[server] net_capture` 配置项 + `server::net_capture` 模块**：开启后把本服务
+  涉网流量**双向**逐条落盘 `$DS_DATA_DIR/logs/net-capture.jsonl`，格式与手工
+  net-export jsonl 一致（每行一个事件：`request`/`response`/`response_body`/
+  `error`，`id` 关联同一次往返，`dir=in` 入站 / `dir=out` 出站）。
+  - **入站**：axum 最外层中间件抓全部路由（/v1/*、/anthropic/*、/captcha/*、
+    /device*、/admin/api/*、/health 等），auth 拒掉的 401/503 也是证据；
+    仅跳过 /admin 静态资源（面板 chunk 会淹没真实流量）。请求体缓冲后透传，
+    读取上限 32MB（超出 413）；响应体 tee 全量透传、累计 16MB 记录
+    （truncated 只影响记录不影响转发）。
+  - **出站**：DeepSeek 全部端点 + HIF 分发服务 + 数美注册 + wasm/fp 静态资源。
+  - 轮转 128MB × 当前+.1+.2 ≈ 384MB 封顶；二进制体（multipart/PNG/wasm）只记
+    说明不落内容。
+- **SSE 流留痕**：completion 出站流与入站响应流都做 tee，累计至 16MB 截断，
   正常结束、出错、上层提前断流（drop）都会落盘已收到的部分——禁言等业务
   失败常在首帧 biz_code 里。
 - **词典笔端联动**：设置页「启用调试日志」开关联动写入 `net_capture` 并自动
-  重启后端；诊断日志弹窗新增「网络抓取」tab 可看尾部与清空。
-  报文含 Authorization/Cookie 等真实凭据，外发前注意脱敏。
+  重启后端；诊断日志弹窗新增「网络抓取」tab（shell tail 读取，不整读大文件）。
+  报文含 Authorization/Cookie/API key 等真实凭据，外发前注意脱敏。
 
 ## [0.2.17] - 2026-09-25
 

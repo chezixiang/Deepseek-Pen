@@ -166,9 +166,10 @@ export async function mkdir(path) {
 }
 
 // 轮询读取某个文件，直到它出现非空内容或超时。execShell 是异步的，用它来等命令产物。
-export async function waitForFile(path, timeoutMs) {
+export async function waitForFile(path, timeoutMs, shouldCancel) {
   const start = Date.now()
   while (Date.now() - start < timeoutMs) {
+    if (shouldCancel && shouldCancel()) return null
     const c = await readFile(path)
     if (c !== null && c !== '') return c
     await sleep(150)
@@ -792,6 +793,35 @@ export async function updateDsFreeApiNetCapture(enabled) {
     }
   } catch (e) {
     return makeErr(10002, '更新网络抓取开关失败：' + (e && e.message ? e.message : String(e)))
+  }
+}
+
+/**
+ * 读网络抓取文件尾部（「查看诊断日志 → 网络抓取」用）。
+ * 用 shell tail 而非 fs.readFile：文件可达 20MB，整读进 QuickJS 会撑爆内存。
+ * 每行展示层截断到 600 字符（完整内容以文件为准）。
+ * @param {number} n 尾部行数
+ * @param {number} gen 0=当前 1=.1 2=.2（后端轮转）
+ */
+export async function readNetCaptureTail(n = 20, gen = 0) {
+  const suffix = gen === 1 ? '.1' : gen === 2 ? '.2' : ''
+  const p = joinPath(dsHomeDir(), 'logs', 'net-capture.jsonl' + suffix)
+  const tmp = joinDataDir('ds-capture-tail.txt')
+  try {
+    await writeFile(tmp, '')
+    // cut -c 在设备侧就截断每行：单个事件体可达 16MB，避免 tail 输出整行
+    // 再整读进 QuickJS（busybox cut 支持 -c）
+    execShell('tail -n ' + n + ' ' + shq(p) + ' | cut -c 1-600 > ' + shq(tmp) + ' 2>/dev/null; true')
+    const out = await waitForFile(tmp, 3000)
+    return String(out || '')
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => (l.length >= 600 ? l + '…' : l))
+      .join('\n')
+  } catch (e) {
+    return ''
+  } finally {
+    execShell('rm -f ' + shq(tmp) + ' 2>/dev/null || true')
   }
 }
 
