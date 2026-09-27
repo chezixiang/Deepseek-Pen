@@ -4,6 +4,7 @@
 - **执行角色**：重构流程首个工作 Agent；已确认 `重构计划\【上一阶段交接文件】` 不存在。
 - **代码冻结点**：`main` @ `2c8d2bbb9b9d1259fd40b3497646de65cfb12c01`（2026-09-27 14:31:03 +0800，提交名「修了一堆bug，自己看吧」）；冻结时 `git status --porcelain` 输出为空。
 - **本阶段文档提交**：`232b405`（本文件）、`17b6e4d`（`重构计划\【本阶段文件】.md`）。
+- **追加核查**：2026-09-27 核查外部参考仓库 Pen-LVGL（见第九节），并按其结论修订了 G-1/G-2/G-3 的状态。
 - **依据文件**：《总体重构路线.md》《下一步开发计划.md》（已通读）。未读取任何历史会话记录，全部结论来自上述文件与当前工作区。
 - **本轮范围**：只读核对与记录。未修改业务代码、未实施阶段 0、未迁移、未删除任何文件。
 - **用途**：后续阶段（阶段 0—5）引用同一份基线、同一种交接格式；缺口统一以「待补项」列明，不代替阶段放行。
@@ -204,9 +205,9 @@ UI 页面（app/src/pages/{startup,login,index,settings}）
 
 | 编号 | 缺口 | 阻塞级别 | 备注 |
 |---|---|---|---|
-| G-1 | `app/libs/` 不存在；`libs→.falcon_→amr` 链路虽有代码证据，但「PMS 解包后能否 import、import 名如何解析」未验证 | **阻塞阶段 0** | 证据：`aiot-vue-cli/src/steps/{build,pack,manifest}.js` |
-| G-2 | 无 JSAPI SDK 头文件 / `jqutil_dist` 头文件本地副本；ABI 核验路径未确定 | **阻塞阶段 0** | 只有设备 `libjsapi_proxy.so`/`libfalcon.so` strings 线索 |
-| G-3 | Probe 命名（`asyncEcho` vs `echo`）未冻结 | 阻塞阶段 0 验收口径 | 见 U3 |
+| G-1 | `app/libs/` 不存在；`libs→.falcon_→amr` 链路有代码证据，**arch 目录名需在 X7 Pro 上确认**（本地固件 strings 为 `arm64`，参考仓库用 `arm64-orange`）；解包后 import 解析仍待真机验证 | **阻塞阶段 0** | 证据：`aiot-vue-cli/src/steps/{build,pack,manifest}.js`、第九节 |
+| G-2 | 无 JSAPI SDK 头文件本地副本、ABI 核验路径未定 | **阶段 0 前需复核**（已有外部 SDK 来源，见第九节） | 设备 strings + Pen-LVGL vendored SDK（Apache-2.0/LGPL 混合，需确认兼容性） |
+| G-3 | Probe 命名（`asyncEcho` vs `echo`）未冻结；命名/导入约定已可从参考实现推出（`libjsapi_<name>.so` ↔ `import … from '<name>'`） | 阻塞阶段 0 验收口径（收窄） | 见 U3、第九节 |
 | G-4 | 无 PoW 固定回归样本（无 `*.wasm`、无 challenge/answer 对） | 阻塞阶段 2 验收 | 需用现有后端导出 |
 | G-5 | 后端宿主单测未在本机复核（WSL 不可用：嵌套虚拟化不支持）；本次仅 CI/脚本具备运行路径 | 不阻塞文档放行，阻塞「行为基线已复核」结论 | 建议以 CI 运行结果补档 |
 | G-6 | 无真机 `config.toml` 集中归档 | 阻塞阶段 3 的导入/回滚演练 | 需导出存档 |
@@ -220,12 +221,78 @@ UI 页面（app/src/pages/{startup,login,index,settings}）
 
 ## 八、下一阶段（阶段 0）进入条件
 
-1. G-2：明确 JSAPI SDK（含 `jqutil_dist`/ABI 头文件与样例工程）的取得路径与版本；无法取得时只允许做环境诊断与构建准备，不得猜测 ABI。
-2. G-1：确认探针投放路径为 `app/libs/arm64/`，并约定构建后核验 `.falcon_/libs/…` 与 amr `manifest.json` 中确实出现该文件。
-3. G-3：冻结探针接口命名（`version()` 同步、异步回显、事件回调三者各一），并写进阶段 0 交接。
+1. G-2：登记 JSAPI SDK 来源与版本（优先使用第九节给出的外部 SDK 副本 + 设备侧符号集复核），并在本机完成“能编译出空模块并导出 `custom_init_jsapis`”的最小验证；取不到可用 SDK 时只允许环境诊断，不猜 ABI。
+2. G-1：确认探针投放目录名（`app/libs/<arch>/`，候选 `arm64` 与 `arm64-orange`，以 X7 Pro 固件为准），并约定构建后核验 `.falcon_/libs/…` 与 amr `manifest.json` 中确实出现该文件。
+3. G-3：冻结探针接口命名（`version()` 同步、异步回显、事件回调三者各一，参照第九节的同步/Promise/发布订阅三种绑定方式），并写进阶段 0 交接。
 4. 回滚准备：保留现有 `app/*.amr` 与 `app/backend/linux-aarch64-gnu/ds-free-api`；探针引入失败时可删除 `app/libs/` 并重建旧包。
 5. 真机通道：本阶段已确认 adb 在线（`G:\youdao\others\adb.exe`，设备脱敏 `MEC17****3678`）；阶段 0 开工前复核 `miniapp_cli` 可用与 PMS 安装/卸载方式。
 6. 验收记录口径：同步返回、Promise、事件回调、重复加载、退出/升级五类证据分开记录；mock 与真机证据不得互相替代。
+
+---
+
+## 九、外部参考仓库核查（Pen-LVGL，2026-09-27 追加）
+
+### 9.1 仓库信息与采集方式
+
+| 项 | 值 |
+|---|---|
+| 仓库 | `https://github.com/Magniswan/Pen-LVGL` |
+| 采集版本 | HEAD `a8d9a668d63d69176e0c7a28740143381699a4c6`（浅克隆，仅见 1 个提交「Create LICENSE」，2026-09-09） |
+| 采集方式 | `git clone --depth 1` 到系统临时目录；随后按目录子集拷贝到本仓库忽略目录 `.probe/refs/Pen-LVGL/`（121 个文件 ≈ 705 KB，含来源说明 `README.md`） |
+| 许可 | 仓库根为 GNU LGPL-2.1；其 vendored `iot-miniapp-sdk` 内含 Apache-2.0（Android atomic）与 Dropbox（jqbson）头注，无单独 LICENSE；复用前需确认归属 |
+| 平台一致性 | 同为 Falcon/QuickJS 小程序：`quickjs.version = 20200705`、`bigNum = false`、`aiot-vue-cli 1.0.32`、16 位 appid、AMR 打包 |
+
+### 9.2 该仓库提供的、与本路线直接相关的能力
+
+| 主题 | 位置（相对仓库根） | 要点 |
+|---|---|---|
+| Native JSAPI SDK | `launcher/native/iot-miniapp-sdk/{include,src}` | `jqutil_v2/*`（`JQObjectTemplate`、`JQFunctionTemplate`、`JQAsyncExecutor`、`JQSignal`、`jqbson` 等）、`jsmodules/JSCModuleExtension.h`、`looper/*`、`port/*`、`quickjs.h`；来源标注为 `haasui-falcon-app/templates/jsapi/iot-miniapp-sdk` 模板 |
+| 模块注册契约 | `launcher/native/src/JSAPI.cpp`、`manager/native/src/JSAPI.cpp` | `extern "C" JQUICK_EXPORT void custom_init_jsapis()` → `registerCModuleLoader("<name>", &<name>_module_load)`；`DEF_MODULE_LOAD_FUNC_EXPORT` 宏（`jqmisc.h`）生成 loader 并注册 `default` 及各导出名 |
+| 导入命名约定 | `launcher/src/services/launcher.js` | 模块名 = `libjsapi_<name>.so` 去掉 `libjsapi_` 前缀（`lvgl_launcher`），JS 侧 `import { Launcher } from 'lvgl_launcher'` |
+| 同步方法 | `launcher/native/src/Launcher/JSLauncher.cpp` | `SetProtoMethod` + `info.GetReturnValue().Set(...)` / `ThrowInternalError` |
+| 异步 Promise | 同上 | `SetProtoMethodPromise` + `info.post(Bson::object{...})` / `info.postError(...)`；JS 侧 `await Launcher.probe()` |
+| 事件/订阅 | `jqutil_v2/JQPublishObject.h` | `publish(topic, bson)` + `onSubscribe/onUnsubscribe`（JS 侧 `on/off` 主题回调），即阶段 0“事件回调”的现成机制 |
+| 构建脚本模板 | `launcher/tools/build-native.sh`、`manager/tools/build-native.sh` | aarch64-none-linux-gnu g++ 11.3、`-std=gnu++17 -O3 -fPIC`、`-shared -pthread -Wl,--unresolved-symbols=ignore-all`、`-Wl,-soname,libjsapi_<name>.so`；末尾校验 ELF64 AArch64 + `custom_init_jsapis` 导出，并检查无宿主 RPATH |
+| AMR 产物结构 | `scripts/falcon_build_common.ps1:44,61,165` | 期望条目含 `app.js`、`app_icon.png`、`libs/arm64-orange/<NativeLibrary>`、`manifest.json`；逐条校验 cert md5 与大小；产出确定性归档（时间戳 1980-01-01）；`.so` 大小上限 16 MB |
+| 设备脚本模式 | `scripts/{device_app_common,install_device_app,status_device_app,uninstall_device_app}.ps1` | 显式 `-Serial`、`miniapp_cli install/uninstall`、只读状态采集、绝不 `pkill`/杀 Falcon；设备安装目录与第 1.5 节一致（`/userdisk/secondary/miniapp/data/mini_app/pkg/<appid>`） |
+| 开发期宿主模拟 | `launcher/api-mock/lvgl_launcher.js` | 不连真机即可在预览器验证 JS 业务；与本仓库 `app/api-mock/*.js` 同型 |
+
+### 9.3 本设备固件侧证据（本地 `.probe` strings）
+
+`.probe/libfalcon.txt`（X7 Pro `libfalcon.so` strings 存档）中与加载链直接相关的片段：
+
+```text
+dynamic_load_jsapi / custom_init_jsapis / dlsym in custom_init_jsapis
+PrivateJSApiEntry::init do load jsapis
+libjsapi_
+libs/
+[ERROR] %s is not a directory or not exist!
+data/mini_app/pkg/
+arm64
+__templibs
+extract arch libs from %s
+[PMS]processArchLibs rename archLibs to libs failed
+```
+
+可确认：固件用 `libs/` + `libjsapi_<name>` 动态加载并调用 `custom_init_jsapis`；PMS 负责把 AMR 内的 arch 库目录重命名为 `libs` 后安装；本固件 strings 中出现的 arch 目录名是 `arm64`，未出现 `arm64-orange`（参考仓库使用的名字）。
+
+### 9.4 对基线缺口的影响
+
+| 缺口 | 状态变化 |
+|---|---|
+| G-2（SDK/ABI） | 部分解除：已有可用的 SDK 头文件与源码副本（`.probe/refs/Pen-LVGL/launcher/native/iot-miniapp-sdk`）与公开的模块注册/构建样板；剩余工作是**版本/ABI 与本机固件的一致性复核**，以及许可归属确认 |
+| G-1（打包与导入） | 收窄但不解除：AMR 内容与 `manifest.cert` 契约已有他证；剩余不确定项是 **X7 Pro 选定的 arch 目录名**（`arm64` vs `arm64-orange`）与真机 import/卸载/升级行为 |
+| G-3（探针命名） | 收窄：命名与绑定方式可直接对照参考实现（同步 `version()`、异步 promise 方法、`JQPublishObject` 订阅回调）；仅剩本路线自有命名（`echo` vs `asyncEcho`）的取舍 |
+| U3/U6（接口契约） | 有新输入：事件回调形态可参考 `publish(topic, bson)` + JS `on/off`，但**本阶段不代决**，留给阶段 0/1 契约冻结 |
+| 新增 G-10 | X7 Pro 固件的 arch 目录名未定，需在阶段 0 首个迭代内确认（本地固件 strings 指向 `arm64`） |
+| 新增 G-11 | 参考 SDK 与本地固件 ABI 兼容性未验证：需比对 `jsapi_proxy`/`libfalcon` 导出符号与 SDK 头文件版本，必要时以“空模块 + `custom_init_jsapis`”最小产物做真机 dlopen 验证 |
+
+### 9.5 阶段 0 建议动作（不构成本轮实施）
+
+1. 阅读顺序：`scripts/falcon_build_common.ps1` → `launcher/tools/build-native.sh` → `launcher/native/src/JSAPI.cpp` → `launcher/native/src/Launcher/JSLauncher.cpp` → `docs/superpowers/specs/2026-08-05-falcon-lvgl-launcher-design.md`。
+2. 以参考脚本为模板产出探针构建脚本（保持 `-Wl,--unresolved-symbols=ignore-all`、无宿主 RPATH、导出 `custom_init_jsapis`、产物名 `libjsapi_ds_probe.so`）。
+3. 在 X7 Pro 上用两种 arch 目录名各打一个探针包（或先查设备已装小程序包内 `libs/` 的实际目录名），以真机 import 结果定名，不靠猜测。
+4. 保留参考仓库子集副本（忽略目录）作为离线依据；若后续需要完整仓库（含 LVGL、docs 全量），再单独拉取。
 
 ---
 
@@ -243,6 +310,10 @@ app/libs 存在性                             → False
 adb devices                                → 1 台设备，状态 device（序列号脱敏）
 app: npm test                              → exit 0，9 个脚本全部通过
 wsl -d Ubuntu … run-host-tests.sh          → 未完成（本机不支持嵌套虚拟化）
+git clone --depth 1 github.com/Magniswan/Pen-LVGL → 成功（临时目录），HEAD a8d9a66
+rg 'jqutil|libjsapi|custom_init_jsapis' <clone>   → SDK/模块注册/构建样板齐备（见第九节）
+rg 'libjsapi_|libs/|archLibs|arm64' .probe/libfalcon.txt → 固件加载链与 PMS arch 目录证据
+参照子集拷贝 .probe/refs/Pen-LVGL/        → 121 个文件 ≈ 705 KB（忽略目录，不入 git）
 ```
 
 ## 附录 B：本轮明确未做的事
