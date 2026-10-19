@@ -23,11 +23,11 @@
 //! （与此前手工抓包一致），文件仅落本机；对外分享前由使用者自行脱敏。
 //!
 //! 注意：出站 headers 记录的是**应用层显式设置**的头（client.rs 构造的那部分），
-//! 不含 wreq 仿真层内部补齐的默认头（sec-ch-ua / 伪头 / 头序）；入站头为完整
+//! DsClient 路径补充发送前 Cookie jar 快照；不含 wreq 仿真层默认头、伪头和头序；入站头为完整
 //! 收到的头。该事实随 session 事件写入文件，避免误读。
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -50,6 +50,7 @@ struct Capture {
     /// 懒打开的当前文件（轮转后置 None，下次写时重开）
     file: std::sync::Mutex<Option<File>>,
     next_id: AtomicU64,
+    session_id: String,
 }
 
 static CAPTURE: OnceLock<Capture> = OnceLock::new();
@@ -62,6 +63,9 @@ pub fn init(data_dir: &str, enabled: bool) {
         path,
         file: std::sync::Mutex::new(None),
         next_id: AtomicU64::new(1),
+        session_id: format!("{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_nanos()),
     };
     if enabled {
         if let Some(parent) = cap.path.parent() {
@@ -75,9 +79,26 @@ pub fn init(data_dir: &str, enabled: bool) {
             "id": 0,
             "phase": "session",
             "version": env!("CARGO_PKG_VERSION"),
-            "note": "双向抓取：dir=in 为入站（客户端→本服务），dir=out 为出站（本服务→上游）；id 关联同一次往返。出站 headers 为应用层显式设置（不含 wreq 仿真层默认头），入站 headers 为完整收到的头。非流式体上限 16MB，超出打 truncated 但透传完整",
+            "pid": std::process::id(),
+            "executable_sha256": std::env::current_exe().ok().and_then(|path| file_sha256(&path).ok()),
+            "schema_version": 2,
+            "note": "双向抓取：dir=in 为入站（客户端→本服务），dir=out 为出站（本服务→上游）；id 关联同一次往返。出站 headers 为应用层显式设置；DsClient 路径附加 cookie jar 发送前快照（非线上逐字节头，仍不含 wreq 仿真默认头/头序/HTTP2 伪头），入站 headers 为完整收到的头。非流式体上限 16MB，超出打 truncated 但透传完整",
         }));
     }
+}
+
+/// 启用抓取时记录实际可执行文件摘要，避免把源码版本当成设备运行版本。
+fn file_sha256(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut file = File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 { break; }
+        hash.update(&buffer[..n]);
+    }
+    Ok(hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 /// 抓取是否启用（调用方可据此跳过流包装等有成本的操作）
@@ -287,6 +308,19 @@ where
     Value::Object(map)
 }
 
+/// 借用事件体序列化，避免完整正文额外克隆一次。
+fn event_line(event: &Value, session_id: &str) -> String {
+    #[derive(serde::Serialize)]
+    struct TaggedEvent<'a> {
+        session_id: &'a str,
+        #[serde(flatten)]
+        event: &'a Value,
+    }
+    let mut line = serde_json::to_string(&TaggedEvent { session_id, event }).unwrap();
+    line.push('\n');
+    line
+}
+
 fn write_event(v: &Value) {
     let Some(cap) = CAPTURE.get() else { return };
     if !cap.enabled {
@@ -307,8 +341,7 @@ fn write_event(v: &Value) {
         rotate(cap, &mut guard);
     }
     if let Some(f) = guard.as_mut() {
-        let mut line = v.to_string();
-        line.push('\n');
+        let line = event_line(v, &cap.session_id);
         let _ = f.write_all(line.as_bytes());
         let _ = f.flush();
     }
@@ -392,4 +425,26 @@ mod tests {
             assert!(b > a);
         }
     }
+    #[test]
+    fn capture_event_preserves_body_and_process_identity() {
+        let event = json!({"id": 1, "phase": "response_body", "body": "第一行\n第二行"});
+        let a = event_line(&event, "process-a");
+        let b = event_line(&event, "process-b");
+        assert_eq!(a.lines().count(), 1);
+        let a: Value = serde_json::from_str(&a).unwrap();
+        let b: Value = serde_json::from_str(&b).unwrap();
+        assert_eq!(a["id"], b["id"]);
+        assert_ne!(a["session_id"], b["session_id"]);
+        assert_eq!(a["body"], event["body"]);
+    }
+
+    #[test]
+    fn executable_digest_uses_file_bytes() {
+        let path = std::env::temp_dir().join(format!("ds-capture-hash-{}", std::process::id()));
+        std::fs::write(&path, b"abc").unwrap();
+        let digest = file_sha256(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(digest, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
 }

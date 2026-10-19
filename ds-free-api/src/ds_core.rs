@@ -70,7 +70,12 @@ pub enum CoreError {
 
 impl From<ClientError> for CoreError {
     fn from(e: ClientError) -> Self {
-        CoreError::ProviderError(e.to_string())
+        match e {
+            ClientError::Business { code: 40003, msg } => CoreError::Rejected(
+                format!("DeepSeek 认证已失效（40003）：{}；已停止重试，请重新登录", msg),
+            ),
+            other => CoreError::ProviderError(other.to_string()),
+        }
     }
 }
 

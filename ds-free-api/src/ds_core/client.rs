@@ -885,6 +885,47 @@ impl DsClient {
         self.hif.dliq().await
     }
 
+    /// 所有生成入口共用会话与 SSE 凭据；避免编辑重答漏掉 completion 已有的头。
+    async fn generation_headers(
+        &self, token: &str, pow_response: &str, session_id: &str,
+    ) -> Result<wreq::header::HeaderMap, ClientError> {
+        let mut headers = self.auth_headers_with_pow(token, pow_response)?;
+        if !session_id.is_empty() {
+            headers.insert(wreq::header::REFERER,
+                wreq::header::HeaderValue::from_str(&format!("{}/a/chat/s/{}", self.web_origin, session_id))
+                    .map_err(|e| ClientError::InvalidHeader(format!("Referer: {e}")))?);
+        }
+        for (name, value) in [("x-hif-leim", self.current_hif_leim().await),
+                              ("x-hif-dliq", self.current_hif_dliq().await)] {
+            if let Some(value) = value {
+                headers.insert(name, wreq::header::HeaderValue::from_str(&value)
+                    .map_err(|e| ClientError::InvalidHeader(format!("{name}: {e}")))?);
+            }
+        }
+        Ok(headers)
+    }
+
+    /// 仅用于抓取：补充发送前 cookie jar 的快照，不改动真实请求和 Cookie 策略。
+    fn capture_headers(&self, url: &str, headers: &wreq::header::HeaderMap) -> wreq::header::HeaderMap {
+        use wreq::cookie::CookieStore;
+        let mut snapshot = headers.clone();
+        if !snapshot.contains_key(wreq::header::COOKIE)
+            && let Ok(url) = wreq::Url::parse(url)
+            && let Some(cookie) = self.jar.cookies(&url) {
+            snapshot.insert(wreq::header::COOKIE, cookie);
+        }
+        snapshot
+    }
+
+    fn capture_request(
+        &self, cid: u64, method: &str, url: &str, headers: &wreq::header::HeaderMap,
+        body: Option<serde_json::Value>,
+    ) {
+        if cid != 0 {
+            net_capture::req(cid, "out", method, url, &self.capture_headers(url, headers), body);
+        }
+    }
+
     /// 统一出站发送入口：net_capture 开启时把请求/响应头落盘 JSONL（请求体
     /// 序列化产物原样记录）。`cid` 由调用方 `net_capture::begin()` 分配（未启用
     /// 时为 0，内部全部 no-op）；响应体由调用方读取后用 `net_capture::body` 记录。
@@ -907,9 +948,8 @@ impl DsClient {
                 wreq::header::HeaderValue::from_static("application/json"),
             );
         }
-        net_capture::req(
+        self.capture_request(
             cid,
-            "out",
             method,
             url,
             &rec_headers,
@@ -1045,9 +1085,8 @@ impl DsClient {
         let url = format!("{}{}", self.api_base, ENDPOINT_CLIENT_SETTINGS);
         let cid = net_capture::begin();
         // 抓取记录的 URL 手工补 query（实际发送仍走 .query()，行为不变）
-        net_capture::req(
+        self.capture_request(
             cid,
-            "out",
             "GET",
             &format!(
                 "{}{}?did={}&scope=main/model/web_upgrade",
@@ -1091,7 +1130,7 @@ impl DsClient {
         if let Some(ts) = before_updated_at {
             url_cap.push_str(&format!("&lte_cursor.updated_at={:.3}", ts));
         }
-        net_capture::req(cid, "out", "GET", &url_cap, &headers, None);
+        self.capture_request(cid, "GET", &url_cap, &headers, None);
         let mut rb = self
             .http
             .get(base)
@@ -1138,9 +1177,8 @@ impl DsClient {
     ) -> Result<Vec<CloudMessage>, ClientError> {
         let cid = net_capture::begin();
         let headers = self.auth_headers(token)?;
-        net_capture::req(
+        self.capture_request(
             cid,
-            "out",
             "GET",
             &format!(
                 "{}{}?chat_session_id={}",
@@ -1259,33 +1297,7 @@ impl DsClient {
         pow_response: &str,
         payload: &CompletionPayload,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Bytes, ClientError>> + Send>>, ClientError> {
-        let mut h = self.auth_headers_with_pow(token, pow_response)?;
-        // Referer 按会话定制（风控差异 #6）：官方在会话页发 completion，
-        // Referer 为 {origin}/a/chat/s/{session_id}；旧实现一律是 {origin}/。
-        if !payload.chat_session_id.is_empty() {
-            let referer = format!("{}/a/chat/s/{}", self.web_origin, payload.chat_session_id);
-            if let Ok(v) = wreq::header::HeaderValue::from_str(&referer) {
-                h.insert(wreq::header::REFERER, v);
-            }
-        }
-        // HIF 头：new.jsonl 实测仅 /chat/completion 携带（login、create_session、
-        // create_pow_challenge、upload_file 均无）。值为分发服务下发的动态凭据
-        // （见 hif.rs），静态配置值优先，否则用后台拉取的当前值；都没有则不发
-        // （等价于前端冷启动首个请求在 poller 成功前的形态）。
-        if let Some(v) = self.current_hif_leim().await {
-            h.insert(
-                "x-hif-leim",
-                wreq::header::HeaderValue::from_str(&v)
-                    .map_err(|e| ClientError::InvalidHeader(format!("x-hif-leim: {e}")))?,
-            );
-        }
-        if let Some(v) = self.current_hif_dliq().await {
-            h.insert(
-                "x-hif-dliq",
-                wreq::header::HeaderValue::from_str(&v)
-                    .map_err(|e| ClientError::InvalidHeader(format!("x-hif-dliq: {e}")))?,
-            );
-        }
+        let h = self.generation_headers(token, pow_response, &payload.chat_session_id).await?;
         let cid = net_capture::begin();
         let resp = self
             .send_traced(
@@ -1331,13 +1343,14 @@ impl DsClient {
         pow_response: &str,
         payload: &EditMessagePayload,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Bytes, ClientError>> + Send>>, ClientError> {
+        let h = self.generation_headers(token, pow_response, &payload.chat_session_id).await?;
         let cid = net_capture::begin();
         let resp = self
             .send_traced(
                 cid,
                 "POST",
                 &format!("{}{}", self.api_base, ENDPOINT_CHAT_EDIT_MESSAGE),
-                self.auth_headers_with_pow(token, pow_response)?,
+                h,
                 Some(serde_json::to_value(payload)?),
                 true,
             )
@@ -1448,9 +1461,8 @@ impl DsClient {
         );
 
         let cid = net_capture::begin();
-        net_capture::req(
+        self.capture_request(
             cid,
-            "out",
             "POST",
             &format!("{}{}", self.api_base, ENDPOINT_FILE_UPLOAD),
             &h,
@@ -1563,9 +1575,8 @@ impl DsClient {
 
     pub async fn get_wasm(&self) -> Result<Bytes, ClientError> {
         let cid = net_capture::begin();
-        net_capture::req(
+        self.capture_request(
             cid,
-            "out",
             "GET",
             &self.wasm_url,
             &wreq::header::HeaderMap::new(),
@@ -1707,7 +1718,7 @@ fn prune_message_tree(nodes: Vec<(String, TreeNode)>, has_tree: bool) -> Vec<Clo
 mod tests {
     use super::{
         origin_of, prune_message_tree, ChatMute, CloudMessage, CreateSessionWrapper, DsClient,
-        Envelope, LoginData, LoginPayload, TreeNode, UserInfo,
+        Envelope, LoginData, LoginPayload, TreeNode, UserInfo, EditMessagePayload, ClientError,
     };
 
     fn node(id: &str, parent: Option<&str>, role: &str, content: &str) -> (String, TreeNode) {
@@ -1953,10 +1964,55 @@ mod tests {
             .expect("mock 未收到登录请求（超时）")
             .expect("mock 任务失败");
         let cookie = req.header("cookie").unwrap_or_default();
+        let url = format!("http://{addr}/api/v0/users/login");
+        let headers = client.capture_headers(&url, &wreq::header::HeaderMap::new());
+        assert_eq!(headers.get("cookie").unwrap().to_str().unwrap(), cookie);
+        let mut explicit = wreq::header::HeaderMap::new();
+        explicit.insert(wreq::header::COOKIE, wreq::header::HeaderValue::from_static("chosen=1"));
+        assert_eq!(client.capture_headers(&url, &explicit).get("cookie").unwrap(), "chosen=1");
+        assert!(client.capture_headers("http://unrelated.test/", &wreq::header::HeaderMap::new()).get("cookie").is_none());
         assert!(
             cookie.contains("smidV2=smid-test-123"),
             "smidV2 必须随登录请求发送，实际 cookie: {cookie}"
         );
         assert!(!cookie.contains("smid-other"), "二次写入的值不得出现");
     }
+    /// 两种生成入口使用同一组会话与 HIF 头；本地 HTTP 实收验证，不连接上游。
+    #[tokio::test]
+    async fn edit_message_preserves_generation_headers() {
+        let (addr, captured) = crate::ds_core::mock_http::spawn(200, "event: close\ndata: {}\n\n");
+        let client = DsClient::new(
+            format!("http://{addr}/api/v0"), format!("http://{addr}/wasm"),
+            crate::ds_core::default_user_agent(), "2.5.0".into(), "web".into(),
+            "zh_CN".into(), "test.bundle".into(), 28800, None, vec![],
+            "test-leim".into(), "test-dliq".into(), false,
+        );
+        let payload = EditMessagePayload {
+            chat_session_id: "session-test".into(), message_id: 1, prompt: "test".into(),
+            search_enabled: false, thinking_enabled: false, model_type: None,
+        };
+        let stream = client.edit_message("test-token", "test-pow", &payload).await.unwrap();
+        drop(stream);
+        let req = tokio::time::timeout(std::time::Duration::from_secs(5), captured)
+            .await.unwrap().unwrap();
+        assert_eq!(req.uri, "/api/v0/chat/edit_message");
+        assert_eq!(req.header("x-hif-leim"), Some("test-leim"));
+        assert_eq!(req.header("x-hif-dliq"), Some("test-dliq"));
+        assert_eq!(req.header("x-ds-pow-response"), Some("test-pow"));
+        assert_eq!(req.header("referer"), Some(format!("http://{addr}/a/chat/s/session-test").as_str()));
+    }
+
+    #[test]
+    fn invalid_token_is_a_non_retryable_request_failure() {
+        let raw = r#"{"code":40003,"msg":"Authorization Failed (invalid token)","data":null}"#;
+        let envelope: Envelope<serde_json::Value> = serde_json::from_str(raw).unwrap();
+        let error = crate::ds_core::CoreError::from(envelope.into_result().unwrap_err());
+        assert!(matches!(error, crate::ds_core::CoreError::Rejected(ref msg)
+            if msg.contains("40003") && msg.contains("认证")), "{error:?}");
+        let network_error = crate::ds_core::CoreError::from(ClientError::Status {
+            status: 503, body: "unavailable".into(),
+        });
+        assert!(matches!(network_error, crate::ds_core::CoreError::ProviderError(_)));
+    }
+
 }

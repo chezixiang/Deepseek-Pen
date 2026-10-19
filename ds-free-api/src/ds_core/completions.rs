@@ -1792,11 +1792,19 @@ fn check_hint(event_block: &str) -> Option<CoreError> {
     if !is_hint {
         return None;
     }
-    if event_block.contains("rate_limit") {
-        // 限流用独立错误类型：调用方据此让账号退避而不是标记 Error 后换号重试
-        return Some(CoreError::RateLimited(
-            "上游触发限流（rate_limit_reached），请稍后再试".into(),
-        ));
+    let data = event_block.lines()
+        .filter_map(|line| line.trim().strip_prefix("data:"))
+        .map(str::trim).collect::<Vec<_>>().join("\n");
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) {
+        let message = value.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let reason = value.get("finish_reason").and_then(|v| v.as_str()).unwrap_or(message);
+        let is_error = value.get("type").and_then(|v| v.as_str())
+            .is_none_or(|kind| kind == "error");
+        if is_error && matches!(reason, "edit_rate_limit" | "rate_limit_reached" | "rate_limit") {
+            // 保留编辑限流与普通限流的区别，不把任意正文里的 rate_limit 当错误。
+            let message = &message[..floor_utf8_end(message, 240)];
+            return Some(CoreError::RateLimited(format!("上游限流（{}）：{}", reason, message)));
+        }
     }
     if event_block.contains("input_exceeds_limit") {
         // 输入超长是**请求级**的确定性拒绝：重试不会让输入变短，
@@ -2035,4 +2043,12 @@ mod tests {
         assert!(matches!(initial_hint_error("event: ready\ndata: {}", hint),
             Some((_, CoreError::Rejected(_)))));
     }
+    #[test]
+    fn edit_rate_limit_preserves_upstream_reason() {
+        let block = "event: hint\ndata: {\"type\":\"error\",\"content\":\"修改/重新生成过于频繁，请稍后重试\",\"clear_response\":true,\"finish_reason\":\"edit_rate_limit\"}\n\n";
+        assert!(matches!(check_hint(block), Some(CoreError::RateLimited(msg))
+            if msg.contains("edit_rate_limit") && msg.contains("修改/重新生成过于频繁")));
+        assert!(check_hint("event: hint\ndata: {\"type\":\"info\",\"content\":\"rate_limit is a field\"}\n\n").is_none());
+    }
+
 }

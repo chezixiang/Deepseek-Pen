@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.20] - 2026-09-30
+
+### Fixed
+- 编辑重答与普通生成共用 HIF/会话 Referer 构造；本地 HTTP 回归验证两条路径的请求头。
+- 顶层 `40003 Authorization Failed` 不再作为可重试的 ProviderError，保留认证失效原因返回。
+- SSE 限流按结构化 `finish_reason` 识别并保留 `edit_rate_limit` 及上游提示，不匹配任意正文关键词。
+- 本地限流退避调整为 10/15/20/25/30 分钟。真实日志中 6 分钟后编辑仍被限流；这是一项保守流量策略，不能保证服务端解除限制，也不是禁言根因结论。
+
+### Diagnostics
+- 抓取 session 记录 PID、实际二进制 SHA-256、schema_version；每行带启动代次 session_id，跨重启可关联。
+- DsClient 抓取补充发送前 Cookie jar 快照（与实际线上头/HTTP2 抓包有区别），不修改发送行为。
+- 增加离线脱敏审计工具与 9 月 27–29 日事件报告，区分编辑限流、认证失效和首次明确禁言。
+
 ## [0.2.19] - 2026-09-26
 
 ### Fixed（设备身份链路一致性：分层排查清单的两处确认缺口）

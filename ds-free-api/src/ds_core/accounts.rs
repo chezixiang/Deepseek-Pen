@@ -95,10 +95,10 @@ pub struct Account {
 /// 连续登录失败上限，达到后标记为 Invalid
 const MAX_ERROR_COUNT: u8 = 3;
 
-/// 限流退避阶梯（秒）：连续被限流时逐级加长，最长 30 分钟。
-/// 取指数增长是为了让"用户一直点重试"这种情形快速把请求量压下来——
+/// 本地保守退避策略：首次 10 分钟，逐级延长至 30 分钟；不是上游解限保证。
+/// 首次较长暂停、后续逐级延长，用于限制用户持续重试产生的请求量。
 /// 这里约束本地重试频率，不代表已知的上游风控阈值。
-const COOLDOWN_LADDER_SECS: [i64; 5] = [60, 180, 600, 1200, 1800];
+const COOLDOWN_LADDER_SECS: [i64; 5] = [600, 900, 1200, 1500, 1800];
 
 /// 最近一小时的分配记录。固定窗口允许边界两侧突发两倍配额，不能兑现
 /// 「每小时上限」。这是本地流量约束，并不代表任何已知的上游免封阈值。
@@ -469,7 +469,7 @@ impl AccountPool {
             if let Some(g) = self.get_account() {
                 return Some(g);
             }
-            // 全部账号都在限流退避中：等待没有意义（退避最短 60s > 这里的等待窗口），
+            // 全部账号都在限流退避中：等待没有意义（退避最短 600s > 这里的等待窗口），
             // 提前返回让调用方尽快把"上游限流"告诉用户，而不是白等 30 秒（bug 1）
             if self.all_in_cooldown() {
                 return None;
@@ -1248,6 +1248,7 @@ mod tests {
         assert!(a.cooldown_remaining() > 0 && a.cooldown_remaining() <= COOLDOWN_LADDER_SECS[0]);
 
         assert_eq!(a.enter_cooldown(3), COOLDOWN_LADDER_SECS[2]);
+        assert!(COOLDOWN_LADDER_SECS[0] >= 600, "首次限流至少等待 10 分钟，避免短窗再次撞限流");
         // 档位超出阶梯长度时取最后一档，不越界
         assert_eq!(
             a.enter_cooldown(99),
