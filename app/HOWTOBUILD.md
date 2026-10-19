@@ -7,7 +7,7 @@
 
 1.构建目标 wsl --cd /mnt/g/youdao/Deepseek/ds-free-api bash -lc "cargo build --release"
 
-2.压缩以便节省空间 wsl --cd /mnt/g/youdao/Deepseek/ds-free-api/target/aarch64-unknown-linux-gnu/release/youdao/Deepseek/ds-free-api/target/aarch64-unknown-linux-gnu/release bash -lc "upx --lzma ds-free-api"
+2.压缩以便节省空间 wsl --cd /mnt/g/youdao/Deepseek/ds-free-api/target/aarch64-unknown-linux-gnu/release bash -lc "upx --lzma ds-free-api"
 
 3.复制到指定地点 Copy-Item -Path "G:\youdao\Deepseek\ds-free-api\target\aarch64-unknown-linux-gnu\release\ds-free-api" -Destination "G:\youdao\Deepseek\app\backend\linux-aarch64-gnu\" -Force
 
