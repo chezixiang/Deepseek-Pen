@@ -50,3 +50,7 @@ ds-free-api/ds-free-api-v*/config.toml
 target-wsl/
 target-*/
 ds-free-api-newest/
+
+# astra 路线 C 实验证据根：约 3.9GB，含编译产物、vendor 源码快照、tar 包与原始
+# 抓取，仅在本机保存；docs/astra/*.md 报告入库并用相对路径引用。
+docs/astra/evidence/
