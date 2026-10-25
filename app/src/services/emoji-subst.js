@@ -1,3 +1,60 @@
+
+// ---------- Emoji 区段拆分（配合可选下载的 NotoColorEmoji 字体） ----------
+// 设备缺 emoji 字形时显示白块；把 emoji 字符拆成独立 run 并指定 emoji 字体渲染。
+const EMOJI_RANGES = [
+  [0x2190, 0x21FF], // 箭头
+  [0x2300, 0x23FF], // 杂项技术
+  [0x25A0, 0x27BF], // 几何图形/杂项符号/印刷符号
+  [0x2900, 0x297F], // 补充箭头
+  [0x2B00, 0x2BFF], // 杂项符号和箭头
+  [0x1F000, 0x1FAFF], // emoji 主区
+  [0xFE00, 0xFE0F], // 变体选择符
+  [0x200D, 0x200D] // 零宽连接符
+];
+
+function isEmojiCp(cp) {
+  for (let i = 0; i < EMOJI_RANGES.length; i++) {
+    if (cp >= EMOJI_RANGES[i][0] && cp <= EMOJI_RANGES[i][1]) return true
+  }
+  return false
+}
+
+/**
+ * 把文本切成 [{ t: '片段', e: 是否emoji }]，供模板对 emoji 片段套用字体。
+ * ZWJ/变体选择符在前一个字符是 emoji 时并入 emoji 段。
+ */
+function splitEmojiRuns(text) {
+  const src = String(text || '');
+  if (!src) return [{ t: '', e: false }]
+  const runs = [];
+  let buf = '';
+  let bufEmoji = false;
+  let i = 0;
+  while (i < src.length) {
+    const code = src.charCodeAt(i);
+    let cp = code;
+    let advance = 1;
+    if (code >= 0xD800 && code <= 0xDBFF && i + 1 < src.length) {
+      const lo = src.charCodeAt(i + 1);
+      if (lo >= 0xDC00 && lo <= 0xDFFF) {
+        cp = (code - 0xD800) * 0x400 + (lo - 0xDC00) + 0x10000;
+        advance = 2;
+      }
+    }
+    const emoji = isEmojiCp(cp) || ((cp === 0x200D || cp === 0xFE0F) && bufEmoji);
+    if (emoji === bufEmoji) {
+      buf += src.substr(i, advance);
+    } else {
+      if (buf) runs.push({ t: buf, e: bufEmoji });
+      buf = src.substr(i, advance);
+      bufEmoji = emoji;
+    }
+    i += advance;
+  }
+  if (buf) runs.push({ t: buf, e: bufEmoji });
+  return runs
+}
+
 // Emoji 文本替换降级 —— 无字体注册环境的兜底渲染方案。
 //
 // 背景：词典笔固件没有全局 weex 对象、dom 模块也不可用，无法通过
@@ -11,8 +68,8 @@
 // 3. 未命中的 BMP 符号（U+2600 区段等，部分中文字体自带）→ 原样保留。
 
 // U+FE0F 变体选择符 / U+200D 零宽连接符
-const VS16 = '\uFE0F'
-const ZWJ = '\u200D'
+const VS16 = '\uFE0F';
+const ZWJ = '\u200D';
 
 // 常用 emoji → 文字标签（键不带 VS16，匹配前先归一化）
 const EMOJI_LABELS = {
@@ -90,7 +147,7 @@ const EMOJI_LABELS = {
   '🆕': '[新]', '🆒': '[酷]', '🆓': '[免费]', '🆗': '[好的]', '🆙': '[升级]',
   '🔝': '[顶部]', '🔜': '[即将]', '↗': '[右上]', '➡': '[右]', '🔄': '[循环]',
   '♻': '[回收]', '✳': '[星号]', '❇': '[光点]'
-}
+};
 
 // 需要替换检测的 emoji 主区段（高位面，设备字体必缺）
 function isHighEmoji(cp) {
@@ -113,7 +170,7 @@ function isBmpEmoji(cp) {
 }
 
 function lookupLabel(seq) {
-  const plain = seq.split(VS16).join('').split(ZWJ).join('')
+  const plain = seq.split(VS16).join('').split(ZWJ).join('');
   if (Object.prototype.hasOwnProperty.call(EMOJI_LABELS, plain)) return EMOJI_LABELS[plain]
   // 逐字符兜底（ZWJ 序列的每个基元单独查）
   for (const ch of plain) {
@@ -129,87 +186,87 @@ function lookupLabel(seq) {
  * - 未命中 BMP 符号 → 保留（部分设备字体可渲染）
  * 纯显示层转换：调用方负责不把返回值写回存储。
  */
-export function substituteEmoji(text) {
-  const src = String(text === undefined || text === null ? '' : text)
+function substituteEmoji(text) {
+  const src = String(text === undefined || text === null ? '' : text);
   if (!src) return src
   // 快速路径：没有任何高位面/BMP emoji 代理对或符号时原样返回。
   // 区段必须与 isBmpEmoji 保持同步（旧版漏了 ‼⁉/箭头区/2600-2613，
   // 导致 ↗ ‼ ☀ 这类已配标签的符号走不到替换）。
   if (!/[\u203C\u2049\u2190-\u21FF\u2300-\u23FF\u25AA\u25AB\u25FB-\u25FE\u2600-\u27BF\u2B00-\u2BFF]|[\uD83C-\uD83E]/.test(src)) return src
 
-  let out = ''
-  let i = 0
+  let out = '';
+  let i = 0;
   while (i < src.length) {
-    const code = src.charCodeAt(i)
-    let cp = code
-    let advance = 1
+    const code = src.charCodeAt(i);
+    let cp = code;
+    let advance = 1;
     if (code >= 0xD800 && code <= 0xDBFF && i + 1 < src.length) {
-      const lo = src.charCodeAt(i + 1)
+      const lo = src.charCodeAt(i + 1);
       if (lo >= 0xDC00 && lo <= 0xDFFF) {
-        cp = (code - 0xD800) * 0x400 + (lo - 0xDC00) + 0x10000
-        advance = 2
+        cp = (code - 0xD800) * 0x400 + (lo - 0xDC00) + 0x10000;
+        advance = 2;
       }
     }
 
-    const high = isHighEmoji(cp)
-    const bmp = isBmpEmoji(cp)
+    const high = isHighEmoji(cp);
+    const bmp = isBmpEmoji(cp);
     if (!high && !bmp && cp !== 0x200D && cp !== 0xFE0F) {
-      out += src.substr(i, advance)
-      i += advance
+      out += src.substr(i, advance);
+      i += advance;
       continue
     }
 
     // 收集完整 emoji 序列（基元 + VS16 + ZWJ + 后续基元）
-    let seq = src.substr(i, advance)
-    i += advance
+    let seq = src.substr(i, advance);
+    i += advance;
     while (i < src.length) {
-      const c2 = src.charCodeAt(i)
+      const c2 = src.charCodeAt(i);
       if (c2 === 0xFE0F) {
-        seq += src.charAt(i)
-        i++
+        seq += src.charAt(i);
+        i++;
         continue
       }
       if (c2 === 0x200D) {
         // ZWJ 只有在后随基元仍是 emoji 时才并入；后随普通文本（截断/畸形
         // 序列，如 "👍‍ok"）就停在 ZWJ 前 —— 旧版无条件吃 2 个码元，
         // 会把 ZWJ 后的正文一起吞进序列再整体丢弃。
-        let j = i + 1
-        let nextIsEmoji = false
+        let j = i + 1;
+        let nextIsEmoji = false;
         if (j < src.length) {
-          const n = src.charCodeAt(j)
+          const n = src.charCodeAt(j);
           if (n >= 0xD800 && n <= 0xDBFF && j + 1 < src.length) {
-            const lo2 = src.charCodeAt(j + 1)
+            const lo2 = src.charCodeAt(j + 1);
             if (lo2 >= 0xDC00 && lo2 <= 0xDFFF) {
-              const cp2 = (n - 0xD800) * 0x400 + (lo2 - 0xDC00) + 0x10000
-              nextIsEmoji = isHighEmoji(cp2) || isBmpEmoji(cp2)
+              const cp2 = (n - 0xD800) * 0x400 + (lo2 - 0xDC00) + 0x10000;
+              nextIsEmoji = isHighEmoji(cp2) || isBmpEmoji(cp2);
             }
           } else {
-            nextIsEmoji = isBmpEmoji(n)
+            nextIsEmoji = isBmpEmoji(n);
           }
         }
         if (!nextIsEmoji) break
-        seq += src.charAt(i)
-        i++
+        seq += src.charAt(i);
+        i++;
         // 消费 ZWJ 后的基元（代理对 2 个码元，或 BMP 字符 1 个）
-        const n2 = src.charCodeAt(i)
+        const n2 = src.charCodeAt(i);
         if (n2 >= 0xD800 && n2 <= 0xDBFF && i + 1 < src.length &&
             src.charCodeAt(i + 1) >= 0xDC00 && src.charCodeAt(i + 1) <= 0xDFFF) {
-          seq += src.substr(i, 2)
-          i += 2
+          seq += src.substr(i, 2);
+          i += 2;
         } else {
-          seq += src.charAt(i)
-          i += 1
+          seq += src.charAt(i);
+          i += 1;
         }
         continue
       }
       // 代理对基元
       if (c2 >= 0xD800 && c2 <= 0xDBFF && i + 1 < src.length) {
-        const lo2 = src.charCodeAt(i + 1)
+        const lo2 = src.charCodeAt(i + 1);
         if (lo2 >= 0xDC00 && lo2 <= 0xDFFF) {
-          const cp2 = (c2 - 0xD800) * 0x400 + (lo2 - 0xDC00) + 0x10000
+          const cp2 = (c2 - 0xD800) * 0x400 + (lo2 - 0xDC00) + 0x10000;
           if (isHighEmoji(cp2) || isBmpEmoji(cp2)) {
-            seq += src.substr(i, 2)
-            i += 2
+            seq += src.substr(i, 2);
+            i += 2;
             continue
           }
         }
@@ -217,18 +274,22 @@ export function substituteEmoji(text) {
       break
     }
 
-    const label = lookupLabel(seq)
+    const label = lookupLabel(seq);
     if (label) {
-      out += label
+      out += label;
     } else {
-      const plainSeq = seq.split(VS16).join('').split(ZWJ).join('')
-      const firstCp = plainSeq.codePointAt(0) || 0
-      if (isHighEmoji(firstCp)) {
-        // 丢弃（渲染必为白块）
-      } else {
-        out += seq // BMP 符号保留
+      const plainSeq = seq.split(VS16).join('').split(ZWJ).join('');
+      const firstCp = plainSeq.codePointAt(0) || 0;
+      if (isHighEmoji(firstCp)) ; else {
+        out += seq; // BMP 符号保留
       }
     }
   }
   return out
 }
+
+//
+
+
+
+export { EMOJI_LABELS, EMOJI_RANGES, VS16, ZWJ, isBmpEmoji, isEmojiCp, isHighEmoji, lookupLabel, splitEmojiRuns, substituteEmoji };

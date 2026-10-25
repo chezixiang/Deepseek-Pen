@@ -68,7 +68,6 @@
                 </div>
 
                 <div v-if="builtinEnabled" :class="dc('field')">
-                    <text :class="dc('label')">认证模式</text>
                     <div class="modes">
                         <text :class="form.authMode === 'builtin' ? dc('chip-active') : dc('chip')" @click="setAuthMode('builtin')">内置 ds-free-api</text>
                         <text :class="form.authMode === 'openai' ? dc('chip-active') : dc('chip')" @click="setAuthMode('openai')">OpenAI 兼容端点</text>
@@ -221,7 +220,8 @@
             <div :class="dc('field')">
                 <text :class="dc('label')">启用调试日志</text>
                 <text :class="form.debugLog ? dc('chip-active') : dc('chip')" @click="form.debugLog = !form.debugLog">{{ form.debugLog ? '开启' : '关闭' }}</text>
-                <text :class="dc('field-hint')">开启后双向抓取全部网络报文（app→后端、后端→DeepSeek/数美，JSONL；「查看诊断日志 → 网络抓取」可看尾部，完整文件 logs/net-capture.jsonl 单份 128MB、最多留 3 份）。禁言/风控发生时即有第一手报文可查。注意：报文含账号凭据，外发前自行脱敏；切换后点「保存」，会自动重启后端生效</text>
+                <text v-if="builtinEnabled" :class="dc('field-hint')">开启后双向抓取全部网络报文（app→后端、后端→DeepSeek/数美，JSONL；「查看诊断日志 → 网络抓取」可看尾部，完整文件 logs/net-capture.jsonl 单份 128MB、最多留 3 份）。禁言/风控发生时即有第一手报文可查。注意：报文含账号凭据，外发前自行脱敏；切换后点「保存」，会自动重启后端生效</text>
+                <text v-else :class="dc('field-hint')">开启后记录应用侧调试日志（请求地址、错误分类、流式收尾等），可在下方「查看诊断日志 → 应用日志」查看</text>
             </div>
             <div :class="dc('field')">
                 <text :class="dc('label')">Emoji 字体（实验，联网下载约 10MB）</text>
@@ -241,7 +241,7 @@
             <text :class="dc('danger')" @click="resetData">清空全部对话数据</text>
             <text :class="dc('about')" @click="onVersionTap">Deepseek · 词典笔版 {{ appVersion }}</text>
             <text v-if="form.debugMode" :class="dc('debug-badge')" @click="disableDebug">调试模式已开启（点击关闭）</text>
-            <text :class="dc('about-sub')">后端：ds-free-api（OpenAI 兼容）</text>
+            <text :class="dc('about-sub')">{{ builtinEnabled ? '后端：ds-free-api（OpenAI 兼容）' : '服务：自定义 OpenAI 兼容端点（传输由设备 curl/http 承担）' }}</text>
             <text :class="dc('log-link')" @click="showLogModal = true">查看诊断日志</text>
             <text v-if="saveMsg && !showSaveModal" :class="saved ? dc('save-msg-ok') : dc('save-msg')">{{ saveMsg }}</text>
         </scroller>
@@ -306,9 +306,14 @@
 <script>
 
 import { peekBootTheme } from '../../services/theme.js'
-import { MODES, ensureEmojiFont, pullMissing, listRemoteModels, syncPurgeAll } from '../../services/session-sync.js'
+import { MODES, listRemoteModels } from '../../services/ds.js'
+import { ensureEmojiFont } from '../../services/emoji-font.js'
+import { pullMissing, syncPurgeAll } from '../../services/session-sync.js'
 import { APP_VERSION, BUILTIN_AUTH_ENABLED, DEFAULT_SETTINGS, UPSTREAM_BASE_URL, LOCK_TO_UPSTREAM, appLog, isUpstreamMode, resolveBackendBaseUrl, loadSettings, loadAccountTrouble, loadControlCache, readLocalDsPass, readDsFreeApiProxy, deployBackend, saveSettings, INPUT_TYPES, openTextEditor, appLogTail, readNetCaptureTail, backendLogTail, appLogClear, netCaptureClear, backendLogClear, validateProxyUrl, updateDsFreeApiProxy, saveControlCache, loadConversations, saveMessages, saveConversations, updateDsFreeApiAccount, updateDsFreeApiNetCapture, deleteMessages, saveActiveId } from '../../services/store.js'
-import { maskDeviceId, quotaText, quotaLow, normalizeControl, uuidV4, generatePairingCode, pairDevice, refreshDeviceToken, revokeDeviceToken, ensureUpstreamAuth, getLastAuthError, upstreamBase, fetchDeviceStatus, fetchControl, updateGate, validateExternalUrl, fmtReset } from '../../services/cloud-control.js'
+import { maskDeviceId, uuidV4, generatePairingCode } from '../../services/api-auth.js'
+import { pairDevice, refreshDeviceToken, revokeDeviceToken } from '../../services/api-pairing.js'
+import { validateExternalUrl } from '../../services/http.js'
+import { quotaText, quotaLow, normalizeControl, ensureUpstreamAuth, getLastAuthError, upstreamBase, fetchDeviceStatus, fetchControl, updateGate, fmtReset } from '../../services/cloud-control.js'
 
 const MODEL_LIST_MAX = 50
 

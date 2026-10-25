@@ -316,13 +316,18 @@
 <script>
 
 import { peekBootTheme } from '../../services/theme.js'
-import { MODES, cancelThumbJobs, queueSessionPush, pullMissing, listCloudSessions, isAccountSuspension, listCloudSessionMessages, ensureEmojiFont, getMode, syncDelete, deleteCloudSession, buildMessages, chatStream, isRateLimitedError, listAlbum, ensureThumb, readImageDataUrl, stripInternalTags } from '../../services/session-sync.js'
+import { MODES, listCloudSessions, isAccountSuspension, listCloudSessionMessages, getMode, deleteCloudSession, buildMessages, chatStream, isRateLimitedError, stripInternalTags } from '../../services/ds.js'
+import { cancelThumbJobs, listAlbum, ensureThumb, readImageDataUrl } from '../../services/images.js'
+import { queueSessionPush, pullMissing, syncDelete } from '../../services/session-sync.js'
+import { ensureEmojiFont } from '../../services/emoji-font.js'
 import { execShell, sleep, joinPath, dataDirBase, writeFile, readFile, statSize, waitForFile, BUILTIN_AUTH_ENABLED, DEFAULT_SETTINGS, isUpstreamMode, appLog, saveSettings, loadControlCache, saveControlCache, saveMessages, saveConversations, saveActiveId, loadMessages, openTextEditor, INPUT_TYPES, uid, recordAccountTrouble, setDebugLogEnabled, ensureBackendRunning, loadSettings, loadConversations, loadActiveId, deleteMessages, stopStream } from '../../services/store.js'
 import { createBackendMonitor } from '../../services/backend-health.js'
-import { maintenanceActive, quotaExhausted, quotaText, ensureUpstreamAuth, tokenExpiringSoon, refreshDeviceToken, upstreamBase, fetchControl, normalizeControl, fetchDeviceStatus, activeAnnouncement, updateGate } from '../../services/cloud-control.js'
+import { tokenExpiringSoon } from '../../services/api-auth.js'
+import { refreshDeviceToken } from '../../services/api-pairing.js'
+import { maintenanceActive, quotaExhausted, quotaText, ensureUpstreamAuth, upstreamBase, fetchControl, normalizeControl, fetchDeviceStatus, activeAnnouncement, updateGate } from '../../services/cloud-control.js'
 import { startPreview, stopPreview, stopFramePreview, capturePhoto, cropFrame, PHOTO_W, PHOTO_H } from '../../services/camera.js'
-import { latexToText, splitMathSegments, canTypesetMath, bracesBalanced, markdownToBlocks, inlineSpans, splitEmojiRuns } from '../../services/markdown.js'
-import { substituteEmoji } from '../../services/emoji-subst.js'
+import { latexToText, splitMathSegments, canTypesetMath, bracesBalanced, markdownToBlocks, inlineSpans } from '../../services/markdown.js'
+import { splitEmojiRuns, substituteEmoji } from '../../services/emoji-subst.js'
 
 export default {
     name: 'index',

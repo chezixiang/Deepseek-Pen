@@ -48,7 +48,8 @@
 <script>
 import { peekBootTheme } from '../../services/theme.js'
 import { APP_VERSION, loadSettings, loadFeedbackDraft, openTextEditor, INPUT_TYPES, appLogTail, clearFeedbackDraft, appLog, saveFeedbackDraft, saveSettings } from '../../services/store.js'
-import { maskDeviceId, quotaText, ensureUpstreamAuth, submitFeedback, upstreamBase } from '../../services/cloud-control.js'
+import { maskDeviceId } from '../../services/api-auth.js'
+import { quotaText, ensureUpstreamAuth, submitFeedback, upstreamBase } from '../../services/cloud-control.js'
 
 export default {
     name: 'feedback',
