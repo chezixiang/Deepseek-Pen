@@ -7,8 +7,8 @@
         <!-- 顶栏：会话 | 联网/深度思考 | 模式/标题 | 设置 -->
         <div :class="dc('topbar')" v-if="!camMode">
             <text :class="dc('icon-btn')" @click="toggleDrawer">会话</text>
-            <text :class="toggleClass(search)" @click="toggleSearch">联网</text>
-            <text :class="toggleClass(thinking)" @click="toggleThinking">深度</text>
+            <text v-if="featSearch" :class="toggleClass(search)" @click="toggleSearch">联网</text>
+            <text v-if="featThinking" :class="toggleClass(thinking)" @click="toggleThinking">深度</text>
             <div class="topbar-center">
                 <template v-if="!modeLocked() && visibleModes.length">
                     <text
@@ -31,6 +31,27 @@
         <!-- 后端断线提示 -->
         <div :class="dc('backend-error-banner')" v-if="backendDisconnected && !camMode">
             <text :class="dc('backend-error-text')">⚠️ 后端连接已断开（如果是安装/更新后第一次打开软件可以通过配置账号的方式重启服务试试）</text>
+        </div>
+
+        <!-- 未配置端点 / 上游未连接：点进设置 -->
+        <div :class="dc('backend-error-banner')"
+             v-if="!builtinEnabled && !hasEndpoint && !camMode"
+             @click="goSettings">
+            <text :class="dc('backend-error-text')">{{ upstreamMode ? '⚠️ 服务未连接：点此查看状态与额度' : '⚠️ 未配置 API 端点：点此填写服务地址与 API Key' }}</text>
+        </div>
+
+        <!-- 服务端公告（云控下发） -->
+        <div :class="dc('backend-error-banner')"
+             v-if="announcement && !camMode"
+             @click="dismissAnnouncement">
+            <text :class="dc('backend-error-text')">📢 {{ announcement.title }}：{{ announcement.body }}（点击关闭）</text>
+        </div>
+
+        <!-- 维护 / 配额耗尽 / 强制更新等阻塞提示 -->
+        <div :class="dc('backend-error-banner')"
+             v-if="blockedNotice && !camMode"
+             @click="onBlockedTap">
+            <text :class="dc('backend-error-text')">{{ blockedNotice }}</text>
         </div>
 
         <!-- 消息区。scroller 绝不能套 v-if：Falcon 对被 v-if 包装的 scroller 会渲染空白。
@@ -182,9 +203,10 @@
             <div :class="dc('drawer-head')" @click="noopDrawer">
                 <text :class="dc('drawer-title')">会话列表</text>
                 <text :class="dc('icon-btn')" @click="searchConversations">{{ convFilter ? '重搜' : '搜索' }}</text>
-                <text :class="dc('icon-btn')" @click="syncCloudSessions">{{ syncing ? '同步中…' : '同步' }}</text>
+                <text v-if="builtinEnabled" :class="dc('icon-btn')" @click="syncCloudSessions">{{ syncing ? '同步中…' : '同步' }}</text>
                 <text :class="dc('icon-btn')" @click="newConversation(true)">＋ 新对话</text>
             </div>
+            <text v-if="upstreamMode && quotaLine" :class="dc('sync-msg')">剩余额度：{{ quotaLine }}</text>
             <text v-if="syncMsg" :class="dc('sync-msg')">{{ syncMsg }}</text>
             <div class="filter-row" v-if="convFilter">
                 <text :class="dc('filter-text')">筛选：{{ convFilter }}</text>
@@ -273,41 +295,42 @@
             </div>
         </div>
         </div>
+
+        <!-- 版本更新弹窗（云控 updateGate 下发） -->
+        <div :class="isDark ? 'ov-mask ov-mask-dark' : 'ov-mask'" v-if="showUpdateModal">
+            <div :class="isDark ? 'ov-box ov-box-dark' : 'ov-box'">
+                <text :class="isDark ? 'ov-title ov-title-dark' : 'ov-title'">{{ updateState === 'force' ? '需要更新' : '发现新版本' }}</text>
+                <text :class="isDark ? 'ov-text ov-text-dark' : 'ov-text'">build {{ updateInfo.latestBuild }}{{ updateInfo.version ? ' · ' + updateInfo.version : '' }}</text>
+                <text v-if="updateInfo.notes" :class="isDark ? 'ov-text ov-text-dark' : 'ov-text'">{{ updateInfo.notes }}</text>
+                <text :class="isDark ? 'ov-text ov-text-dark' : 'ov-text'">{{ updateInfo.url ? '更新包：' + updateInfo.url : '请通过发布渠道获取新版本' }}</text>
+                <div class="modes model-actions">
+                    <text :class="isDark ? 'ov-btn ov-btn-dark' : 'ov-btn'" @click="openUpdateUrl">查看更新</text>
+                    <text v-if="updateState !== 'force'" :class="isDark ? 'ov-btn ov-btn-dark' : 'ov-btn'" @click="skipUpdate">以后再说</text>
+                    <text :class="isDark ? 'ov-btn ov-btn-dark' : 'ov-btn'" @click="closeUpdate">关闭</text>
+                </div>
+            </div>
+        </div>
     </div>
 </template>
 
 <script>
-import { MODES, getMode, buildMessages, chatStream, stripInternalTags, listCloudSessions, listCloudSessionMessages, deleteCloudSession } from '../../services/ds.js'
-import { isAccountSuspension, isRateLimitedError } from '../../services/error-classify.js'
-import {
-    loadConversations, saveConversations, loadMessages, saveMessages,
-    deleteMessages, loadSettings, loadActiveId, saveActiveId, uid, DEFAULT_SETTINGS,
-    recordAccountTrouble
-} from '../../services/store.js'
-import { listAlbum, readImageDataUrl, ensureThumb, cancelThumbJobs } from '../../services/images.js'
-import { startPreview, stopPreview, startFramePreview, stopFramePreview, capturePhoto, cropFrame, PHOTO_W, PHOTO_H } from '../../services/camera.js'
-import { openTextEditor, setDebugLogEnabled, stopStream, INPUT_TYPES, ensureBackendRunning } from '../../services/native.js'
-import { markdownToBlocks, inlineSpans, splitEmojiRuns, latexToText, splitMathSegments, canTypesetMath, bracesBalanced } from '../../services/markdown.js'
-import { ensureEmojiFont } from '../../services/emoji-font.js'
-import { substituteEmoji } from '../../services/emoji-subst.js'
-import { createBackendMonitor } from '../../services/backend-health.js'
-import { appLog } from '../../services/app-log.js'
 
-// 首帧主题预读：startup 页在跳转前把主题写到 $falcon.__dsTheme（跨页共享），
-// 这里同步读取，避免深色用户进入主页时先闪一帧浅色（#7）。
-function peekBootTheme() {
-  try {
-    return ($falcon && $falcon.__dsTheme) || 'light'
-  } catch (e) {
-    return 'light'
-  }
-}
+import { peekBootTheme } from '../../services/theme.js'
+import { MODES, cancelThumbJobs, queueSessionPush, pullMissing, listCloudSessions, isAccountSuspension, listCloudSessionMessages, ensureEmojiFont, getMode, syncDelete, deleteCloudSession, buildMessages, chatStream, isRateLimitedError, listAlbum, ensureThumb, readImageDataUrl, stripInternalTags } from '../../services/session-sync.js'
+import { execShell, sleep, joinPath, dataDirBase, writeFile, readFile, statSize, waitForFile, BUILTIN_AUTH_ENABLED, DEFAULT_SETTINGS, isUpstreamMode, appLog, saveSettings, loadControlCache, saveControlCache, saveMessages, saveConversations, saveActiveId, loadMessages, openTextEditor, INPUT_TYPES, uid, recordAccountTrouble, setDebugLogEnabled, ensureBackendRunning, loadSettings, loadConversations, loadActiveId, deleteMessages, stopStream } from '../../services/store.js'
+import { createBackendMonitor } from '../../services/backend-health.js'
+import { maintenanceActive, quotaExhausted, quotaText, ensureUpstreamAuth, tokenExpiringSoon, refreshDeviceToken, upstreamBase, fetchControl, normalizeControl, fetchDeviceStatus, activeAnnouncement, updateGate } from '../../services/cloud-control.js'
+import { startPreview, stopPreview, stopFramePreview, capturePhoto, cropFrame, PHOTO_W, PHOTO_H } from '../../services/camera.js'
+import { latexToText, splitMathSegments, canTypesetMath, bracesBalanced, markdownToBlocks, inlineSpans, splitEmojiRuns } from '../../services/markdown.js'
+import { substituteEmoji } from '../../services/emoji-subst.js'
 
 export default {
     name: 'index',
     data() {
         return {
             MODES,
+            // 账号登录模式是否可用（false 时隐藏云端会话同步等后端专属入口）
+            builtinEnabled: BUILTIN_AUTH_ENABLED,
             // 会话
             conversations: [],
             activeId: null,
@@ -367,7 +390,16 @@ export default {
             streamToken: null,
             // 后端监控
             backendMonitor: null,
-            backendDisconnected: false
+            backendDisconnected: false,
+            // 云控：公告 / 维护 / 更新策略；quota 为最近一次查询的配额快照
+            control: null,
+            quota: null,
+            announcement: null,
+            showUpdateModal: false,
+            updateState: 'none',
+            updateInfo: { latestBuild: 0, minBuild: 0, version: '', notes: '', url: '', currentBuild: 0 },
+            controlFetchedAt: 0,
+            updatePromptedBuild: 0
         }
     },
     computed: {
@@ -392,12 +424,45 @@ export default {
             if (!this.settings) return false
             return this.settings.theme === 'dark'
         },
+        // 上游模式：零配置后端。云控/配额只在这个模式下生效。
+        upstreamMode() {
+            return isUpstreamMode(this.settings && this.settings.backendMode)
+        },
+        maintenanceOn() {
+            return this.upstreamMode && maintenanceActive(this.control)
+        },
+        forceUpdateOn() {
+            return this.upstreamMode && this.updateState === 'force'
+        },
+        quotaOut() {
+            if (!this.upstreamMode) return false
+            return quotaExhausted(this.quota || (this.settings && this.settings.quotaCache))
+        },
+        // 发不出去的原因（维护 > 强制更新 > 额度），横幅展示
+        blockedNotice() {
+            if (this.chatDisabled) return '⏸ 对话功能已暂停，请稍后再试'
+            if (this.maintenanceOn) {
+                const m = (this.control && this.control.maintenance) || {};
+                return '🛠 ' + (m.message || '服务正在维护，请稍后再试')
+            }
+            if (this.forceUpdateOn) {
+                return '⬆ 需要更新到 build ' + this.updateInfo.latestBuild + ' 才能继续使用（点此查看）'
+            }
+            if (this.quotaOut) {
+                return '📊 今日额度已用完：' + quotaText(this.quota || this.settings.quotaCache)
+            }
+            return ''
+        },
+        quotaLine() {
+            if (!this.upstreamMode) return ''
+            return quotaText(this.quota || (this.settings && this.settings.quotaCache))
+        },
         // 抽屉渲染列表：按搜索词过滤（#7）
         // 必须放在 computed 里：之前定义在 methods 中，模板 `v-for="c in drawerConversations"`
         // 拿到的是**函数本身**（不是返回值），v-for 遍历函数对象得到空数组 —— 抽屉永远显示
         // "暂无会话"，云端同步导入成功也看不到（bug 3）。
         drawerConversations() {
-            const q = (this.convFilter || '').trim().toLowerCase()
+            const q = (this.convFilter || '').trim().toLowerCase();
             if (!q) return this.conversations
             return this.conversations.filter((c) => (c.title || '').toLowerCase().indexOf(q) >= 0)
         },
@@ -409,13 +474,13 @@ export default {
         // 取不到环境值时回退 X7 Pro 实测硬编码。非竖屏返回空对象（避免 null 样式）。
         portraitStyle() {
             if (!this.portrait) return {}
-            let w = 936
-            let h = 280
+            let w = 936;
+            let h = 280;
             try {
-                const env = (typeof weex !== 'undefined') && weex.config && weex.config.env
+                const env = (typeof weex !== 'undefined') && weex.config && weex.config.env;
                 if (env && env.deviceWidth && env.deviceHeight) {
-                    w = Math.max(env.deviceWidth, env.deviceHeight)
-                    h = Math.min(env.deviceWidth, env.deviceHeight)
+                    w = Math.max(env.deviceWidth, env.deviceHeight);
+                    h = Math.min(env.deviceWidth, env.deviceHeight);
                 }
             } catch (e) { /* 回退默认值 */ }
             return {
@@ -430,23 +495,39 @@ export default {
             // 只有一个模式时不必渲染切换条（省掉顶部一行空间）。
             return MODES.length > 1 ? MODES : []
         },
-        // 图片上传是否可用：合并后的模型自带图片理解（file_feature.vision=true），
-        // 不再依赖"识图模式"，所以任何时候都能传图。
+        // 图片上传是否可用：云控可关（features.images）；关闭后隐藏相册/相机入口
         canUploadImage() {
-            return true
+            return this.featImages
+        },
+        // 云控功能开关：服务端未下发（或旧缓存）时一律按开启处理
+        featSearch() {
+            const c = this.control;
+            return !c || !c.features || c.features.search !== false
+        },
+        featThinking() {
+            const c = this.control;
+            return !c || !c.features || c.features.thinking !== false
+        },
+        featImages() {
+            const c = this.control;
+            return !c || !c.features || c.features.images !== false
+        },
+        chatDisabled() {
+            const c = this.control;
+            return !!(this.upstreamMode && c && c.features && c.features.chat === false)
         },
         // ===== 相机浮层几何 =====
         // 屏幕尺寸：取框架环境宽高（X7 Pro 实测 936x280 横屏），取不到回退实测值。
         // 相机浮层已移出旋转画布，永远按横屏布局（与相册选择器一致）。
         stageW() {
             try {
-                const env = weex.config.env
+                const env = weex.config.env;
                 return Math.max(env.deviceWidth, env.deviceHeight) || 936
             } catch (e) { return 936 }
         },
         stageH() {
             try {
-                const env = weex.config.env
+                const env = weex.config.env;
                 return Math.min(env.deviceWidth, env.deviceHeight) || 280
             } catch (e) { return 280 }
         },
@@ -454,15 +535,15 @@ export default {
         // 矩形：image 节点占满整个浮层，contain 会在剩余横向空间内居中；
         // 裁剪框必须使用同一矩形，否则会整体偏左而无法贴合照片边框。
         dispRect() {
-            const W = this.stageW
-            const H = this.stageH
-            const s = Math.min(W / PHOTO_W, H / PHOTO_H)
-            const w = PHOTO_W * s
-            const h = PHOTO_H * s
+            const W = this.stageW;
+            const H = this.stageH;
+            const s = Math.min(W / PHOTO_W, H / PHOTO_H);
+            const w = PHOTO_W * s;
+            const h = PHOTO_H * s;
             return { x: (W - w) / 2, y: (H - h) / 2, w: w, h: h }
         },
         cropBoxStyle() {
-            const b = this.cropBox
+            const b = this.cropBox;
             return {
                 left: b.x + 'px',
                 top: b.y + 'px',
@@ -473,32 +554,226 @@ export default {
         camHintText() {
             if (this.previewMode === 'frames' && this.previewFrame) return ''
             return '相机启动中…'
+        },
+        // 端点是否已配置（startup 已按此分流，这里是运行期二次兜底提示）
+        hasEndpoint() {
+            const s = this.settings || {};
+            // 上游模式没有 API Key：地址解析成功 + 完成配对才算可用
+            if (isUpstreamMode(s.backendMode)) return !!(s.effectiveBaseUrl && String(s.pairToken || '').trim())
+            if (String(s.apiKey || '').trim()) return true
+            // 配对模式没有 apiKey，Bearer 用的是 deviceToken（见 api-auth.js）
+            return !!String(s.pairToken || '').trim()
+        },
+        // 实际请求根地址：上游模式由 store.loadSettings 解析到 effectiveBaseUrl
+        // （锁定构建只认构建期常量），自定义模式回落到用户填写的 baseUrl。
+        apiBaseUrl() {
+            const s = this.settings || {};
+            return s.effectiveBaseUrl || s.baseUrl || 'https://api.deepseek.com/v1'
         }
     },
     created() {
-        this.$page.on('show', this.onPageShow)
-        this.init()
-        this.startBackendMonitor()
+        this.$page.on('show', this.onPageShow);
+        this.init();
+        // 账号登录模式已暂停：没有本机后端可监控（监控会每 10 秒探测 22217-22222）
+        if (BUILTIN_AUTH_ENABLED) this.startBackendMonitor();
     },
     watch: {
         isDark(v) {
-            appLog('[index] isDark 实际变化 => ' + v + ' theme=' + (this.settings && this.settings.theme))
+            appLog('[index] isDark 实际变化 => ' + v + ' theme=' + (this.settings && this.settings.theme));
         }
     },
     destroyed() {
-        this.$page.off('show', this.onPageShow)
-        this.stopBackendMonitor()
+        this.$page.off('show', this.onPageShow);
+        this.stopBackendMonitor();
         // 相机预览是常驻 gst 管道 + JS 轮询，页面销毁必须一并停掉，
         // 否则相机节点被占、回调持有组件引用
-        cancelThumbJobs()
-        ++this.albumLoadSeq
-        stopPreview()
-        if (this._errTimer) { clearTimeout(this._errTimer); this._errTimer = null }
+        cancelThumbJobs();
+        ++this.albumLoadSeq;
+        stopPreview();
+        if (this._errTimer) { clearTimeout(this._errTimer); this._errTimer = null; }
         // 清理节流的渲染/滚动定时器，避免页面销毁后回调仍持有组件引用
-        if (this._renderTimer) { clearTimeout(this._renderTimer); this._renderTimer = null }
-        if (this._scrollTimer) { clearTimeout(this._scrollTimer); this._scrollTimer = null }
+        if (this._renderTimer) { clearTimeout(this._renderTimer); this._renderTimer = null; }
+        if (this._scrollTimer) { clearTimeout(this._scrollTimer); this._scrollTimer = null; }
     },
     methods: {
+        // 设备凭证材料（未注册返回 null，ds.js 回退到 API Key 模式）
+        pairAuth() {
+            const s = this.settings || {};
+            if (!s.pairDeviceId || !s.pairSecret || !s.pairToken) return null
+            return {
+                deviceId: s.pairDeviceId,
+                deviceToken: s.pairToken,
+                signSecret: s.pairSecret,
+                expiresAt: s.pairExpiresAt || 0,
+                tlsPin: s.pairTlsPin || ''
+            }
+        },
+        // 发请求前确保凭证可用：
+        //   上游模式：静默注册 / 续期（用户不需要做任何配置，失败也不抛，让请求给出可读错误）
+        //   自定义模式：临期刷新一次，失败沿用旧令牌
+        async ensureFreshAuth() {
+            if (this.upstreamMode) {
+                return await ensureUpstreamAuth({
+                    settings: this.settings,
+                    persist: () => saveSettings(this.settings)
+                })
+            }
+            const auth = this.pairAuth();
+            if (!auth || !tokenExpiringSoon(auth, 300000)) return auth
+            try {
+                const r = await refreshDeviceToken({ baseUrl: this.apiBaseUrl, auth });
+                this.settings.pairToken = r.deviceToken;
+                if (r.signSecret) this.settings.pairSecret = r.signSecret;
+                this.settings.pairExpiresAt = r.expiresAt;
+                await saveSettings(this.settings);
+                appLog('[index] 设备令牌已刷新 expiresAt=' + r.expiresAt);
+            } catch (e) {
+                appLog('[index] 设备令牌刷新失败（继续用旧令牌）: ' + (e && e.message ? e.message : String(e)));
+            }
+            return this.pairAuth()
+        },
+
+        // ---------- 云控 / 配额 / 自动更新 ----------
+        // 缓存先上屏，再静默刷新；任何失败都只记录日志，不影响聊天。
+        async refreshCloudControl(force, prompt) {
+            if (!this.upstreamMode) return
+            if (!force && this.controlFetchedAt && Date.now() - this.controlFetchedAt < 5 * 60 * 1000) return
+            const allowPrompt = prompt !== false;
+            try {
+                const cached = await loadControlCache();
+                if (cached) this.applyControl(cached, false);
+            } catch (e) { /* 忽略 */ }
+            const auth = await ensureUpstreamAuth({
+                settings: this.settings,
+                persist: () => saveSettings(this.settings)
+            });
+            if (!auth) return
+            const baseUrl = upstreamBase(this.settings);
+            try {
+                const raw = await fetchControl({ baseUrl, auth });
+                const c = normalizeControl(raw);
+                this.applyControl(c, allowPrompt);
+                await saveControlCache(c);
+                this.controlFetchedAt = Date.now();
+            } catch (e) {
+                appLog('[index] 云控拉取失败 ' + (e && e.message ? e.message : String(e)));
+            }
+            try {
+                const st = await fetchDeviceStatus({ baseUrl, auth });
+                this.quota = st.quota || null;
+                if (st.quota) {
+                    this.settings.quotaCache = st.quota;
+                    await saveSettings(this.settings);
+                }
+            } catch (e) { /* 配额失败不打扰 */ }
+            this.$forceUpdate();
+        },
+        applyControl(raw, allowPrompt) {
+            const c = normalizeControl(raw);
+            this.control = c;
+            // 公告：按 id 去重，用户点过关闭就不再弹
+            this.announcement = activeAnnouncement(c, this.settings && this.settings.seenAnnouncementId);
+            const gate = updateGate(c);
+            this.updateState = gate.state;
+            this.updateInfo = gate;
+            if (!allowPrompt || gate.state === 'none') return
+            // 可选更新：同一构建号只主动弹一次；强制更新每次进入都提示
+            const skipped = Number(this.settings && this.settings.skippedUpdateBuild) || 0;
+            if (gate.state === 'optional' && skipped === gate.latestBuild) return
+            if (this.updatePromptedBuild === gate.latestBuild && gate.state === 'optional') return
+            this.updatePromptedBuild = gate.latestBuild;
+            this.showUpdateModal = true;
+            this.$forceUpdate();
+        },
+        dismissAnnouncement() {
+            const a = this.announcement;
+            this.announcement = null;
+            if (a && a.id && this.settings) {
+                this.settings.seenAnnouncementId = a.id;
+                saveSettings(this.settings).catch(() => {});
+            }
+            this.$forceUpdate();
+        },
+        onBlockedTap() {
+            if (this.forceUpdateOn) {
+                this.showUpdateModal = true;
+                this.$forceUpdate();
+                return
+            }
+            if (this.quotaOut) {
+                this.imageWarn = '今日额度已用完，额度会在次日 00:00（UTC）重置';
+                this.$forceUpdate();
+                return
+            }
+            if (this.maintenanceOn) {
+                this.imageWarn = '服务维护中，请稍后再试';
+                this.$forceUpdate();
+            }
+        },
+        openUpdateUrl() {
+            const url = (this.updateInfo && this.updateInfo.url) || '';
+            if (!url) {
+                this.imageWarn = '请通过发布渠道获取新版本';
+                this.$forceUpdate();
+                return
+            }
+            // 设备没有通用浏览器入口：复制到提示条，用户可在 PC 上打开
+            this.imageWarn = '更新地址：' + url;
+            this.$forceUpdate();
+        },
+        skipUpdate() {
+            this.showUpdateModal = false;
+            if (this.updateInfo && this.updateInfo.latestBuild && this.settings) {
+                this.settings.skippedUpdateBuild = this.updateInfo.latestBuild;
+                saveSettings(this.settings).catch(() => {});
+            }
+            this.$forceUpdate();
+        },
+        closeUpdate() {
+            this.showUpdateModal = false;
+            this.$forceUpdate();
+        },
+        // 会话推送到云端（本地已落盘；失败只记日志）
+        queueCloudSync(conv, messages) {
+            if (!this.upstreamMode || !conv) return
+            queueSessionPush({
+                settings: this.settings,
+                conversation: conv,
+                messages: messages || this.messages,
+                persist: () => saveSettings(this.settings)
+            });
+        },
+        // 本地没有任何会话时，从云端备份恢复（重装/换机）
+        async restoreCloudIfEmpty() {
+            if (!this.upstreamMode || this.conversations.length) return
+            try {
+                const got = await pullMissing({
+                    settings: this.settings,
+                    existingIds: [],
+                    max: 20,
+                    persist: () => saveSettings(this.settings)
+                });
+                if (!got.length) return
+                for (const g of got) {
+                    await saveMessages(g.conversation.id, g.messages);
+                }
+                this.conversations = got.map((g) => g.conversation);
+                this.activeId = this.conversations[0].id;
+                await saveConversations(this.conversations);
+                await saveActiveId(this.activeId);
+                this.messages = await loadMessages(this.activeId);
+                const conv = this.activeConversation();
+                if (conv) {
+                    this.modeKey = conv.mode;
+                    this.thinking = conv.thinking;
+                    this.search = conv.search;
+                }
+                appLog('[index] 已从云端恢复 ' + got.length + ' 条会话');
+                this.$forceUpdate();
+            } catch (e) {
+                appLog('[index] 云端恢复失败 ' + (e && e.message ? e.message : String(e)));
+            }
+        },
         // 深色模式类名切换：浅色返回原类，深色返回 -dark 变体类
         // （Weex 引擎仅支持单类选择器，不能用 .dark .xxx 后代选择器覆盖）
         dc(cls) {
@@ -506,7 +781,7 @@ export default {
         },
         // 把当前主题缓存到 $falcon 全局，供 settings/index 页首帧同步预读（#7）
         cacheTheme() {
-            try { $falcon.__dsTheme = (this.settings && this.settings.theme) || 'light' } catch (e) { /* 忽略 */ }
+            try { $falcon.__dsTheme = (this.settings && this.settings.theme) || 'light'; } catch (e) { /* 忽略 */ }
         },
         // 流式渲染节流：每来一个 delta 就 $forceUpdate + 滚动，会把弱 SoC 的 CPU
         // 打满（消息多时还要全量重渲染整列），是"发送消息时设备卡死/重启"的诱因之一。
@@ -514,57 +789,62 @@ export default {
         scheduleRender() {
             if (this._renderTimer) return
             this._renderTimer = setTimeout(() => {
-                this._renderTimer = null
-                this.$forceUpdate()
-                this.scrollToBottom(true)
-            }, 120)
+                this._renderTimer = null;
+                this.$forceUpdate();
+                this.scrollToBottom(true);
+            }, 120);
         },
         flushRender() {
             if (this._renderTimer) {
-                clearTimeout(this._renderTimer)
-                this._renderTimer = null
+                clearTimeout(this._renderTimer);
+                this._renderTimer = null;
             }
-            this.$forceUpdate()
-            this.scrollToBottom(true)
+            this.$forceUpdate();
+            this.scrollToBottom(true);
         },
         closeDrawer() {
-            this.showDrawer = false
-            this.syncMsg = ''
-            this.$forceUpdate()
+            this.showDrawer = false;
+            this.syncMsg = '';
+            this.$forceUpdate();
         },
         // 空消费点击：挡住抽屉内部空白区域的事件穿透到遮罩（bug 修复）
         noopDrawer() {},
         async searchConversations() {
-            const text = await openTextEditor(INPUT_TYPES.ZH_CN_PREFERRED, this.convFilter || '')
+            const text = await openTextEditor(INPUT_TYPES.ZH_CN_PREFERRED, this.convFilter || '');
             if (text === null) return
-            this.convFilter = String(text).trim()
-            this.$forceUpdate()
+            this.convFilter = String(text).trim();
+            this.$forceUpdate();
         },
         clearConvFilter() {
-            this.convFilter = ''
-            this.$forceUpdate()
+            this.convFilter = '';
+            this.$forceUpdate();
         },
 
         // ---------- 云端会话同步（#10） ----------
         // 拉取 DeepSeek 账号的会话列表，按标题去重后导入：
         // 恢复原会话模式（model_type→mode），记录 cloudId 供进入时按需拉取消息内容
         async syncCloudSessions() {
+            if (!BUILTIN_AUTH_ENABLED) {
+                this.syncMsg = '账号登录模式已暂停：云端会话同步暂不可用';
+                this.$forceUpdate();
+                return
+            }
             if (this.syncing) return
-            this.syncing = true
-            this.syncMsg = ''
-            this.$forceUpdate()
+            this.syncing = true;
+            this.syncMsg = '';
+            this.$forceUpdate();
             try {
                 const list = await listCloudSessions({
-                    baseUrl: this.settings.baseUrl,
+                    baseUrl: this.apiBaseUrl,
                     apiKey: this.settings.apiKey,
                     authMode: this.settings.authMode
-                })
-                let added = 0
-                let linked = 0
+                });
+                let added = 0;
+                let linked = 0;
                 for (const s of list) {
-                    const title = String(s.title || '').trim()
+                    const title = String(s.title || '').trim();
                     if (!title) continue
-                    const ts = s.updated_at ? Math.round(s.updated_at * 1000) : Date.now()
+                    const ts = s.updated_at ? Math.round(s.updated_at * 1000) : Date.now();
                     // 已关联过的云端会话（cloudId 匹配）：不重复导入
                     if (this.conversations.some((c) => c.cloudId === s.id)) continue
                     // 本机新建的会话在云端也有一条同名会话（服务端为每次对话都建了 session），
@@ -572,25 +852,25 @@ export default {
                     // 对话又导入一遍 —— 抽屉里出现两份（云的一份是空占位，进入才拉取）。
                     // 这里先按标题认领：命中未关联的本地会话就补上 cloudId 并标记
                     // cloudLoaded（消息本地已有，不需要再拉云端内容覆盖）。
-                    const candidates = this.conversations.filter((c) => !c.cloudId && !c.cloudLinked && (c.title || '').trim() === title)
+                    const candidates = this.conversations.filter((c) => !c.cloudId && !c.cloudLinked && (c.title || '').trim() === title);
                     if (candidates.length) {
-                        let best = candidates[0]
-                        let bestDiff = Math.abs((best.updatedAt || 0) - ts)
+                        let best = candidates[0];
+                        let bestDiff = Math.abs((best.updatedAt || 0) - ts);
                         for (const c of candidates) {
-                            const diff = Math.abs((c.updatedAt || 0) - ts)
+                            const diff = Math.abs((c.updatedAt || 0) - ts);
                             if (diff < bestDiff) {
-                                best = c
-                                bestDiff = diff
+                                best = c;
+                                bestDiff = diff;
                             }
                         }
-                        best.cloudId = s.id
-                        best.cloudLinked = true
-                        best.cloudLoaded = true
-                        linked += 1
+                        best.cloudId = s.id;
+                        best.cloudLinked = true;
+                        best.cloudLoaded = true;
+                        linked += 1;
                         continue
                     }
                     // 模型已合并：云端 model_type 无论是 default/expert/vision 都映射到唯一模式
-                    const mode = MODES[0].key
+                    const mode = MODES[0].key;
                     this.conversations.push({
                         id: uid('c'),
                         title: title.slice(0, 30),
@@ -601,107 +881,108 @@ export default {
                         updatedAt: ts,
                         cloudId: s.id,
                         cloudLoaded: false
-                    })
-                    added += 1
+                    });
+                    added += 1;
                 }
-                this.conversations.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
+                this.conversations.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
                 if (added > 0 || linked > 0) {
-                    await saveConversations(this.conversations)
+                    await saveConversations(this.conversations);
                 }
                 // 已关联的会话不再计入"导入"：认领只是给本地会话补云端身份，没有新增条目
                 this.syncMsg = added > 0
                     ? ('已导入 ' + added + ' 个云端会话（进入时加载内容）' + (linked ? '，关联 ' + linked + ' 个本地会话' : ''))
-                    : (linked > 0 ? ('已关联 ' + linked + ' 个本地会话，无重复导入') : '云端会话均已存在')
-                appLog('[sync] 云端会话 ' + list.length + ' 个，新增 ' + added + '，关联 ' + linked)
+                    : (linked > 0 ? ('已关联 ' + linked + ' 个本地会话，无重复导入') : '云端会话均已存在');
+                appLog('[sync] 云端会话 ' + list.length + ' 个，新增 ' + added + '，关联 ' + linked);
             } catch (e) {
-                this.syncMsg = '同步失败：' + (e && e.message ? e.message : '未知错误')
-                const msg = e && e.message ? e.message : String(e)
+                this.syncMsg = '同步失败：' + (e && e.message ? e.message : '未知错误');
+                const msg = e && e.message ? e.message : String(e);
                 if (isAccountSuspension(msg)) {
-                    recordAccountTrouble('同步', msg)
+                    recordAccountTrouble('同步', msg);
                 }
-                appLog('[sync] 失败 ' + msg)
+                appLog('[sync] 失败 ' + msg);
             }
-            this.syncing = false
-            this.$forceUpdate()
+            this.syncing = false;
+            this.$forceUpdate();
         },
 
         // 进入带 cloudId 的空会话时，按需拉取云端消息内容（一次性）
         async ensureCloudMessages(conv) {
+            if (!BUILTIN_AUTH_ENABLED) return
             if (!conv || !conv.cloudId || conv.cloudLoaded) return
-            this._cloudLoading = this._cloudLoading || {}
+            this._cloudLoading = this._cloudLoading || {};
             if (this._cloudLoading[conv.id]) return
-            this._cloudLoading[conv.id] = true
-            this.cloudLoadingId = conv.id
-            this.$forceUpdate()
+            this._cloudLoading[conv.id] = true;
+            this.cloudLoadingId = conv.id;
+            this.$forceUpdate();
             try {
                 const list = await listCloudSessionMessages({
-                    baseUrl: this.settings.baseUrl,
+                    baseUrl: this.apiBaseUrl,
                     apiKey: this.settings.apiKey,
                     authMode: this.settings.authMode,
                     sessionId: conv.cloudId
-                })
-                const convNow = this.conversations.find((c) => c.id === conv.id)
+                });
+                const convNow = this.conversations.find((c) => c.id === conv.id);
                 if (!convNow) return
-                const now = Date.now()
-                const msgs = []
-                let seq = 0
+                const now = Date.now();
+                const msgs = [];
+                let seq = 0;
                 for (const m of list) {
                     if (m.role === 'user') {
-                        const id = uid('u')
+                        const id = uid('u');
                         // 云端编辑历史：alt_texts 是被替换的旧版本（升序），当前
                         // content 是最新——与本地 revisions 的语义一致
                         // （revisions[activeRevision] 为当前显示版本）。
-                        const alts = Array.isArray(m.alt_texts) ? m.alt_texts : []
+                        const alts = Array.isArray(m.alt_texts) ? m.alt_texts : [];
                         msgs.push({
                             id, role: 'user', content: m.content, images: [], createdAt: now + seq++,
                             revisions: alts.map((t) => ({ content: t, images: [], createdAt: now + seq }))
                                 .concat([{ content: m.content, images: [], createdAt: now + seq }]),
                             activeRevision: alts.length
-                        })
+                        });
                     } else {
-                        const id = uid('a')
+                        const id = uid('a');
                         // 云端重试历史同理映射为 attempts（attempts[activeAttempt]
                         // 为当前版本，本地 retryMessage 就是往 attempts 追加）。
-                        const alts = Array.isArray(m.alt_texts) ? m.alt_texts : []
+                        const alts = Array.isArray(m.alt_texts) ? m.alt_texts : [];
                         msgs.push({
                             id, role: 'assistant', content: m.content, reasoning: m.reasoning || '', pending: false,
                             createdAt: now + seq++,
                             attempts: alts.map((t) => ({ id: uid('a'), content: t, reasoning: '', pending: false, createdAt: now + seq }))
                                 .concat([{ id, content: m.content, reasoning: m.reasoning || '', pending: false, createdAt: now + seq }]),
                             activeAttempt: alts.length
-                        })
+                        });
                     }
                 }
-                convNow.cloudLoaded = true
-                await saveConversations(this.conversations)
+                convNow.cloudLoaded = true;
+                await saveConversations(this.conversations);
                 if (msgs.length && this.activeId === conv.id) {
-                    this.messages = msgs
-                    await saveMessages(conv.id, this.messages)
-                    this.$forceUpdate()
-                    this.scrollToBottom()
+                    this.messages = msgs;
+                    await saveMessages(conv.id, this.messages);
+                    this.$forceUpdate();
+                    this.scrollToBottom();
                 }
-                appLog('[cloud] 已加载云端会话内容 ' + msgs.length + ' 条: ' + conv.title)
+                appLog('[cloud] 已加载云端会话内容 ' + msgs.length + ' 条: ' + conv.title);
             } catch (e) {
                 // 静默失败：保留占位会话，下次进入重试
-                const msg = e && e.message ? e.message : String(e)
+                const msg = e && e.message ? e.message : String(e);
                 if (isAccountSuspension(msg)) {
-                    recordAccountTrouble('云端内容', msg)
+                    recordAccountTrouble('云端内容', msg);
                 }
-                appLog('[cloud] 拉取云端会话内容失败 ' + msg)
+                appLog('[cloud] 拉取云端会话内容失败 ' + msg);
             } finally {
-                this._cloudLoading[conv.id] = false
+                this._cloudLoading[conv.id] = false;
                 if (this.cloudLoadingId === conv.id) {
-                    this.cloudLoadingId = ''
+                    this.cloudLoadingId = '';
                 }
-                this.$forceUpdate()
+                this.$forceUpdate();
             }
         },
         // 首条消息派生会话标题（#9 本地兜底；后端 dsTitle 可用时会被覆盖）
         deriveTitle(text, imgCount) {
-            const t = (text || '').replace(/\s+/g, ' ').trim()
+            const t = (text || '').replace(/\s+/g, ' ').trim();
             if (t) {
-                const cut = t.slice(0, 20)
-                const m = cut.match(/^(.+?[，。？！、；：,.!?;:])/)
+                const cut = t.slice(0, 20);
+                const m = cut.match(/^(.+?[，。？！、；：,.!?;:])/);
                 return (m ? m[1] : cut) + (t.length > 20 ? '…' : '')
             }
             return imgCount > 0 ? '图片对话' : '新对话'
@@ -721,11 +1002,11 @@ export default {
         markdownBlocks(content, final = true) {
             if (!content) return []
             if (!final) return markdownToBlocks(content)
-            const cache = this._mdCache || (this._mdCache = new Map())
+            const cache = this._mdCache || (this._mdCache = new Map());
             if (cache.has(content)) return cache.get(content)
-            const blocks = markdownToBlocks(content)
-            if (cache.size > 400) cache.clear()
-            cache.set(content, blocks)
+            const blocks = markdownToBlocks(content);
+            if (cache.size > 400) cache.clear();
+            cache.set(content, blocks);
             return blocks
         },
         // 行内 run 列表：把一段文本拆成 [{ text, bold?, italic?, code?, emoji }]，
@@ -739,13 +1020,13 @@ export default {
         // 曾经的写法是 <text :class="spanClass(s)"><text :class="emojiRunClass(...)">…，
         // 正好踩中这个断言。现在两层合一层，run 之间平级。
         mdRuns(text, final = true) {
-            const key = String(text === undefined || text === null ? '' : text)
+            const key = String(text === undefined || text === null ? '' : text);
             if (!final) return this._buildRuns(key, false)
-            const cache = this._runCache || (this._runCache = new Map())
+            const cache = this._runCache || (this._runCache = new Map());
             if (cache.has(key)) return cache.get(key)
-            const result = this._buildRuns(key, true)
-            if (cache.size > 600) cache.clear()
-            cache.set(key, result)
+            const result = this._buildRuns(key, true);
+            if (cache.size > 600) cache.clear();
+            cache.set(key, result);
             return result
         },
         // 实际转换：先按 markdown 行内语法切 span，再把每个 span 按 emoji 区段切 run，
@@ -756,32 +1037,32 @@ export default {
         // 超长公式被截断（不换行），括号不配平的中间态渲染成空白。其余情况一律回退
         // Unicode（latexToText），内容完整且能换行——宁可朴素，不要显示半截或空白。
         _buildRuns(text, final = true) {
-            const src = String(text === undefined || text === null ? '' : text)
-            const runs = []
-            const segs = splitMathSegments(src)
+            const src = String(text === undefined || text === null ? '' : text);
+            const runs = [];
+            const segs = splitMathSegments(src);
             for (let k = 0; k < segs.length; k++) {
-                const seg = segs[k]
+                const seg = segs[k];
                 if (seg.math) {
                     if (final && canTypesetMath(seg.text)) {
-                        runs.push({ text: seg.text, math: true })
+                        runs.push({ text: seg.text, math: true });
                     } else if (!bracesBalanced(seg.text)) {
                         // 括号不配平（流式中间态 / 模型笔误）：原生排成空白、Unicode
                         // 会把 \frac 啃成 "frac" 拼出错字。原样显示源码最诚实，且
                         // 流式下一帧就变正常，不会停留。
-                        runs.push({ text: '$' + seg.text + '$', code: true })
+                        runs.push({ text: '$' + seg.text + '$', code: true });
                     } else {
                         // 超长等其它情况：Unicode 近似（内容完整、可换行，只是不精确）
-                        const uni = latexToText('$' + seg.text + '$')
-                        if (uni) runs.push({ text: uni })
+                        const uni = latexToText('$' + seg.text + '$');
+                        if (uni) runs.push({ text: uni });
                     }
                     continue
                 }
-                const spans = inlineSpans(seg.text)
+                const spans = inlineSpans(seg.text);
                 for (let i = 0; i < spans.length; i++) {
-                    const s = spans[i]
+                    const s = spans[i];
                     // emoji 替换只改显示层：字体可用时用原文，否则把 emoji 换成文字标签
-                    const source = this._emojiFontActive ? s.text : substituteEmoji(s.text)
-                    const pieces = splitEmojiRuns(source)
+                    const source = this._emojiFontActive ? s.text : substituteEmoji(s.text);
+                    const pieces = splitEmojiRuns(source);
                     for (let j = 0; j < pieces.length; j++) {
                         if (!pieces[j].t) continue
                         runs.push({
@@ -790,22 +1071,22 @@ export default {
                             italic: !!s.italic,
                             code: !!s.code,
                             emoji: !!pieces[j].e
-                        })
+                        });
                     }
                 }
             }
-            if (runs.length === 0) runs.push({ text: '' })
+            if (runs.length === 0) runs.push({ text: '' });
             return runs
         },
         // run 的 class：行内样式 + emoji 字体（字体可用时才套，否则已经是文字标签）
         // forceStrike：任务列表已完成项整条加删除线（√ + 删除线传达"完成"）
         runClass(r, forceStrike) {
-            let s = r
+            let s = r;
             if (forceStrike && r && !r.math && !r.code) {
-                s = { text: r.text, bold: r.bold, italic: r.italic, code: r.code, strike: true }
+                s = { text: r.text, bold: r.bold, italic: r.italic, code: r.code, strike: true };
             }
-            let cls = this.spanClass(s)
-            if (r && r.emoji && this._emojiFontActive) cls += ' md-emoji'
+            let cls = this.spanClass(s);
+            if (r && r.emoji && this._emojiFontActive) cls += ' md-emoji';
             return cls
         },
         // 块级公式是否交给原生排版（过长/括号不配平 → 回退，见 canTypesetMath）
@@ -819,15 +1100,15 @@ export default {
         // 数学公式（LaTeX）在此转成 Unicode 纯文本——这些路径不经过 inlineSpans，
         // 不转换就会把 $x^{2}$ 原样显示出来（bug 2）。
         dispText(text) {
-            const key = String(text === undefined || text === null ? '' : text)
-            const withMath = latexToText(key)
+            const key = String(text === undefined || text === null ? '' : text);
+            const withMath = latexToText(key);
             return this._emojiFontActive ? withMath : substituteEmoji(withMath)
         },
         spanStyle(s) {
-            let st = ''
-            if (s.bold) st += 'font-weight:bold;'
-            if (s.italic) st += 'font-style:italic;'
-            if (s.code) st += 'font-family:monospace;'
+            let st = '';
+            if (s.bold) st += 'font-weight:bold;';
+            if (s.italic) st += 'font-style:italic;';
+            if (s.code) st += 'font-family:monospace;';
             return st
         },
         // bug 修复（深色黑字）：Weex 的 <div> 颜色不会可靠继承到 <text>，
@@ -845,7 +1126,7 @@ export default {
         // 列表 marker：任务项 √/□（√ 是数学符号 U+221A，设备数学字体必有；
         // □ U+25A1 CJK 字体常带——避开缺字形的 emoji 字符），普通项沿用原符号
         listMarker(block, ii) {
-            const st = block.taskStates && block.taskStates[ii]
+            const st = block.taskStates && block.taskStates[ii];
             if (st === 'done') return '√ '
             if (st === 'open') return '□ '
             return block.ordered ? ((block.start || 1) + ii) + '. ' : '• '
@@ -855,7 +1136,7 @@ export default {
         },
         // 表格列对齐：GFM 分隔行解析出的 left/center/right 套到单元格文字上
         mdAlign(align, ci) {
-            const a = (align && align[ci]) || 'left'
+            const a = (align && align[ci]) || 'left';
             return 'text-align:' + a
         },
 
@@ -874,55 +1155,55 @@ export default {
         },
         prevUserVersion(m) {
             if (this.sending || !m || !m.revisions || m.revisions.length <= 1) return
-            m.activeRevision = (m.activeRevision || 0) - 1
-            if (m.activeRevision < 0) m.activeRevision = m.revisions.length - 1
-            this.applyUserVersion(m)
+            m.activeRevision = (m.activeRevision || 0) - 1;
+            if (m.activeRevision < 0) m.activeRevision = m.revisions.length - 1;
+            this.applyUserVersion(m);
         },
         nextUserVersion(m) {
             if (this.sending || !m || !m.revisions || m.revisions.length <= 1) return
-            m.activeRevision = (m.activeRevision || 0) + 1
-            if (m.activeRevision >= m.revisions.length) m.activeRevision = 0
-            this.applyUserVersion(m)
+            m.activeRevision = (m.activeRevision || 0) + 1;
+            if (m.activeRevision >= m.revisions.length) m.activeRevision = 0;
+            this.applyUserVersion(m);
         },
         applyUserVersion(m) {
-            const rev = m.revisions[m.activeRevision]
+            const rev = m.revisions[m.activeRevision];
             if (rev) {
-                m.content = rev.content || ''
-                m.images = rev.images || []
+                m.content = rev.content || '';
+                m.images = rev.images || [];
             }
-            this.$forceUpdate()
-            this.saveCurrentMessages()
+            this.$forceUpdate();
+            this.saveCurrentMessages();
         },
         prevAssistantAttempt(m) {
             if (this.sending || !m || !m.attempts || m.attempts.length <= 1) return
-            m.activeAttempt = (m.activeAttempt || 0) - 1
-            if (m.activeAttempt < 0) m.activeAttempt = m.attempts.length - 1
-            this.applyAssistantAttempt(m)
+            m.activeAttempt = (m.activeAttempt || 0) - 1;
+            if (m.activeAttempt < 0) m.activeAttempt = m.attempts.length - 1;
+            this.applyAssistantAttempt(m);
         },
         nextAssistantAttempt(m) {
             if (this.sending || !m || !m.attempts || m.attempts.length <= 1) return
-            m.activeAttempt = (m.activeAttempt || 0) + 1
-            if (m.activeAttempt >= m.attempts.length) m.activeAttempt = 0
-            this.applyAssistantAttempt(m)
+            m.activeAttempt = (m.activeAttempt || 0) + 1;
+            if (m.activeAttempt >= m.attempts.length) m.activeAttempt = 0;
+            this.applyAssistantAttempt(m);
         },
         applyAssistantAttempt(m) {
-            const att = m.attempts[m.activeAttempt]
+            const att = m.attempts[m.activeAttempt];
             if (att) {
-                m.content = att.content || ''
-                m.reasoning = att.reasoning || ''
-                m.error = att.error || ''
+                m.content = att.content || '';
+                m.reasoning = att.reasoning || '';
+                m.error = att.error || '';
                 // errorCode 必须跟着切：重试按钮靠它判断"这条是限流失败"，
                 // 漏掉会让用户切到成功的版本后重试仍被拦（或反之放行）（bug 1）
-                m.errorCode = att.errorCode || ''
-                m.pending = !!att.pending
+                m.errorCode = att.errorCode || '';
+                m.pending = !!att.pending;
             }
-            this.$forceUpdate()
-            this.saveCurrentMessages()
+            this.$forceUpdate();
+            this.saveCurrentMessages();
         },
         async saveCurrentMessages() {
             if (!this.activeId) return
             try {
-                await saveMessages(this.activeId, this.messages)
+                await saveMessages(this.activeId, this.messages);
             } catch (e) { /* 忽略 */ }
         },
 
@@ -935,120 +1216,129 @@ export default {
             ensureEmojiFont()
                 .then((r) => {
                     if (r.ok) {
-                        this._emojiFontActive = true
+                        this._emojiFontActive = true;
                         // run 缓存里存的是「按当时字体可用性构建」的结果，字体状态一变就得整表清掉
-                        if (this._runCache) this._runCache.clear()
-                        this.$forceUpdate()
+                        if (this._runCache) this._runCache.clear();
+                        this.$forceUpdate();
                         return
                     }
                     // 失败原因写日志：开关显示"已开启"但只渲染出白块时，
                     // 用户能在"查看日志"里看到到底是设备不支持还是下载失败。
-                    this._emojiFontActive = false
-                    appLog('[index] emoji 字体不可用（已用文字替换 emoji）：' + (r.message || '未知原因'))
+                    this._emojiFontActive = false;
+                    appLog('[index] emoji 字体不可用（已用文字替换 emoji）：' + (r.message || '未知原因'));
                 })
                 .catch((e) => {
-                    this._emojiFontActive = false
-                    appLog('[index] emoji 字体异常：' + (e && e.message ? e.message : String(e)))
-                })
+                    this._emojiFontActive = false;
+                    appLog('[index] emoji 字体异常：' + (e && e.message ? e.message : String(e)));
+                });
         },
         setDebugLog() {
             try {
-                setDebugLogEnabled(!!(this.settings && this.settings.debugLog))
+                setDebugLogEnabled(!!(this.settings && this.settings.debugLog));
             } catch (e) { /* 忽略 */ }
         },
         // 兜底拉起后端（startup 页若未执行 ensureBackendRunning 时启用）
         async ensureBackend() {
+            // 账号登录模式已暂停：不部署、不拉起、不探测任何本机后端
+            if (!BUILTIN_AUTH_ENABLED) return
             // 自定义端点模式不依赖本机后端，别去部署/重启它
             if (this.settings && this.settings.authMode && this.settings.authMode !== 'builtin') return
             if (this._backendEnsuring) return
-            this._backendEnsuring = true
+            this._backendEnsuring = true;
             try {
-                const result = await ensureBackendRunning()
-                appLog('[index] ensureBackend 结果 ok=' + result.ok + ' msg=' + (result.message || '') + ' code=' + (result.code || ''))
+                const result = await ensureBackendRunning();
+                appLog('[index] ensureBackend 结果 ok=' + result.ok + ' msg=' + (result.message || '') + ' code=' + (result.code || ''));
                 if (result.ok) {
                     // 成功后清除断开标志（自愈完成）
                     if (this.backendDisconnected) {
-                        this.backendDisconnected = false
-                        this.$forceUpdate()
+                        this.backendDisconnected = false;
+                        this.$forceUpdate();
                     }
                 } else if (this.backendDisconnected !== true) {
-                    this.backendDisconnected = true
-                    this.$forceUpdate()
+                    this.backendDisconnected = true;
+                    this.$forceUpdate();
                 }
             } catch (e) {
-                appLog('[index] ensureBackend 异常 ' + (e && e.message ? e.message : String(e)))
+                appLog('[index] ensureBackend 异常 ' + (e && e.message ? e.message : String(e)));
             } finally {
-                this._backendEnsuring = false
+                this._backendEnsuring = false;
             }
         },
         async init() {
-            this.settings = await loadSettings()
-            this.cacheTheme()
-            appLog('[index] init theme=' + (this.settings && this.settings.theme) + ' isDark=' + this.isDark + ' authMode=' + (this.settings && this.settings.authMode))
+            this.settings = await loadSettings();
+            this.cacheTheme();
+            appLog('[index] init theme=' + (this.settings && this.settings.theme) + ' isDark=' + this.isDark + ' authMode=' + (this.settings && this.settings.authMode));
             // 未登录兜底：内置模式且没有任何账号时，引导到专用登录页
             // （正常路径由 startup 页判断；这里防御直接进入 index 的情况）
-            if (this.settings && this.settings.authMode === 'builtin' && !this.settings.dsConfigured) {
-                appLog('[index] 未配置账号，跳转登录页')
+            if (BUILTIN_AUTH_ENABLED && this.settings && this.settings.authMode === 'builtin' && !this.settings.dsConfigured) {
+                appLog('[index] 未配置账号，跳转登录页');
                 try {
-                    $falcon.navTo('login')
+                    $falcon.navTo('login');
                 } catch (e) { /* 忽略 */ }
                 return
             }
-            this.setDebugLog()
-            this.ensureEmojiFontIfEnabled()
+            this.setDebugLog();
+            this.ensureEmojiFontIfEnabled();
             // 兜底拉起后端：startup 页可能因生命周期问题从未执行 ensureBackendRunning，
             // 这里确保后端一定被部署并启动（不阻塞 UI 渲染）
-            this.ensureBackend()
-            this.conversations = (await loadConversations()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
-            this.activeId = await loadActiveId()
+            this.ensureBackend();
+            this.conversations = (await loadConversations()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+            this.activeId = await loadActiveId();
             if (!this.activeId || !this.conversations.some((c) => c.id === this.activeId)) {
-                this.activeId = this.conversations.length ? this.conversations[0].id : null
+                this.activeId = this.conversations.length ? this.conversations[0].id : null;
             }
             if (this.activeId) {
-                this.messages = await loadMessages(this.activeId)
-                const conv = this.activeConversation()
+                this.messages = await loadMessages(this.activeId);
+                const conv = this.activeConversation();
                 if (conv) {
-                    this.modeKey = conv.mode
-                    this.thinking = conv.thinking
-                    this.search = conv.search
+                    this.modeKey = conv.mode;
+                    this.thinking = conv.thinking;
+                    this.search = conv.search;
                 }
             } else {
-                this.messages = []
-                this.modeKey = this.settings.defaultMode
-                this.thinking = this.settings.defaultThinking
-                this.search = this.settings.defaultSearch
+                this.messages = [];
+                this.modeKey = this.settings.defaultMode;
+                this.thinking = this.settings.defaultThinking;
+                this.search = this.settings.defaultSearch;
             }
-            this.$forceUpdate()
+            // 上游模式：云控（公告/维护/更新）与配额；本地为空时尝试从云端恢复
+            if (this.upstreamMode) {
+                this.refreshCloudControl(false, true);
+                this.restoreCloudIfEmpty();
+            }
+            this.$forceUpdate();
         },
         async onPageShow() {
             // 从设置页返回时刷新设置与会话列表（可能被清空）
-            this.settings = await loadSettings()
-            this.cacheTheme()
-            this.setDebugLog()
-            this.ensureEmojiFontIfEnabled()
+            this.settings = await loadSettings();
+            this.cacheTheme();
+            this.setDebugLog();
+            this.ensureEmojiFontIfEnabled();
             if (this.sending) {
                 // 发送中：不重载消息数组，避免 pending 消息被覆盖导致"正在思考"卡住
                 return
             }
-            this.conversations = (await loadConversations()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
+            this.conversations = (await loadConversations()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
             if (!this.activeId || !this.conversations.some((c) => c.id === this.activeId)) {
-                this.activeId = this.conversations.length ? this.conversations[0].id : null
+                this.activeId = this.conversations.length ? this.conversations[0].id : null;
                 if (this.activeId) {
-                    this.messages = await loadMessages(this.activeId)
-                    const conv = this.activeConversation()
+                    this.messages = await loadMessages(this.activeId);
+                    const conv = this.activeConversation();
                     if (conv) {
-                        this.modeKey = conv.mode
-                        this.thinking = conv.thinking
-                        this.search = conv.search
+                        this.modeKey = conv.mode;
+                        this.thinking = conv.thinking;
+                        this.search = conv.search;
                     }
                 } else {
-                    this.messages = []
-                    this.modeKey = this.settings.defaultMode
-                    this.thinking = this.settings.defaultThinking
-                    this.search = this.settings.defaultSearch
+                    this.messages = [];
+                    this.modeKey = this.settings.defaultMode;
+                    this.thinking = this.settings.defaultThinking;
+                    this.search = this.settings.defaultSearch;
                 }
             }
-            this.$forceUpdate()
+            // 从设置页返回：策略可能被改过（例如刚跳过更新/刚反馈），静默刷新一次
+            if (this.upstreamMode) this.refreshCloudControl(true, false);
+            this.$forceUpdate();
         },
 
         // ---------- 派生状态 ----------
@@ -1093,23 +1383,23 @@ export default {
             return this.isDark ? 'icons/camera-dark.png' : 'icons/camera.png'
         },
         isLastAssistant(m) {
-            const last = this.messages[this.messages.length - 1]
+            const last = this.messages[this.messages.length - 1];
             return m === last && !m.pending
         },
 
         // ---------- 会话管理 ----------
         toggleDrawer() {
-            this.showDrawer = !this.showDrawer
-            if (!this.showDrawer) this.syncMsg = ''
-            this.$forceUpdate()
+            this.showDrawer = !this.showDrawer;
+            if (!this.showDrawer) this.syncMsg = '';
+            this.$forceUpdate();
         },
         // applyDefaults=true（"＋新对话"按钮）：设置里的默认深度思考/默认联网搜索
         // 在此刻生效一次；false（空态直接发送）：沿用当前开关（尊重用户已拨状态）
         async newConversation(applyDefaults = false) {
-            this.reqSeq += 1
+            this.reqSeq += 1;
             if (applyDefaults) {
-                this.thinking = this.settings.defaultThinking
-                this.search = this.settings.defaultSearch
+                this.thinking = this.settings.defaultThinking;
+                this.search = this.settings.defaultSearch;
             }
             const conv = {
                 id: uid('c'),
@@ -1119,147 +1409,154 @@ export default {
                 search: this.search,
                 createdAt: Date.now(),
                 updatedAt: Date.now()
-            }
-            this.conversations = [conv].concat(this.conversations)
-            await saveConversations(this.conversations)
-            this.activeId = conv.id
-            await saveActiveId(conv.id)
-            this.messages = []
-            this.modeKey = conv.mode
-            this.thinking = conv.thinking
-            this.search = conv.search
-            this.editingMsgId = null
-            this.draft = ''
-            this.draftImages = []
-            this.showDrawer = false
-            this.syncMsg = ''
-            this.convFilter = ''
-            this.$forceUpdate()
+            };
+            this.conversations = [conv].concat(this.conversations);
+            await saveConversations(this.conversations);
+            this.activeId = conv.id;
+            await saveActiveId(conv.id);
+            this.messages = [];
+            this.modeKey = conv.mode;
+            this.thinking = conv.thinking;
+            this.search = conv.search;
+            this.editingMsgId = null;
+            this.draft = '';
+            this.draftImages = [];
+            this.showDrawer = false;
+            this.syncMsg = '';
+            this.convFilter = '';
+            this.$forceUpdate();
         },
         async switchConversation(id) {
             if (id === this.activeId) {
-                this.showDrawer = false
+                this.showDrawer = false;
                 return
             }
-            this.reqSeq += 1
-            this.activeId = id
-            await saveActiveId(id)
-            this.messages = await loadMessages(id)
-            const conv = this.activeConversation()
+            this.reqSeq += 1;
+            this.activeId = id;
+            await saveActiveId(id);
+            this.messages = await loadMessages(id);
+            const conv = this.activeConversation();
             if (conv) {
-                this.modeKey = conv.mode
-                this.thinking = conv.thinking
-                this.search = conv.search
+                this.modeKey = conv.mode;
+                this.thinking = conv.thinking;
+                this.search = conv.search;
                 // #10：云端同步的占位会话，进入时按需拉取消息内容
-                this.ensureCloudMessages(conv)
+                this.ensureCloudMessages(conv);
             }
-            this.editingMsgId = null
-            this.draft = ''
-            this.draftImages = []
-            this.showDrawer = false
-            this.syncMsg = ''
-            this.$forceUpdate()
+            this.editingMsgId = null;
+            this.draft = '';
+            this.draftImages = [];
+            this.showDrawer = false;
+            this.syncMsg = '';
+            this.$forceUpdate();
             // 切换会话不滚到底：短会话会被"锚点对齐上沿"式滚动把气泡滚出
             // 视口（只剩"重试"按钮），历史会话从头看更自然
         },
         async deleteConversation(c) {
-            this.reqSeq += 1
-            const cloudId = c && c.cloudId
-            this.conversations = this.conversations.filter((x) => x.id !== c.id)
-            await saveConversations(this.conversations)
-            await deleteMessages(c.id)
+            this.reqSeq += 1;
+            const cloudId = c && c.cloudId;
+            this.conversations = this.conversations.filter((x) => x.id !== c.id);
+            await saveConversations(this.conversations);
+            await deleteMessages(c.id);
             if (this.activeId === c.id) {
-                this.activeId = this.conversations.length ? this.conversations[0].id : null
-                await saveActiveId(this.activeId)
+                this.activeId = this.conversations.length ? this.conversations[0].id : null;
+                await saveActiveId(this.activeId);
                 if (this.activeId) {
-                    this.messages = await loadMessages(this.activeId)
-                    const conv = this.activeConversation()
+                    this.messages = await loadMessages(this.activeId);
+                    const conv = this.activeConversation();
                     if (conv) {
-                        this.modeKey = conv.mode
-                        this.thinking = conv.thinking
-                        this.search = conv.search
+                        this.modeKey = conv.mode;
+                        this.thinking = conv.thinking;
+                        this.search = conv.search;
                     }
                 } else {
-                    this.messages = []
-                    this.modeKey = this.settings.defaultMode
-                    this.thinking = this.settings.defaultThinking
-                    this.search = this.settings.defaultSearch
+                    this.messages = [];
+                    this.modeKey = this.settings.defaultMode;
+                    this.thinking = this.settings.defaultThinking;
+                    this.search = this.settings.defaultSearch;
                 }
-                this.draft = ''
-                this.draftImages = []
-                this.editingMsgId = null
+                this.draft = '';
+                this.draftImages = [];
+                this.editingMsgId = null;
             }
-            this.$forceUpdate()
-            // 同步删云端会话（bug 3）：只删本地的话，下次「同步」会把这条会话
-            // 从云端再导回来，用户看到"删了又回来"。失败不阻断本地删除
-            // （本地已经删掉了），只把原因写进提示，用户能自己决定要不要重试。
-            if (cloudId) {
-                this.deleteCloudConversation(cloudId, c.title)
+            this.$forceUpdate();
+            // 同步删云端会话（bug 3）：只删本地的话，下次「同步」/「从云端恢复」
+            // 会把这条会话再导回来，用户看到"删了又回来"。
+            // 上游模式：删的是会话备份（session-sync），失败不阻断本地删除。
+            if (this.upstreamMode) {
+                syncDelete({
+                    settings: this.settings,
+                    conversation: c,
+                    persist: () => saveSettings(this.settings)
+                });
+            } else if (cloudId) {
+                this.deleteCloudConversation(cloudId, c.title);
             }
         },
         // 删除远端会话：失败时把原因显示在抽屉的同步提示里（不弹窗打扰）
         async deleteCloudConversation(cloudId, title) {
+            if (!BUILTIN_AUTH_ENABLED) return
             try {
                 await deleteCloudSession({
-                    baseUrl: this.settings.baseUrl,
+                    baseUrl: this.apiBaseUrl,
                     apiKey: this.settings.apiKey,
                     authMode: this.settings.authMode,
                     sessionId: cloudId
-                })
-                appLog('[cloud] 已删除云端会话 ' + cloudId + '（' + (title || '') + '）')
+                });
+                appLog('[cloud] 已删除云端会话 ' + cloudId + '（' + (title || '') + '）');
             } catch (e) {
-                const msg = e && e.message ? e.message : String(e)
-                this.syncMsg = '本地已删除，云端删除失败：' + msg + '（下次同步可能重新出现）'
+                const msg = e && e.message ? e.message : String(e);
+                this.syncMsg = '本地已删除，云端删除失败：' + msg + '（下次同步可能重新出现）';
                 if (isAccountSuspension(msg)) {
-                    recordAccountTrouble('删除云端会话', msg)
+                    recordAccountTrouble('删除云端会话', msg);
                 }
-                appLog('[cloud] 删除云端会话失败 ' + msg)
-                this.$forceUpdate()
+                appLog('[cloud] 删除云端会话失败 ' + msg);
+                this.$forceUpdate();
             }
         },
         async persistConversation(conv) {
-            const exists = this.conversations.some((c) => c.id === conv.id)
+            const exists = this.conversations.some((c) => c.id === conv.id);
             this.conversations = exists
                 ? this.conversations.map((c) => (c.id === conv.id ? conv : c))
-                : [conv].concat(this.conversations)
-            await saveConversations(this.conversations)
+                : [conv].concat(this.conversations);
+            await saveConversations(this.conversations);
         },
 
         // ---------- 选项 ----------
         selectMode(key) {
             if (this.modeLocked()) return
-            this.modeKey = key
+            this.modeKey = key;
             // 模型已合并，单一模式即支持图片，切换模式不再需要清空待发图片。
-            const conv = this.activeConversation()
+            const conv = this.activeConversation();
             if (conv) {
-                conv.mode = key
-                this.persistConversation(conv)
+                conv.mode = key;
+                this.persistConversation(conv);
             }
-            this.$forceUpdate()
+            this.$forceUpdate();
         },
         toggleClass(v) {
             return v ? this.dc('top-toggle-on') : this.dc('top-toggle')
         },
         toggleThinking() {
-            if (this.sending) return
-            this.thinking = !this.thinking
+            if (this.sending || !this.featThinking) return
+            this.thinking = !this.thinking;
             // 会话创建后开关只属于该会话（持久化），不再受设置默认值影响
-            const conv = this.activeConversation()
+            const conv = this.activeConversation();
             if (conv) {
-                conv.thinking = this.thinking
-                this.persistConversation(conv)
+                conv.thinking = this.thinking;
+                this.persistConversation(conv);
             }
-            this.$forceUpdate()
+            this.$forceUpdate();
         },
         toggleSearch() {
-            if (this.sending) return
-            this.search = !this.search
-            const conv = this.activeConversation()
+            if (this.sending || !this.featSearch) return
+            this.search = !this.search;
+            const conv = this.activeConversation();
             if (conv) {
-                conv.search = this.search
-                this.persistConversation(conv)
+                conv.search = this.search;
+                this.persistConversation(conv);
             }
-            this.$forceUpdate()
+            this.$forceUpdate();
         },
 
         // ---------- 输入 ----------
@@ -1268,69 +1565,75 @@ export default {
             // 实测（计算器 v1.12.103 反编译 + 真机）：用默认 ZhCNPreferred 即可带出系统输入法的语音/录音按钮；
             // RecordPreferred 与底部滑动手势关联（y03 主题特有），在本机不触发语音按钮，弃用。
             // Bug 4 修复：将当前 draft 作为预填充文本传给输入法，修改消息时编辑器能显示原文。
-            const text = await openTextEditor(INPUT_TYPES.ZH_CN_PREFERRED, this.draft || '')
+            const text = await openTextEditor(INPUT_TYPES.ZH_CN_PREFERRED, this.draft || '');
             if (text === null) return
             // 编辑器返回：null=取消；字符串=确认后结果（含空串"清空"）。直接覆盖 draft。
-            this.draft = text || ''
-            this.$forceUpdate()
+            this.draft = text || '';
+            this.$forceUpdate();
         },
 
         // ---------- 发送 / 重试 / 修改 ----------
         // 发送前的本地校验失败提示（不写入消息，避免污染会话）
         failSend(text) {
-            this.imageWarn = text
-            this.$forceUpdate()
-            try { appLog('[send] 已阻断：' + text) } catch (e) { /* 忽略 */ }
+            this.imageWarn = text;
+            this.$forceUpdate();
+            try { appLog('[send] 已阻断：' + text); } catch (e) { /* 忽略 */ }
         },
         async send() {
             if (this.sending) {
-                this.stopGeneration()
+                this.stopGeneration();
                 return
             }
-            const text = (this.draft || '').trim()
+            // 云控三连：维护 / 强制更新 / 额度用尽时直接拦住，不发请求
+            if (this.chatDisabled || this.maintenanceOn || this.forceUpdateOn || this.quotaOut) {
+                if (this.forceUpdateOn) this.showUpdateModal = true;
+                this.$forceUpdate();
+                return
+            }
+            const text = (this.draft || '').trim();
             // 合并后的模型自带图片理解，图片随任意消息发送即可
-            const images = this.draftImages || []
+            const images = this.draftImages || [];
             if (!text && images.length === 0) return
 
             // 等待后台预压缩完成（若还没好），把 dataUrl 补进每个待发图片对象
-            await Promise.all(images.map((i) => i.pending || Promise.resolve()))
-            images.forEach((i) => { i.dataUrl = i.dataUrl || null })
-            const usable = images.filter((i) => i.dataUrl)
+            await Promise.all(images.map((i) => i.pending || Promise.resolve()));
+            images.forEach((i) => { i.dataUrl = i.dataUrl || null; });
+            const usable = images.filter((i) => i.dataUrl);
             if (images.length && !usable.length) {
                 // 全部图片都超限：别发空消息，直接告知原因
-                this.failSend('图片过大无法发送（单图上限约 900KB），请换一张或先裁剪')
+                this.failSend('图片过大无法发送（单图上限约 900KB），请换一张或先裁剪');
                 return
             }
             if (usable.length < images.length) {
-                this.imageWarn = '部分图片过大，无法发送（已跳过）'
+                this.imageWarn = '部分图片过大，无法发送（已跳过）';
             }
 
             if (!this.activeConversation()) {
-                await this.newConversation()
+                await this.newConversation();
             }
-            const conv = this.activeConversation()
-            const seq = ++this.reqSeq
-            const convId = conv.id
+            const conv = this.activeConversation();
+            const seq = ++this.reqSeq;
+            const convId = conv.id;
 
-            let pending = null
+            let pending = null;
             if (this.editingMsgId) {
-                const idx = this.messages.findIndex((m) => m.id === this.editingMsgId)
+                const idx = this.messages.findIndex((m) => m.id === this.editingMsgId);
                 if (idx >= 0) {
-                    const userMsg = this.messages[idx]
-                    const normalized = this.normalizeImages(images)
-                    const rev = { content: text, images: normalized, createdAt: Date.now() }
-                    if (!Array.isArray(userMsg.revisions)) userMsg.revisions = []
-                    userMsg.revisions.push(rev)
-                    userMsg.activeRevision = userMsg.revisions.length - 1
-                    userMsg.content = text
-                    userMsg.images = normalized
+                    const userMsg = this.messages[idx];
+                    const normalized = this.normalizeImages(images);
+                    const rev = { content: text, images: normalized, createdAt: Date.now() };
+                    if (!Array.isArray(userMsg.revisions)) userMsg.revisions = [];
+                    userMsg.revisions.push(rev);
+                    userMsg.activeRevision = userMsg.revisions.length - 1;
+                    userMsg.content = text;
+                    userMsg.images = normalized;
 
                     // Bug 修复：修改消息时，删除该消息之后的所有消息（实现分支逻辑）
                     // 用户修改消息 → 删除后续所有对话 → 从修改点重新生成
-                    this.messages = this.messages.slice(0, idx + 1)
+                    this.messages = this.messages.slice(0, idx + 1);
                     
                     // 创建新的助手消息（而不是复用旧的）
-                    const att = { id: uid('a'), content: '', reasoning: '', pending: true, createdAt: Date.now() }
+                    const att = { id: uid('a'), content: '', reasoning: '', pending: true, createdAt: Date.now() };
                     pending = {
                         id: uid('a'),
                         role: 'assistant',
@@ -1340,12 +1643,12 @@ export default {
                         createdAt: Date.now(),
                         attempts: [att],
                         activeAttempt: 0
-                    }
-                    this.messages.push(pending)
+                    };
+                    this.messages.push(pending);
                 }
-                this.editingMsgId = null
+                this.editingMsgId = null;
             } else {
-                const normalized = this.normalizeImages(images)
+                const normalized = this.normalizeImages(images);
                 const userMsg = {
                     id: uid('u'),
                     role: 'user',
@@ -1354,15 +1657,15 @@ export default {
                     createdAt: Date.now(),
                     revisions: [{ content: text, images: normalized, createdAt: Date.now() }],
                     activeRevision: 0
-                }
-                this.messages.push(userMsg)
+                };
+                this.messages.push(userMsg);
                 if (!conv.title || conv.title === '新对话') {
-                    conv.title = this.deriveTitle(text, images.length)
+                    conv.title = this.deriveTitle(text, images.length);
                 }
             }
 
             if (!pending) {
-                const att = { id: uid('a'), content: '', reasoning: '', pending: true, createdAt: Date.now() }
+                const att = { id: uid('a'), content: '', reasoning: '', pending: true, createdAt: Date.now() };
                 pending = {
                     id: uid('a'),
                     role: 'assistant',
@@ -1372,86 +1675,91 @@ export default {
                     createdAt: Date.now(),
                     attempts: [att],
                     activeAttempt: 0
-                }
-                this.messages.push(pending)
+                };
+                this.messages.push(pending);
             }
 
-            this.draft = ''
-            this.draftImages = []
-            this.imageWarn = ''
-            conv.updatedAt = Date.now()
-            await this.persistConversation(conv)
-            await saveMessages(convId, this.messages)
-            this.$forceUpdate()
-            this.scrollToBottom()
+            this.draft = '';
+            this.draftImages = [];
+            this.imageWarn = '';
+            conv.updatedAt = Date.now();
+            await this.persistConversation(conv);
+            await saveMessages(convId, this.messages);
+            this.$forceUpdate();
+            this.scrollToBottom();
 
-            await this.generate(conv, convId, seq, pending.id)
+            await this.generate(conv, convId, seq, pending.id);
         },
 
         async generate(conv, convId, seq, pendingId, forceThinking = false) {
-            this.sending = true
-            this.streamToken = null
+            this.sending = true;
+            this.streamToken = null;
             try {
-                const apiMessages = await buildMessages(this.messages, this.settings.systemPrompt)
-                console.error('GEN | built messages count=' + apiMessages.length)
+                const apiMessages = await buildMessages(this.messages, this.settings.systemPrompt);
+                console.error('GEN | built messages count=' + apiMessages.length);
+
+                // 配对模式：临期先刷新设备令牌（未配对返回 null，走旧行为）
+                const auth = await this.ensureFreshAuth();
 
                 const opts = {
-                    baseUrl: this.settings.baseUrl,
+                    baseUrl: this.apiBaseUrl,
                     apiKey: this.settings.apiKey,
                     modeKey: conv.mode,
                     messages: apiMessages,
                     thinking: forceThinking ? true : conv.thinking,
                     search: conv.search,
                     authMode: this.settings.authMode,
+                    backendMode: this.settings.backendMode,
                     modelId: this.settings.openaiModelId || '',
-                    conversationId: convId
-                }
+                    conversationId: convId,
+                    auth
+                };
 
                 // 流式（SSE）始终启用：逐字输出是设备上唯一可接受的体验，
                 // 非流式要等整段生成完才出字（开关已移除，见 store.js）
-                console.error('GEN | using SSE stream')
+                console.error('GEN | using SSE stream');
                 const res = await chatStream(opts, {
                     isCancelled: () => seq !== this.reqSeq || convId !== this.activeId,
-                    onToken: (token) => { this.streamToken = token },
+                    onToken: (token) => { this.streamToken = token; },
                     onDelta: (delta) => {
                         if (seq !== this.reqSeq || convId !== this.activeId) return
-                        const m = this.messages.find((x) => x.id === pendingId)
+                        const m = this.messages.find((x) => x.id === pendingId);
                         if (!m) return
-                        const att = m.attempts && m.attempts[m.activeAttempt]
+                        const att = m.attempts && m.attempts[m.activeAttempt];
                         if (att) {
-                            att.content = (att.content || '') + delta
-                            m.content = att.content
+                            att.content = (att.content || '') + delta;
+                            m.content = att.content;
                         } else {
-                            m.content = (m.content || '') + delta
+                            m.content = (m.content || '') + delta;
                         }
                         // 实时清洗内部标签，避免用户看到协议标签
                         if (m.content) {
-                            const cleaned = stripInternalTags(m.content)
+                            const cleaned = stripInternalTags(m.content);
                             if (cleaned !== m.content) {
-                                if (att) att.content = cleaned
-                                m.content = cleaned
+                                if (att) att.content = cleaned;
+                                m.content = cleaned;
                             }
                         }
-                        this.scheduleRender()
+                        this.scheduleRender();
                     },
                     onReasoning: (delta) => {
                         if (seq !== this.reqSeq || convId !== this.activeId) return
-                        const m = this.messages.find((x) => x.id === pendingId)
+                        const m = this.messages.find((x) => x.id === pendingId);
                         if (!m) return
-                        const att = m.attempts && m.attempts[m.activeAttempt]
+                        const att = m.attempts && m.attempts[m.activeAttempt];
                         if (att) {
-                            att.reasoning = (att.reasoning || '') + delta
-                            m.reasoning = att.reasoning
+                            att.reasoning = (att.reasoning || '') + delta;
+                            m.reasoning = att.reasoning;
                         } else {
-                            m.reasoning = (m.reasoning || '') + delta
+                            m.reasoning = (m.reasoning || '') + delta;
                         }
-                        this.scheduleRender()
+                        this.scheduleRender();
                     }
-                })
+                });
 
-                console.error('GEN | chat returned content len=' + (res && res.content ? res.content.length : 0))
+                console.error('GEN | chat returned content len=' + (res && res.content ? res.content.length : 0));
                 if (seq !== this.reqSeq || convId !== this.activeId) {
-                    console.error('GEN | seq mismatch, return (seq=' + seq + ' reqSeq=' + this.reqSeq + ' convId=' + convId + ' activeId=' + this.activeId + ')')
+                    console.error('GEN | seq mismatch, return (seq=' + seq + ' reqSeq=' + this.reqSeq + ' convId=' + convId + ' activeId=' + this.activeId + ')');
                     return
                 }
 
@@ -1459,18 +1767,18 @@ export default {
                 // 后端此时已让账号进入退避窗口；应用侧再自动发一次，就等于把
                 // 退避白等（bug 1：连续请求会被上游升级为禁言）。
                 if (res && res.rateLimited) {
-                    appLog('[generate] 上游限流，停止自动重试（' + (res.content || '') + '）')
-                    const rm = this.messages.find((x) => x.id === pendingId)
+                    appLog('[generate] 上游限流，停止自动重试（' + (res.content || '') + '）');
+                    const rm = this.messages.find((x) => x.id === pendingId);
                     if (rm) {
-                        const rAtt = rm.attempts && rm.attempts[rm.activeAttempt]
+                        const rAtt = rm.attempts && rm.attempts[rm.activeAttempt];
                         if (rAtt) {
-                            rAtt.pending = false
-                            rAtt.error = res.content || '上游限流，请稍后再试'
+                            rAtt.pending = false;
+                            rAtt.error = res.content || '上游限流，请稍后再试';
                         }
-                        rm.pending = false
-                        rm.error = res.content || '上游限流，请稍后再试'
+                        rm.pending = false;
+                        rm.error = res.content || '上游限流，请稍后再试';
                     }
-                    this.$forceUpdate()
+                    this.$forceUpdate();
                     return
                 }
 
@@ -1478,44 +1786,44 @@ export default {
                 // thinking=OFF 是唯一返回空内容的场景（疑似 DeepSeek 服务端兼容问题），
                 // 自动回退保证用户总能拿到回复；根因以诊断日志持续观察。
                 if (res && !res.content && !res.reasoning && conv.thinking === false && !forceThinking) {
-                    appLog('[generate] 非思考模式返回空内容（mode=' + conv.mode + ' search=' + conv.search + '），自动以思考模式重试 #12')
+                    appLog('[generate] 非思考模式返回空内容（mode=' + conv.mode + ' search=' + conv.search + '），自动以思考模式重试 #12');
                     return await this.generate(conv, convId, seq, pendingId, true)
                 }
 
                 // #9：会话自动命名——DeepSeek 在会话首条消息时下发自动生成的标题
                 // （dsTitle，与 thinking/search 开关无关），用它替换本地截断的标题
-                const convNow = this.conversations.find((c) => c.id === convId)
+                const convNow = this.conversations.find((c) => c.id === convId);
                 if (res && res.dsTitle && convNow) {
-                    const isFirstRound = this.messages.filter((x) => x.role === 'user').length <= 1
-                    const t = String(res.dsTitle).trim()
+                    const isFirstRound = this.messages.filter((x) => x.role === 'user').length <= 1;
+                    const t = String(res.dsTitle).trim();
                     if (t && isFirstRound && convNow.title !== t) {
-                        convNow.title = t.slice(0, 30)
-                        await this.persistConversation(convNow)
-                        appLog('[generate] 会话自动命名 => ' + convNow.title)
+                        convNow.title = t.slice(0, 30);
+                        await this.persistConversation(convNow);
+                        appLog('[generate] 会话自动命名 => ' + convNow.title);
                     }
                 }
                 // 云端会话 id（后端随流末尾下发）：记下来，同步时按 id 去重，
                 // 本机这条对话就不会被当成"云端还有一条新的"重复导入（bug 3）
                 if (res && res.dsSessionId && convNow && convNow.cloudId !== res.dsSessionId) {
-                    convNow.cloudId = res.dsSessionId
-                    convNow.cloudLinked = true
-                    convNow.cloudLoaded = true
-                    await this.persistConversation(convNow)
-                    appLog('[generate] 记录云端会话 id => ' + res.dsSessionId)
+                    convNow.cloudId = res.dsSessionId;
+                    convNow.cloudLinked = true;
+                    convNow.cloudLoaded = true;
+                    await this.persistConversation(convNow);
+                    appLog('[generate] 记录云端会话 id => ' + res.dsSessionId);
                 }
 
-                const m = this.messages.find((x) => x.id === pendingId)
-                console.error('GEN | find pending=' + (m ? 'FOUND' : 'MISSING') + ' messages count=' + this.messages.length)
+                const m = this.messages.find((x) => x.id === pendingId);
+                console.error('GEN | find pending=' + (m ? 'FOUND' : 'MISSING') + ' messages count=' + this.messages.length);
                 if (m) {
-                    const att = m.attempts && m.attempts[m.activeAttempt]
+                    const att = m.attempts && m.attempts[m.activeAttempt];
                     if (att) {
-                        att.content = res.content
-                        att.reasoning = res.reasoning
-                        att.pending = false
+                        att.content = res.content;
+                        att.reasoning = res.reasoning;
+                        att.pending = false;
                     }
-                    m.content = res.content
-                    m.reasoning = res.reasoning
-                    m.pending = false
+                    m.content = res.content;
+                    m.reasoning = res.reasoning;
+                    m.pending = false;
                 } else {
                     // pending 消息在存储重载后丢失：追加完成的消息，避免卡"正在思考"
                     this.messages.push({
@@ -1527,32 +1835,33 @@ export default {
                         createdAt: Date.now(),
                         attempts: [{ id: pendingId, content: res.content, reasoning: res.reasoning, pending: false, createdAt: Date.now() }],
                         activeAttempt: 0
-                    })
+                    });
                 }
             } catch (e) {
-                console.error('GEN | catch err=' + (e && e.message ? e.message : String(e)))
+                console.error('GEN | catch err=' + (e && e.message ? e.message : String(e)));
                 if (seq !== this.reqSeq || convId !== this.activeId) return
-                const msg = e && e.message ? e.message : '发生未知错误，请重试'
+                const msg = e && e.message ? e.message : '发生未知错误，请重试';
                 // 账号异常取证：只记"上游真的限制了这个账号"（禁言/封禁/空 SSE）。
                 // 401/未认证不算——那多半是本机后端没起来或 key 失配，记进来会把
                 // 用户和后续排查都引向"换账号"（bug 4）。
-                if (isAccountSuspension(msg)) {
-                    recordAccountTrouble('对话', msg)
+                // 账号模式暂停后没有账号可取证，避免把第三方端点的错误混进来。
+                if (BUILTIN_AUTH_ENABLED && isAccountSuspension(msg)) {
+                    recordAccountTrouble('对话', msg);
                 }
                 // 限流单独标记在消息上：重试按钮据此拦截，不再向已退避的后端发请求（bug 1）
-                const errCode = e && e.code ? String(e.code) : ''
-                const rateLimited = isRateLimitedError(e)
-                const m = this.messages.find((x) => x.id === pendingId)
+                const errCode = e && e.code ? String(e.code) : '';
+                const rateLimited = isRateLimitedError(e);
+                const m = this.messages.find((x) => x.id === pendingId);
                 if (m) {
-                    const att = m.attempts && m.attempts[m.activeAttempt]
+                    const att = m.attempts && m.attempts[m.activeAttempt];
                     if (att) {
-                        att.pending = false
-                        att.error = e && e.message ? e.message : '发生未知错误，请重试'
-                        att.errorCode = rateLimited ? 'upstream_rate_limited' : errCode
+                        att.pending = false;
+                        att.error = e && e.message ? e.message : '发生未知错误，请重试';
+                        att.errorCode = rateLimited ? 'upstream_rate_limited' : errCode;
                     }
-                    m.pending = false
-                    m.error = e && e.message ? e.message : '发生未知错误，请重试'
-                    m.errorCode = rateLimited ? 'upstream_rate_limited' : errCode
+                    m.pending = false;
+                    m.error = e && e.message ? e.message : '发生未知错误，请重试';
+                    m.errorCode = rateLimited ? 'upstream_rate_limited' : errCode;
                 } else {
                     this.messages.push({
                         id: pendingId,
@@ -1564,98 +1873,100 @@ export default {
                         createdAt: Date.now(),
                         attempts: [{ id: pendingId, content: '', pending: false, error: e && e.message ? e.message : '发生未知错误，请重试', errorCode: rateLimited ? 'upstream_rate_limited' : errCode, createdAt: Date.now() }],
                         activeAttempt: 0
-                    })
+                    });
                 }
             } finally {
-                console.error('GEN | finally, sending=false')
+                console.error('GEN | finally, sending=false');
                 if (this.streamToken) {
-                    stopStream(this.streamToken)
-                    this.streamToken = null
+                    stopStream(this.streamToken);
+                    this.streamToken = null;
                 }
-                this.sending = false
+                this.sending = false;
                 // 只有仍然停留在原会话时才保存，避免切换会话后把新会话内容写进旧会话
                 if (seq === this.reqSeq && convId === this.activeId) {
-                    await saveMessages(convId, this.messages)
+                    await saveMessages(convId, this.messages);
+                    // 本地落盘后异步备份到上游（失败静默，不影响聊天体验）
+                    this.queueCloudSync(conv, this.messages);
                 }
                 // 结束前把节流的渲染补上（流式期间可能还有一帧没落地）
-                this.flushRender()
+                this.flushRender();
             }
         },
 
         async retryMessage(m) {
             if (this.sending) return
-            const conv = this.activeConversation()
+            const conv = this.activeConversation();
             if (!conv) return
             if (!m || m.role !== 'assistant') return
             // 上游限流期间点「重试」= 再发一次请求，正是把限流升级成禁言的动作（bug 1）。
             // 后端已让账号退避，这里直接拦住并说明原因，不再向后端发请求。
             if (isRateLimitedError({ code: m.errorCode, message: m.error })) {
-                this.imageWarn = '上游正在限流：请等待一段时间再重试（连续请求会导致账号被禁言）'
-                this.$forceUpdate()
+                this.imageWarn = '上游正在限流：请等待一段时间再重试（连续请求会导致账号被禁言）';
+                this.$forceUpdate();
                 return
             }
 
             // 不覆盖旧回复：在当前助手气泡上新增一次生成尝试
-            const att = { id: uid('a'), content: '', reasoning: '', pending: true, createdAt: Date.now() }
-            if (!Array.isArray(m.attempts)) m.attempts = []
-            m.attempts.push(att)
-            m.activeAttempt = m.attempts.length - 1
-            m.content = ''
-            m.reasoning = ''
-            m.error = ''
-            m.pending = true
+            const att = { id: uid('a'), content: '', reasoning: '', pending: true, createdAt: Date.now() };
+            if (!Array.isArray(m.attempts)) m.attempts = [];
+            m.attempts.push(att);
+            m.activeAttempt = m.attempts.length - 1;
+            m.content = '';
+            m.reasoning = '';
+            m.error = '';
+            m.pending = true;
 
-            const seq = ++this.reqSeq
-            const convId = conv.id
-            conv.updatedAt = Date.now()
-            await this.persistConversation(conv)
-            await saveMessages(convId, this.messages)
-            this.$forceUpdate()
-            this.scrollToBottom()
-            await this.generate(conv, convId, seq, m.id)
+            const seq = ++this.reqSeq;
+            const convId = conv.id;
+            conv.updatedAt = Date.now();
+            await this.persistConversation(conv);
+            await saveMessages(convId, this.messages);
+            this.$forceUpdate();
+            this.scrollToBottom();
+            await this.generate(conv, convId, seq, m.id);
         },
 
         editMessage(m) {
             if (this.sending) return
-            this.editingMsgId = m.id
+            this.editingMsgId = m.id;
             // 保留已算好的 dataUrl，避免重新压缩；没有则回到待处理状态
             this.draftImages = (m.images || []).map((i) => ({
                 name: i.name,
                 path: i.path,
                 dataUrl: i.dataUrl || null,
                 pending: i.dataUrl ? Promise.resolve(i.dataUrl) : null
-            }))
+            }));
             // Bug 4 修复：设置 draft，点击输入框时 openInput 会把 draft 作为预填充文本
             // 传给系统输入法（contents 字段），用户能直接看到并编辑原文
-            this.draft = m.content || ''
-            this.$forceUpdate()
+            this.draft = m.content || '';
+            this.$forceUpdate();
             // 自动滚动到底部，确保用户看到编辑提示条
-            this.scrollToBottom()
+            this.scrollToBottom();
         },
         cancelEdit() {
-            this.editingMsgId = null
-            this.draft = ''
-            this.draftImages = []
-            this.$forceUpdate()
+            this.editingMsgId = null;
+            this.draft = '';
+            this.draftImages = [];
+            this.$forceUpdate();
         },
 
         stopGeneration() {
-            this.reqSeq += 1
+            this.reqSeq += 1;
             if (this.streamToken) {
-                stopStream(this.streamToken)
-                this.streamToken = null
+                stopStream(this.streamToken);
+                this.streamToken = null;
             }
-            const pendingMsg = this.messages.find((x) => x.pending)
+            const pendingMsg = this.messages.find((x) => x.pending);
             if (pendingMsg) {
                 // 保留已生成的部分内容，标记为完成而不是直接抹掉
-                const att = pendingMsg.attempts && pendingMsg.attempts[pendingMsg.activeAttempt]
-                if (att) att.pending = false
-                pendingMsg.pending = false
-                if (pendingMsg.error) pendingMsg.error = ''
+                const att = pendingMsg.attempts && pendingMsg.attempts[pendingMsg.activeAttempt];
+                if (att) att.pending = false;
+                pendingMsg.pending = false;
+                if (pendingMsg.error) pendingMsg.error = '';
             }
-            this.sending = false
-            this.$forceUpdate()
-            this.saveCurrentMessages()
+            this.sending = false;
+            this.$forceUpdate();
+            this.saveCurrentMessages();
         },
 
         // ---------- 思考过程折叠 ----------
@@ -1664,175 +1975,175 @@ export default {
             return !(this.settings && this.settings.defaultExpandThinking)
         },
         toggleReasoning(id) {
-            this.collapsedReasoning[id] = !this.isReasoningCollapsed(id)
-            this.$forceUpdate()
+            this.collapsedReasoning[id] = !this.isReasoningCollapsed(id);
+            this.$forceUpdate();
         },
 
         // ---------- 图片 ----------
         async openPicker() {
-            cancelThumbJobs()
-            const loadSeq = ++this.albumLoadSeq
-            this.showPicker = true
-            this.albumLoading = true
-            this.albumError = ''
-            this.albumImages = []
-            this.$forceUpdate()
+            cancelThumbJobs();
+            const loadSeq = ++this.albumLoadSeq;
+            this.showPicker = true;
+            this.albumLoading = true;
+            this.albumError = '';
+            this.albumImages = [];
+            this.$forceUpdate();
             try {
-                const list = await listAlbum()
+                const list = await listAlbum();
                 // 如果用户已经进入相机/关闭相册，旧任务只退出，不再触发任何更新。
                 if (loadSeq !== this.albumLoadSeq || !this.showPicker) return
                 // 逐张后台生成缩略图（原图 12MP 直接进 image 会堵死渲染线程，
                 // 真机表现为相册浮层全黑）：每张就绪立即刷新，列表渐进显示。
-                this.albumImages = list
-                this.albumLoading = false
-                this.$forceUpdate()
+                this.albumImages = list;
+                this.albumLoading = false;
+                this.$forceUpdate();
                 for (const img of list) {
                     if (loadSeq !== this.albumLoadSeq || !this.showPicker) return
-                    const thumb = await ensureThumb(img.path)
+                    const thumb = await ensureThumb(img.path);
                     if (loadSeq !== this.albumLoadSeq || !this.showPicker) return
                     if (thumb !== img.path) {
-                        const item = this.albumImages.find((i) => i.path === img.path)
+                        const item = this.albumImages.find((i) => i.path === img.path);
                         if (item) {
-                            item.thumb = thumb
-                            this.$forceUpdate()
+                            item.thumb = thumb;
+                            this.$forceUpdate();
                         }
                     }
                 }
             } catch (e) {
                 if (loadSeq !== this.albumLoadSeq || !this.showPicker) return
-                this.albumError = e && e.message ? e.message : '无法访问相册'
-                this.albumLoading = false
+                this.albumError = e && e.message ? e.message : '无法访问相册';
+                this.albumLoading = false;
             }
-            if (loadSeq === this.albumLoadSeq && this.showPicker) this.$forceUpdate()
+            if (loadSeq === this.albumLoadSeq && this.showPicker) this.$forceUpdate();
         },
         closePicker() {
-            cancelThumbJobs()
-            ++this.albumLoadSeq
-            this.showPicker = false
-            this.$forceUpdate()
+            cancelThumbJobs();
+            ++this.albumLoadSeq;
+            this.showPicker = false;
+            this.$forceUpdate();
         },
         pickImage(img) {
-            cancelThumbJobs()
-            ++this.albumLoadSeq
-            this.addDraftImage(img.name, img.path)
-            this.showPicker = false
-            this.$forceUpdate()
+            cancelThumbJobs();
+            ++this.albumLoadSeq;
+            this.addDraftImage(img.name, img.path);
+            this.showPicker = false;
+            this.$forceUpdate();
         },
         // ---------- 相机取景浮层（对齐手机选图体验：预览 → 快门 → 裁剪 → 待发）----------
         async openCamera() {
             if (this.showCamera || this.showConfirm) return
             // 先使相册缩略图任务失效；否则每张图完成时都会在相机层上方
             // 继续触发整页 forceUpdate，导致触摸事件排队。
-            cancelThumbJobs()
-            ++this.albumLoadSeq
-            this.showPicker = false
-            this.camError = ''
-            this.previewFrame = ''
-            this.previewMode = ''
-            this.showCamera = true
-            this.$forceUpdate()
+            cancelThumbJobs();
+            ++this.albumLoadSeq;
+            this.showPicker = false;
+            this.camError = '';
+            this.previewFrame = '';
+            this.previewMode = '';
+            this.showCamera = true;
+            this.$forceUpdate();
             // 让相机层先提交一次布局，再启动 native 取景管道；避免点击回调里
             // 同步叠加相册卸载、历史消息重排和相机初始化。
             setTimeout(() => {
-                if (this.showCamera && !this.showConfirm) this.startCameraPreview()
-            }, 0)
+                if (this.showCamera && !this.showConfirm) this.startCameraPreview();
+            }, 0);
         },
         // 使用已验证可见的 JPEG 帧循环（~7fps）；不把 kmssink 进程存活误判为画面可见
         async startCameraPreview() {
             const mode = await startPreview((jpg) => {
-                this.previewFrame = 'file://' + jpg
-                this.$forceUpdate()
-            })
+                this.previewFrame = 'file://' + jpg;
+                this.$forceUpdate();
+            });
             if (mode === 'dead') return // 期间已被关闭/重启，丢弃
-            this.previewMode = mode
-            appLog('[camera] preview mode=' + mode)
-            this.$forceUpdate()
+            this.previewMode = mode;
+            appLog('[camera] preview mode=' + mode);
+            this.$forceUpdate();
         },
         // 拍照失败后的取景重启，与正常启动共用 active 状态。
         restartFramePreview() {
-            this.startCameraPreview()
+            this.startCameraPreview();
         },
         // backToPicker=true（取景页 ×）：回相册选择页；false（确认页确认后）：回主聊天页
         closeCamera(backToPicker) {
-            this.showCamera = false
-            this.showConfirm = false
-            this.previewFrame = ''
-            this.previewMode = ''
-            this.camError = ''
-            stopPreview()
+            this.showCamera = false;
+            this.showConfirm = false;
+            this.previewFrame = '';
+            this.previewMode = '';
+            this.camError = '';
+            stopPreview();
             if (backToPicker) {
                 // 回相册选择页（openPicker 自带重载列表）
-                this.openPicker()
+                this.openPicker();
             }
-            this.$forceUpdate()
+            this.$forceUpdate();
         },
         // 快门：抓一帧 → 确认浮层（可拖框裁剪，勾收进待发 / 环形箭头重拍）
         async shoot() {
             if (this.takingPhoto || !this.showCamera) return
-            this.takingPhoto = true
-            this.camError = ''
-            this.$forceUpdate()
+            this.takingPhoto = true;
+            this.camError = '';
+            this.$forceUpdate();
             try {
                 // 取景与拍照共用 video29，必须先暂停帧循环避免相机节点冲突
-                if (this.previewMode === 'frames') stopFramePreview()
-                const r = await capturePhoto()
+                if (this.previewMode === 'frames') stopFramePreview();
+                const r = await capturePhoto();
                 if (!r.ok) {
                     // 失败提示必须可见：视频 plane 在 UI 之上会盖住提示，
                     // 先停预览露出黑底+提示，2.5 秒后按原模式自动恢复取景
-                    const wasFrames = this.previewMode === 'frames'
-                    stopPreview()
-                    this.camError = r.error || '拍照失败'
-                    if (this._errTimer) clearTimeout(this._errTimer)
+                    const wasFrames = this.previewMode === 'frames';
+                    stopPreview();
+                    this.camError = r.error || '拍照失败';
+                    if (this._errTimer) clearTimeout(this._errTimer);
                     this._errTimer = setTimeout(() => {
                         if (!this.showCamera || this.showConfirm) return
-                        if (wasFrames) this.restartFramePreview()
-                        else this.startCameraPreview()
-                    }, 2500)
+                        if (wasFrames) this.restartFramePreview();
+                        else this.startCameraPreview();
+                    }, 2500);
                     return
                 }
                 // 进确认页（JPEG 黑底浮层）：预览没用了，停掉省电
-                stopPreview()
-                this.confirmPath = r.path
+                stopPreview();
+                this.confirmPath = r.path;
                 // 确认页用 640 宽小图预览（全图解码会堵渲染线程）
-                this.confirmSrc = 'file://' + (r.preview || r.path)
-                this.resetCropBox()
-                this.showConfirm = true
+                this.confirmSrc = 'file://' + (r.preview || r.path);
+                this.resetCropBox();
+                this.showConfirm = true;
             } catch (e) {
-                this.camError = (e && e.message) || '拍照失败'
+                this.camError = (e && e.message) || '拍照失败';
             } finally {
-                this.takingPhoto = false
-                this.$forceUpdate()
+                this.takingPhoto = false;
+                this.$forceUpdate();
             }
         },
         // 确认：把屏幕上的裁剪框映射回源图像素（1920x768 带），裁剪后收进待发，回主聊天页
         async confirmShot() {
             if (this.takingPhoto) return
-            this.takingPhoto = true
-            this.$forceUpdate()
+            this.takingPhoto = true;
+            this.$forceUpdate();
             try {
-                const disp = this.dispRect
-                const b = this.clampCropBox(this.cropBox)
-                const sx = (b.x - disp.x) * PHOTO_W / disp.w
-                const sy = (b.y - disp.y) * PHOTO_H / disp.h
-                const sw = b.w * PHOTO_W / disp.w
-                const sh = b.h * PHOTO_H / disp.h
-                const path = await cropFrame(this.confirmPath, { x: sx, y: sy, w: sw, h: sh })
-                const name = String(path).split('/').pop()
-                this.addDraftImage(name, path)
-                this.closeCamera(false)
+                const disp = this.dispRect;
+                const b = this.clampCropBox(this.cropBox);
+                const sx = (b.x - disp.x) * PHOTO_W / disp.w;
+                const sy = (b.y - disp.y) * PHOTO_H / disp.h;
+                const sw = b.w * PHOTO_W / disp.w;
+                const sh = b.h * PHOTO_H / disp.h;
+                const path = await cropFrame(this.confirmPath, { x: sx, y: sy, w: sw, h: sh });
+                const name = String(path).split('/').pop();
+                this.addDraftImage(name, path);
+                this.closeCamera(false);
             } finally {
-                this.takingPhoto = false
-                this.$forceUpdate()
+                this.takingPhoto = false;
+                this.$forceUpdate();
             }
         },
         // 重拍：关确认浮层回取景（重启取景）
         retakeShot() {
-            this.showConfirm = false
-            this.confirmSrc = ''
-            this.confirmPath = ''
-            this.camError = ''
-            this.$forceUpdate()
-            this.startCameraPreview()
+            this.showConfirm = false;
+            this.confirmSrc = '';
+            this.confirmPath = '';
+            this.camError = '';
+            this.$forceUpdate();
+            this.startCameraPreview();
         },
         // ===== 裁剪框（官方同款：一个可拖可缩的白框，取代旧"比例循环"）=====
         // 真机实测（2026-09-26 事件日志取证）：Falcon 的 touch 事件对象顶层有
@@ -1841,106 +2152,106 @@ export default {
         // 拖动中元素跟着动，用 page 系算增量会自相抵消，必须用 screen 系。
         // 偶发杂散事件（坐标跳到几百 px 外）用跳变保护忽略。
         extractTouchXY(e) {
-            let d = e
-            if (d && d.data !== undefined && d.data !== null) d = d.data
-            const cands = []
+            let d = e;
+            if (d && d.data !== undefined && d.data !== null) d = d.data;
+            const cands = [];
             if (d && typeof d === 'object') {
-                if (d.changedTouches && d.changedTouches.length) cands.push(d.changedTouches[0])
-                if (d.touches && d.touches.length) cands.push(d.touches[0])
-                cands.push(d)
-                if (d.touch && typeof d.touch === 'object') cands.push(d.touch)
+                if (d.changedTouches && d.changedTouches.length) cands.push(d.changedTouches[0]);
+                if (d.touches && d.touches.length) cands.push(d.touches[0]);
+                cands.push(d);
+                if (d.touch && typeof d.touch === 'object') cands.push(d.touch);
             }
             for (let i = 0; i < cands.length; i++) {
-                const t = cands[i]
+                const t = cands[i];
                 if (!t || typeof t !== 'object') continue
                 // screen 系优先（绝对坐标）；page/client 系仅作兜底
-                const x = t.screenX !== undefined ? t.screenX : (t.pageX !== undefined ? t.pageX : (t.clientX !== undefined ? t.clientX : (t.x !== undefined ? t.x : null)))
-                const y = t.screenY !== undefined ? t.screenY : (t.pageY !== undefined ? t.pageY : (t.clientY !== undefined ? t.clientY : (t.y !== undefined ? t.y : null)))
+                const x = t.screenX !== undefined ? t.screenX : (t.pageX !== undefined ? t.pageX : (t.clientX !== undefined ? t.clientX : (t.x !== undefined ? t.x : null)));
+                const y = t.screenY !== undefined ? t.screenY : (t.pageY !== undefined ? t.pageY : (t.clientY !== undefined ? t.clientY : (t.y !== undefined ? t.y : null)));
                 if (x !== null && y !== null) return { x: x, y: y }
             }
             return null
         },
         cropTouchStart(mode, e) {
-            const p = this.extractTouchXY(e)
+            const p = this.extractTouchXY(e);
             if (!this._cropTouchLogged) {
-                this._cropTouchLogged = true
-                try { appLog('[crop] touchstart ' + JSON.stringify(e).slice(0, 400)) } catch (err) { /* 忽略 */ }
+                this._cropTouchLogged = true;
+                try { appLog('[crop] touchstart ' + JSON.stringify(e).slice(0, 400)); } catch (err) { /* 忽略 */ }
             }
             if (!p) return
-            this.cropDrag = { mode: mode, x: p.x, y: p.y }
+            this.cropDrag = { mode: mode, x: p.x, y: p.y };
         },
         cropTouchMove(e) {
-            const drag = this.cropDrag
+            const drag = this.cropDrag;
             if (!drag || !drag.mode) return
-            const p = this.extractTouchXY(e)
+            const p = this.extractTouchXY(e);
             if (!p) return
-            const dx = p.x - drag.x
-            const dy = p.y - drag.y
+            const dx = p.x - drag.x;
+            const dy = p.y - drag.y;
             if (dx === 0 && dy === 0) return
             // 杂散事件保护：单次增量超过半屏基本是引擎毛刺，只重新锚定不移动
             if (Math.abs(dx) > 468 || Math.abs(dy) > 280) {
-                this.cropDrag = { mode: drag.mode, x: p.x, y: p.y }
+                this.cropDrag = { mode: drag.mode, x: p.x, y: p.y };
                 return
             }
-            this.cropDrag = { mode: drag.mode, x: p.x, y: p.y }
-            this.applyCropDelta(dx, dy)
+            this.cropDrag = { mode: drag.mode, x: p.x, y: p.y };
+            this.applyCropDelta(dx, dy);
         },
         cropTouchEnd() {
-            try { appLog('[crop] touchend box=' + JSON.stringify(this.clampCropBox(this.cropBox))) } catch (e) { /* 忽略 */ }
-            this.cropDrag = { mode: '', x: 0, y: 0 }
+            try { appLog('[crop] touchend box=' + JSON.stringify(this.clampCropBox(this.cropBox))); } catch (e) { /* 忽略 */ }
+            this.cropDrag = { mode: '', x: 0, y: 0 };
         },
         applyCropDelta(dx, dy) {
-            const b = this.cropBox
-            const m = this.cropDrag.mode
+            const b = this.cropBox;
+            const m = this.cropDrag.mode;
             if (m === 'move') {
-                this.cropBox = this.clampCropBox({ x: b.x + dx, y: b.y + dy, w: b.w, h: b.h })
+                this.cropBox = this.clampCropBox({ x: b.x + dx, y: b.y + dy, w: b.w, h: b.h });
                 return
             }
             // 角缩放：固定对角，动被拖的角。min 尺寸 ~ 屏幕上 60x40（≈源图 123x82，够发图用）
-            const disp = this.dispRect
-            const minW = 60
-            const minH = 40
-            let x = b.x
-            let y = b.y
-            let w = b.w
-            let h = b.h
+            const disp = this.dispRect;
+            const minW = 60;
+            const minH = 40;
+            let x = b.x;
+            let y = b.y;
+            let w = b.w;
+            let h = b.h;
             if (m === 'tl' || m === 'bl') {
-                const nx = Math.max(disp.x, Math.min(b.x + dx, b.x + b.w - minW))
-                w = b.w + (b.x - nx)
-                x = nx
+                const nx = Math.max(disp.x, Math.min(b.x + dx, b.x + b.w - minW));
+                w = b.w + (b.x - nx);
+                x = nx;
             } else if (m === 'tr' || m === 'br') {
-                w = Math.min(disp.x + disp.w - b.x, Math.max(minW, b.w + dx))
+                w = Math.min(disp.x + disp.w - b.x, Math.max(minW, b.w + dx));
             }
             if (m === 'tl' || m === 'tr') {
-                const ny = Math.max(disp.y, Math.min(b.y + dy, b.y + b.h - minH))
-                h = b.h + (b.y - ny)
-                y = ny
+                const ny = Math.max(disp.y, Math.min(b.y + dy, b.y + b.h - minH));
+                h = b.h + (b.y - ny);
+                y = ny;
             } else if (m === 'bl' || m === 'br') {
-                h = Math.min(disp.y + disp.h - b.y, Math.max(minH, b.h + dy))
+                h = Math.min(disp.y + disp.h - b.y, Math.max(minH, b.h + dy));
             }
-            this.cropBox = { x: x, y: y, w: w, h: h }
+            this.cropBox = { x: x, y: y, w: w, h: h };
         },
         clampCropBox(b) {
-            const disp = this.dispRect
-            const minW = 60
-            const minH = 40
-            let w = Math.min(Math.max(b.w, minW), disp.w)
-            let h = Math.min(Math.max(b.h, minH), disp.h)
-            let x = Math.max(disp.x, Math.min(b.x, disp.x + disp.w - w))
-            let y = Math.max(disp.y, Math.min(b.y, disp.y + disp.h - h))
+            const disp = this.dispRect;
+            const minW = 60;
+            const minH = 40;
+            let w = Math.min(Math.max(b.w, minW), disp.w);
+            let h = Math.min(Math.max(b.h, minH), disp.h);
+            let x = Math.max(disp.x, Math.min(b.x, disp.x + disp.w - w));
+            let y = Math.max(disp.y, Math.min(b.y, disp.y + disp.h - h));
             return { x: x, y: y, w: w, h: h }
         },
         resetCropBox() {
-            const disp = this.dispRect
+            const disp = this.dispRect;
             // 默认框就是照片实际显示区域；用户不调整时确认结果等同于原图。
             // 之前缩进到 92% 会在四周留下未选中的边，和照片边框不贴合。
-            this.cropBox = { x: disp.x, y: disp.y, w: disp.w, h: disp.h }
+            this.cropBox = { x: disp.x, y: disp.y, w: disp.w, h: disp.h };
         },
         // 裁剪框外的四块半透明遮罩（上/下/左/右），聚焦框内区域
         cropMaskStyle(pos) {
-            const W = this.stageW
-            const H = this.stageH
-            const b = this.clampCropBox(this.cropBox)
+            const W = this.stageW;
+            const H = this.stageH;
+            const b = this.clampCropBox(this.cropBox);
             if (pos === 'top') return { left: '0px', top: '0px', width: W + 'px', height: Math.max(0, b.y) + 'px' }
             if (pos === 'bottom') return { left: '0px', top: (b.y + b.h) + 'px', width: W + 'px', height: Math.max(0, H - b.y - b.h) + 'px' }
             if (pos === 'left') return { left: '0px', top: b.y + 'px', width: Math.max(0, b.x) + 'px', height: b.h + 'px' }
@@ -1948,10 +2259,10 @@ export default {
         },
         // 四角 L 形手柄：以角为中心的小方块，拖动改变对应角
         cropHandleStyle(corner) {
-            const b = this.clampCropBox(this.cropBox)
-            const s = 36
-            const cx = corner === 'tl' || corner === 'bl' ? b.x : b.x + b.w
-            const cy = corner === 'tl' || corner === 'tr' ? b.y : b.y + b.h
+            const b = this.clampCropBox(this.cropBox);
+            const s = 36;
+            const cx = corner === 'tl' || corner === 'bl' ? b.x : b.x + b.w;
+            const cy = corner === 'tl' || corner === 'tr' ? b.y : b.y + b.h;
             return { left: (cx - s / 2) + 'px', top: (cy - s / 2) + 'px', width: s + 'px', height: s + 'px' }
         },
         checkIconSrc() {
@@ -1963,26 +2274,26 @@ export default {
         },
         // 加入待发图片（相册选择与拍照共用）：后台预压缩，发送时统一 await
         addDraftImage(name, path) {
-            this.imageWarn = ''
+            this.imageWarn = '';
             if (this.draftImages.some((i) => i.path === path)) return
-            const item = { name, path, dataUrl: null, pending: null }
+            const item = { name, path, dataUrl: null, pending: null };
             item.pending = readImageDataUrl(path)
                 .then((du) => {
-                    item.dataUrl = du || null
-                    if (!item.dataUrl) this.setImageWarn()
-                    this.$forceUpdate()
+                    item.dataUrl = du || null;
+                    if (!item.dataUrl) this.setImageWarn();
+                    this.$forceUpdate();
                 })
                 .catch(() => {
-                    item.dataUrl = null
-                    this.setImageWarn()
-                })
-            this.draftImages.push(item)
-            this.$forceUpdate()
+                    item.dataUrl = null;
+                    this.setImageWarn();
+                });
+            this.draftImages.push(item);
+            this.$forceUpdate();
         },
         setImageWarn() {
             // 单图上限 900KB（见 images.js）：超过就不随消息发送，提示用户换一张
-            this.imageWarn = '部分图片过大，无法发送（已跳过）'
-            this.$forceUpdate()
+            this.imageWarn = '部分图片过大，无法发送（已跳过）';
+            this.$forceUpdate();
         },
         // 把待发图片规整为存进消息的形态：等待预压缩完成，携带 dataUrl。
         // 没有 dataUrl 的一律丢弃——把几 MB 原图内联进消息会把设备内存打爆（bug 2）。
@@ -1992,14 +2303,14 @@ export default {
                 .filter((i) => !!i.dataUrl)
         },
         removeDraftImage(i) {
-            this.draftImages.splice(i, 1)
-            if (!this.draftImages.length) this.imageWarn = ''
-            this.$forceUpdate()
+            this.draftImages.splice(i, 1);
+            if (!this.draftImages.length) this.imageWarn = '';
+            this.$forceUpdate();
         },
 
         // ---------- 其他 ----------
         goSettings() {
-            $falcon.navTo('settings')
+            $falcon.navTo('settings');
         },
         scrollToBottom(force = false) {
             // 空态/无消息绝不滚动：anchor 不渲染（v-if），且短内容滚到底会把
@@ -2008,28 +2319,28 @@ export default {
             // 合并重复请求：锚点元素固定，多次排队滚动只在最后一帧有意义
             if (this._scrollTimer) {
                 if (!force) return
-                clearTimeout(this._scrollTimer)
+                clearTimeout(this._scrollTimer);
             }
-            const self = this
+            const self = this;
             this._scrollTimer = setTimeout(() => {
-                self._scrollTimer = null
+                self._scrollTimer = null;
                 try {
                     if (!self.$page || !self.$page.$dom) return
                     // 优先滚到"最后一条消息行"的上沿：短会话时目标位置在视口内、
                     // 滚动量被钳制为 0（不滚过头）；长会话视线锚定最新回复行首。
                     // 旧的"滚到内容末尾 anchor"会把气泡整体滚出视口（真机实证）。
-                    const last = self.chatMessages[self.chatMessages.length - 1]
-                    const ref = last && self.$refs['msg-' + last.id]
-                    const el = ref && (Array.isArray(ref) ? ref[ref.length - 1] : ref)
+                    const last = self.chatMessages[self.chatMessages.length - 1];
+                    const ref = last && self.$refs['msg-' + last.id];
+                    const el = ref && (Array.isArray(ref) ? ref[ref.length - 1] : ref);
                     if (el) {
-                        self.$page.$dom.scrollToElement(el)
+                        self.$page.$dom.scrollToElement(el);
                     } else if (self.$refs.bottom) {
-                        self.$page.$dom.scrollToElement(self.$refs.bottom)
+                        self.$page.$dom.scrollToElement(self.$refs.bottom);
                     }
                 } catch (e) {
                     /* 忽略 */
                 }
-            }, 50)
+            }, 50);
         },
 
         // ---------- 后端监控 ----------
@@ -2038,34 +2349,34 @@ export default {
             
             this.backendMonitor = createBackendMonitor({
                 onDisconnect: () => {
-                    console.error('INDEX | 后端连接断开')
-                    this.backendDisconnected = true
-                    this.$forceUpdate()
+                    console.error('INDEX | 后端连接断开');
+                    this.backendDisconnected = true;
+                    this.$forceUpdate();
                     // 停止当前请求
                     if (this.sending) {
-                        this.stopGeneration()
+                        this.stopGeneration();
                     }
                     // 自愈：尝试重新拉起/修复后端（内部 single-flight，不会重复 restart）
-                    this.ensureBackend()
+                    this.ensureBackend();
                 },
                 onReconnect: () => {
-                    console.log('INDEX | 后端已重新连接')
-                    this.backendDisconnected = false
-                    this.$forceUpdate()
+                    console.log('INDEX | 后端已重新连接');
+                    this.backendDisconnected = false;
+                    this.$forceUpdate();
                 }
-            }, 10000) // 每10秒检查一次
+            }, 10000); // 每10秒检查一次
             
-            this.backendMonitor.start()
+            this.backendMonitor.start();
         },
         
         stopBackendMonitor() {
             if (this.backendMonitor) {
-                this.backendMonitor.stop()
-                this.backendMonitor = null
+                this.backendMonitor.stop();
+                this.backendMonitor = null;
             }
         }
     }
-}
+};
 </script>
 
 <style lang="less" scoped>
@@ -3544,5 +3855,62 @@ export default {
     border-radius: 18px;
     padding: 8px 20px;
     margin-left: 8px;
+}
+
+/* 版本更新弹窗（build143 起由云控 updateGate 触发） */
+.ov-mask {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background-color: rgba(0, 0, 0, 0.6);
+    justify-content: center;
+    align-items: center;
+}
+.ov-mask-dark {
+    background-color: rgba(0, 0, 0, 0.8);
+}
+.ov-box {
+    width: 72%;
+    background-color: #ffffff;
+    border-radius: 16px;
+    padding: 18px 16px;
+    flex-direction: column;
+    align-items: center;
+}
+.ov-box-dark {
+    background-color: #1e1e1e;
+}
+.ov-title {
+    font-size: 24px;
+    font-weight: bold;
+    color: #222222;
+    margin-bottom: 10px;
+}
+.ov-title-dark {
+    color: #ffffff;
+}
+.ov-text {
+    font-size: 16px;
+    color: #555555;
+    line-height: 22px;
+    text-align: center;
+    margin-bottom: 6px;
+}
+.ov-text-dark {
+    color: #cccccc;
+}
+.ov-btn {
+    font-size: 18px;
+    color: #ffffff;
+    background-color: #1a73e8;
+    border-radius: 16px;
+    padding: 7px 18px;
+    margin-right: 8px;
+}
+.ov-btn-dark {
+    color: #000000;
+    background-color: #82b1ff;
 }
 </style>

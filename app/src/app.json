@@ -3,7 +3,8 @@
     "startup": "pages/startup/startup.vue",
     "login": "pages/login/login.vue",
     "index": "pages/index/index.vue",
-    "settings": "pages/settings/settings.vue"
+    "settings": "pages/settings/settings.vue",
+    "feedback": "pages/feedback/feedback.vue"
   },
   "options": {
     "style": {

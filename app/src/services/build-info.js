@@ -1,4 +1,4 @@
 // 构建信息：BUILD_NUM 由 scripts/build-wrapper.js 在每次构建时自动 +1（#17）。
 // 手动编辑本文件即可校准版本号。提交到 git，保证不同克隆的构建序号连续。
-export const BUILD_NUM = 130
-export const BUILD_AT = '2026-10-25 09:10:44'
+export const BUILD_NUM = 143
+export const BUILD_AT = '2026-10-22 07:06:00'
