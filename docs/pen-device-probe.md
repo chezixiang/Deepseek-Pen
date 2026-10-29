@@ -85,3 +85,62 @@ adb shell "grep -E 'Serial|Hardware' /proc/cpuinfo"        # canvas 种子来源
 - adb shell 无 `getprop`，`/bin/sh` 为 busybox，复杂命令建议包在双引号里整条下发。
 - 设备端 curl 为 busybox 精简版，调试模式代理测试时 `socks5` 支持情况未验证（后端代理在 Rust 侧 wreq 实现，不依赖设备 curl）。
 - 屏幕分辨率取自 DRM 面板 modes 的**首选模式**；若固件升级后出现 fb 设备，fb 路径优先。
+
+## 6. 客户端设备身份（deviceId）派生
+
+2026-10-28 起，客户端设备 ID **只由硬件序列号派生**，不再使用 MAC：
+
+```
+deviceId = 'pen-' + SHA-256('deepseek-pen:sn:' + SN).slice(0, 32)
+```
+
+SN 来源优先级（客户端 `src/services/device-id.js` + `cloud-control.js`）：
+
+1. `/proc/cpuinfo` 的 `Serial` 行 —— 本机实测 `Serial : 8c571a98d606d768`（0444 只读，芯片唯一）
+2. `/proc/device-tree/serial-number`（部分机型提供）
+3. eMMC CID：`/sys/block/mmcblk0/device/cid` —— 本机实测 `df011853434136344710165c5c05bb00`
+4. `/etc/machine-id` / `/var/lib/dbus/machine-id`
+5. 无 SN 时才退回旧 MAC 算法（保证老设备 ID 不变），最后才是随机 UUID
+
+读取方式：**只靠 shell**。OS 4.9.7 的 falcon `fs` 有两个硬限制（真机确认）：
+
+- **没有 `fs.writeFile`** —— 应用侧一切写文件都必须走 shell（`store.writeFile` 内部用
+  `base64` 分块 + 哨兵落盘，见 `shell-write.js`）；设备上 `ds_settings.json`、`ds-app.log`
+  都是 `root:root` 就是这条的实证。
+- `fs.readFile` 读 `/proc`、`/sys` 会失败（旧算法因此拿不到 MAC，退化成随机 UUID）。
+
+所以设备侧只发**一条**命令（`buildProbeCommand`），一次做完三件事：读硬件标识、
+`cat` 应用数据目录里的 ID 记录、`cat /userdisk` 里的 ID 记录；结果写进应用数据目录
+（该目录 fs 读写都可用）再读回。真机实测整条命令 55ms。
+
+命令结尾必须 `chmod 644`：shell 是 root，若某机型 umask 是 077，写出的文件应用进程
+读不到，探测就"看似成功其实全空"——又会退回随机 UUID，正是这次 bug 的老路。
+
+为什么不能用 MAC：
+
+- 冷启动 wlan0 尚未初始化时，`/sys/class/net/wlan0/address` 可能返回 `00:00:00:00:00:00`；
+- 不同固件的网卡名是 wlan0 / eth0 / wlan1，读到哪个不确定；
+- 部分机型 MAC 随机化；
+- 旧版手动配对路径还另生成随机 UUID。
+
+结果就是同一台笔卸载重装后出现两个 deviceId（服务端变成两台设备，旧会话/额度对不上）。
+
+持久化与换机识别：
+
+- 最终 ID 写入 `$dataDir/.ds-device-id.json` 与 `/userdisk/.ds-device-id.json`（用户盘，卸载应用通常不清）；
+- 记录里带**全部**可用硬件指纹（`sns` 数组），任一匹配即视为同一台机器，避免"这次只读到 eMMC、下次读到 CPU SN"被误判成换机；
+- 换机/克隆用户盘时指纹全部不匹配，会按新机 SN 重新生成，不会两台设备共用一个 ID；
+- 原始 SN 不落盘、不上传，只上传哈希。
+- 历史随机 UUID 标识会在首次启动时迁移为 SN 派生 ID（旧令牌清空、自动重注册）；`pen-` 开头的历史 MAC ID 保留，避免丢在线会话。
+- **随机 UUID 永远不写持久化记录**：写进去会让"下次能读到 SN"也被它锁死；磁盘上若已有 UUID 记录，
+  只要本次读到 SN 就丢弃它并收敛到 SN 派生 ID。
+- 各来源有最小长度（cpuinfo/device-tree ≥8、eMMC ≥12、machine-id ≥16）：个别固件把芯片型号
+  （如 `RK3562`）写进 `Serial`，这种值全机型相同，会让所有笔撞成一个 ID。
+
+adb 复核命令：
+
+```bash
+adb shell "grep -i '^Serial' /proc/cpuinfo"
+adb shell "cat /sys/block/mmcblk0/device/cid"
+adb shell "cat /userdisk/.ds-device-id.json 2>/dev/null"   # 新版本首次运行后生成
+```
