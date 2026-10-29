@@ -4,7 +4,8 @@
     "login": "pages/login/login.vue",
     "index": "pages/index/index.vue",
     "settings": "pages/settings/settings.vue",
-    "feedback": "pages/feedback/feedback.vue"
+    "feedback": "pages/feedback/feedback.vue",
+    "kbresult": "pages/kbresult/kbresult.vue"
   },
   "options": {
     "style": {
