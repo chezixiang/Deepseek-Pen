@@ -5,6 +5,12 @@
 # Deepseek-specific probe artifacts
 .probe/
 
+# WorkBuddy 代理工作区（记忆/截图/临时探针，含敏感临时文件，不入库）
+.workbuddy/
+
+# 运维小工具含明文 SSH/root 凭据（服务器与词典笔密码），严禁入库
+tools/pen-remote.py
+
 # Dependencies
 node_modules/
 # ---- build artifacts / generated ----
