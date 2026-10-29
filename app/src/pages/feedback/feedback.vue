@@ -34,8 +34,7 @@
 
             <text :class="isDark ? 'group-title group-title-dark' : 'group-title'">诊断信息</text>
             <div :class="isDark ? 'field field-dark' : 'field'">
-                <text :class="withDiagnostics ? chipActive : chip" @click="toggleDiagnostics">{{ withDiagnostics ? '附带诊断信息' : '不附带' }}</text>
-                <text :class="isDark ? 'field-hint field-hint-dark' : 'field-hint'">诊断包含：版本号、构建号、设备标识（已脱敏）、网络模式、今日额度、最近 40 行应用日志。不含聊天正文，可放心提交。</text>
+                <text :class="isDark ? 'field-hint field-hint-dark' : 'field-hint'">提交时会自动附带完整日志文件：应用日志（当前 + 上一份）与后端运行日志（当前 + 上一份），便于定位问题。日志不含聊天正文和密码，可放心提交。</text>
             </div>
 
             <text :class="isDark ? 'submit submit-dark' : 'submit'" @click="submit">{{ busy ? '正在提交…' : '提交反馈' }}</text>
@@ -47,7 +46,7 @@
 
 <script>
 import { peekBootTheme } from '../../services/theme.js'
-import { APP_VERSION, loadSettings, loadFeedbackDraft, openTextEditor, INPUT_TYPES, appLogTail, clearFeedbackDraft, appLog, saveFeedbackDraft, saveSettings } from '../../services/store.js'
+import { APP_VERSION, loadSettings, loadFeedbackDraft, openTextEditor, notifyKeyboardResult, INPUT_TYPES, clearFeedbackDraft, appLog, appLogError, saveFeedbackDraft, saveSettings, buildLogBundle, readAppLogFull } from '../../services/store.js'
 import { maskDeviceId } from '../../services/api-auth.js'
 import { quotaText, ensureUpstreamAuth, submitFeedback, upstreamBase } from '../../services/cloud-control.js'
 
@@ -65,7 +64,6 @@ export default {
             category: 'bug',
             text: '',
             contact: '',
-            withDiagnostics: true,
             busy: false,
             msg: '',
             msgErr: false,
@@ -87,7 +85,9 @@ export default {
         try {
             this.settings = await loadSettings();
             this.theme = (this.settings && this.settings.theme) || peekBootTheme();
-        } catch (e) { /* 忽略 */ }
+        } catch (e) {
+            appLogError('feedback.settings', e);
+        }
         const draft = await loadFeedbackDraft();
         if (draft) {
             this.category = draft.category || 'bug';
@@ -101,6 +101,10 @@ export default {
         this.$forceUpdate();
     },
     methods: {
+        // Loli 键盘通过 kbCaller 回到本页，onNewOptions 是官方回传通道
+        onNewOptions(options) {
+            if (notifyKeyboardResult(options)) this.$forceUpdate()
+        },
         back() {
             if (this.$page && this.$page.finish) this.$page.finish();
         },
@@ -108,23 +112,22 @@ export default {
             this.category = key;
             this.$forceUpdate();
         },
-        toggleDiagnostics() {
-            this.withDiagnostics = !this.withDiagnostics;
-            this.$forceUpdate();
-        },
         async editText() {
-            const text = await openTextEditor(INPUT_TYPES.ZH_CN_PREFERRED, this.text || '');
+            const text = await openTextEditor(INPUT_TYPES.ZH_CN_PREFERRED, this.text || '', { callerPage: 'feedback' });
             if (text === null) return
             this.text = String(text || '').slice(0, 2000);
             this.msg = '';
             this.$forceUpdate();
         },
         async editContact() {
-            const text = await openTextEditor(INPUT_TYPES.EN_US_ONLY, this.contact || '');
+            const text = await openTextEditor(INPUT_TYPES.EN_US_ONLY, this.contact || '', { callerPage: 'feedback' });
             if (text === null) return
             this.contact = String(text || '').slice(0, 120);
             this.$forceUpdate();
         },
+        // 反馈附件：一份完整的日志文件（不是尾部若干行）。
+        // 服务端把它单独落盘，后台可整份下载；diagnostics.log 仍保留尾部，
+        // 便于后台列表里快速扫一眼（旧版服务端也能继续看到日志）。
         async buildDiagnostics() {
             const s = this.settings || {};
             const diag = {
@@ -135,12 +138,30 @@ export default {
                 quota: quotaText(s.quotaCache),
                 enrollAt: s.lastEnrollAt || 0
             };
-            if (this.withDiagnostics) {
-                try {
-                    diag.log = await appLogTail(40);
-                } catch (e) { /* 忽略 */ }
+            let logs = { text: '', lines: 0, chars: 0, truncated: false, parts: [] };
+            try {
+                logs = await buildLogBundle({ includeBackend: true });
+            } catch (e) {
+                appLogError('feedback.logs', e);
             }
-            return diag
+            if (!logs.text) {
+                appLog('[feedback] 日志为空：应用日志文件不存在或不可读');
+                diag.log = '（应用日志为空或读取失败）';
+            } else {
+                // 后台列表里的快速预览固定取应用日志尾部（完整文件另存）
+                let appText = '';
+                try { appText = await readAppLogFull(0); } catch (e) { appLogError('feedback.logs.app', e); }
+                diag.log = appText
+                    ? appText.split('\n').filter(Boolean).slice(-120).join('\n')
+                    : logs.text.split('\n').filter(Boolean).slice(-120).join('\n');
+            }
+            diag.logMeta = JSON.stringify({
+                lines: logs.lines,
+                chars: logs.chars,
+                truncated: logs.truncated,
+                parts: logs.parts
+            });
+            return { diag, logs }
         },
         async submit() {
             if (this.busy) return
@@ -165,14 +186,27 @@ export default {
                 if (!auth) {
                     throw new Error('无法连接服务，请检查网络后重试')
                 }
-                const diagnostics = await this.buildDiagnostics();
+                // 先落一行"准备提交"，让上传的日志本身能看出这次反馈的时间点
+                appLog('[feedback] 准备提交 category=' + this.category + '（附带完整日志）');
+                const built = await this.buildDiagnostics();
+                appLog('[feedback] 提交 category=' + this.category +
+                    ' 日志=' + Math.round(built.logs.chars / 1024) + 'KB/' + built.logs.lines + '行' +
+                    (built.logs.truncated ? '（已截断）' : ''));
                 const r = await submitFeedback({
                     baseUrl: upstreamBase(this.settings || {}),
                     auth,
                     category: this.category,
                     text: body,
                     contact: this.contact,
-                    diagnostics
+                    diagnostics: built.diag,
+                    logs: {
+                        name: 'ds-app.log',
+                        text: built.logs.text,
+                        lines: built.logs.lines,
+                        chars: built.logs.chars,
+                        truncated: built.logs.truncated,
+                        parts: built.logs.parts
+                    }
                 });
                 await clearFeedbackDraft();
                 this.msg = '已提交，感谢反馈' + (r && r.id ? '（编号 ' + r.id + '）' : '');
@@ -191,7 +225,7 @@ export default {
                     contact: this.contact,
                     at: Date.now()
                 });
-                appLog('[feedback] 提交失败 ' + message);
+                appLogError('feedback.submit', e, 'category=' + this.category);
             }
             this.busy = false;
             this.$forceUpdate();

@@ -3,48 +3,77 @@
         <div :class="dc('topbar')">
             <text :class="dc('icon-btn')" @click="back">返回</text>
             <text :class="dc('title')">设置</text>
-            <text :class="dc('icon-btn')" @click="save">保存</text>
+            <text v-if="canEditSettings" :class="dc('icon-btn')" @click="save">保存</text>
+            <text v-else :class="dc('icon-btn') + ' icon-btn-disabled'">只读</text>
         </div>
 
         <scroller class="body" scroll-direction="vertical">
-            <!-- 上游模式：服务状态 / 额度 / 设备 / 版本与反馈（build143） -->
+            <!-- 横屏宽度接近 960px：字段两列排布，避免每行只放一个短控件、
+                 把页面拉成很长的单列。长文本（提示、通知、版本等）仍占整行。 -->
+            <div class="settings-stack">
+            <div v-if="settingsLocked" :class="isDark ? 'notice notice-dark' : 'notice'">
+                <text :class="isDark ? 'notice-title notice-title-dark' : 'notice-title'">设置已锁定</text>
+                <text :class="isDark ? 'notice-text notice-text-dark' : 'notice-text'">服务提供方关闭了设置修改，本页仅可查看；如需调整请联系服务提供者。</text>
+            </div>
+            <!-- 后端类型：非锁定构建下两种模式随时互切；锁定构建（LOCK_TO_UPSTREAM）
+                 整段隐藏，只保留下方那套静默上游面板 -->
+            <template v-if="!upstreamLocked">
+                <text :class="dc('group-title')">后端</text>
+                <text v-if="backendError" :class="dc('backend-error')">{{ backendError }}</text>
+                <div :class="dc('field')">
+                    <text :class="dc('label')">后端类型</text>
+                    <div class="modes">
+                        <text :class="form.backendMode === 'custom' ? dc('chip-active') : dc('chip')" @click="setBackendMode('custom')">自定义端点</text>
+                        <text :class="form.backendMode === 'upstream' ? dc('chip-active') : dc('chip')" @click="setBackendMode('upstream')">内置服务</text>
+                    </div>
+                    <text :class="dc('field-hint')">{{ form.backendMode === 'upstream' ? '接入内置服务：地址预置、设备自动注册，不需要 API Key 或配对码' : '直连任意 OpenAI 兼容 API：填写服务地址与 API Key；设备配对是可选加固' }}</text>
+                </div>
+            </template>
+
+            <!-- 上游模式：服务状态 / 额度 / 设备 / 版本与反馈 -->
             <template v-if="upstreamMode">
                 <text :class="dc('group-title')">服务</text>
-                <div :class="dc('field')">
-                    <text :class="dc('label')">我的上游</text>
-                    <div :class="dc('acct-row')">
-                        <text :class="dc('acct-name')">{{ upstreamStateText }}</text>
-                        <text :class="upstreamReady ? dc('acct-ok') : dc('acct-bad')">{{ upstreamReady ? '已连接' : '未连接' }}</text>
+                <div class="grid-row">
+                    <div :class="dc('field') + ' field-grid'">
+                        <text :class="dc('label')">内置服务</text>
+                        <div :class="dc('acct-row')">
+                            <text :class="dc('acct-name')">{{ upstreamStateText }}</text>
+                            <text :class="upstreamReady ? dc('acct-ok') : dc('acct-bad')">{{ upstreamReady ? '已连接' : '未连接' }}</text>
+                        </div>
+                        <text :class="dc('field-hint')">{{ upstreamHint }}</text>
                     </div>
-                    <text :class="dc('field-hint')">{{ upstreamHint }}</text>
-                </div>
-                <div :class="dc('field')">
-                    <text :class="dc('label')">剩余额度</text>
-                    <text :class="quotaWarn ? (isDark ? 'quota-warn quota-warn-dark' : 'quota-warn') : (isDark ? 'quota-text quota-text-dark' : 'quota-text')">{{ quotaLine }}</text>
-                    <text :class="dc('field-hint')">{{ quotaSubLine }}</text>
-                </div>
-                <div :class="dc('field')">
-                    <text :class="dc('label')">设备</text>
-                    <text :class="dc('field-hint')">{{ deviceLine }}</text>
-                    <div class="modes model-actions">
-                        <text :class="dc('nav-btn-sm')" @click="checkUpstream">{{ upstreamChecking ? '查询中…' : '刷新状态' }}</text>
-                        <text :class="dc('nav-btn-sm')" @click="restoreFromCloud">{{ restoring ? '恢复中…' : '从云端恢复会话' }}</text>
+                    <div :class="dc('field') + ' field-grid'">
+                        <text :class="dc('label')">设备</text>
+                        <text :class="dc('field-hint')">{{ deviceLine }}</text>
+                        <div class="modes model-actions">
+                            <text :class="dc('nav-btn-sm')" @click="checkUpstream">{{ upstreamChecking ? '查询中…' : '刷新状态' }}</text>
+                            <text :class="dc('nav-btn-sm')" @click="restoreFromCloud">{{ restoring ? '恢复中…' : '从云端恢复会话' }}</text>
+                        </div>
                     </div>
-                    <text v-if="upstreamMsg" :class="upstreamMsgErr ? dc('field-hint-warn') : dc('field-hint')">{{ upstreamMsg }}</text>
                 </div>
+                <text v-if="upstreamMsg" :class="upstreamMsgErr ? dc('field-hint-warn') : dc('field-hint')">{{ upstreamMsg }}</text>
+
+                <!-- 额度：每次进入设置页都强制刷新一次；逐项展示上游全部限制 -->
                 <div :class="dc('field')">
-                    <text :class="dc('label')">版本与反馈</text>
-                    <text :class="dc('field-hint')">{{ appVersion }}{{ serverVersion ? ' · 服务端 ' + serverVersion : '' }}</text>
-                    <div class="modes model-actions">
-                        <text :class="dc('nav-btn-sm')" @click="checkUpdate">{{ updateChecking ? '检查中…' : '检查更新' }}</text>
-                        <text :class="dc('nav-btn-sm')" @click="goFeedback">意见反馈</text>
+                    <div class="quota-head">
+                        <text :class="dc('label')">剩余额度</text>
+                        <text :class="quotaRefreshing ? 'quota-refresh quota-refresh-busy' : 'quota-refresh'" @click="refreshQuota">{{ quotaRefreshing ? '刷新中…' : '立即刷新' }}</text>
                     </div>
-                    <text v-if="updateMsg" :class="dc('field-hint')">{{ updateMsg }}</text>
+                    <div v-if="quotaItemsView.length" class="quota-grid">
+                        <div v-for="it in quotaItemsView" :key="it.key" class="quota-cell" :class="isDark ? 'quota-cell-dark' : ''">
+                            <div class="quota-cell-head">
+                                <text class="quota-cell-label" :class="isDark ? 'quota-label-dark' : ''">{{ it.label }}</text>
+                                <text class="quota-cell-pct" :class="it.pctClass">{{ it.limit > 0 ? it.pct + '%' : '不限' }}</text>
+                            </div>
+                            <text class="quota-cell-value" :class="isDark ? 'quota-value-dark' : 'quota-value'">{{ it.valueText }}</text>
+                            <div class="quota-bar" :class="isDark ? 'quota-bar-dark' : ''"><div class="quota-bar-fill" :class="it.barClass" :style="{ width: it.barWidth }"></div></div>
+                            <text class="quota-cell-foot" :class="isDark ? 'quota-foot-dark' : 'quota-foot'">{{ it.footText }}</text>
+                        </div>
+                    </div>
+                    <text v-else :class="dc('field-hint')">正在读取额度…</text>
+                    <text :class="dc('field-hint')">{{ plain(quotaSubLine) }}</text>
                 </div>
-                <div v-if="controlNotice" :class="isDark ? 'notice notice-dark' : 'notice'">
-                    <text :class="isDark ? 'notice-title notice-title-dark' : 'notice-title'">服务通知</text>
-                    <text :class="isDark ? 'notice-text notice-text-dark' : 'notice-text'">{{ controlNotice }}</text>
-                </div>
+
             </template>
 
             <!-- 自定义端点 / 内置账号模式 -->
@@ -53,18 +82,6 @@
                     <text :class="isDark ? 'notice-title notice-title-dark' : 'notice-title'">请先完成后端配置</text>
                     <text :class="isDark ? 'notice-text notice-text-dark' : 'notice-text'">「自定义端点」需要服务地址 + API Key。</text>
                     <text v-if="form.dsUser" :class="isDark ? 'notice-text notice-text-dark' : 'notice-text'">原 DeepSeek 账号 {{ maskedDsUser }} 已保留，恢复账号模式后可继续使用。</text>
-                </div>
-
-                <text :class="dc('group-title')">后端</text>
-                <text v-if="backendError" :class="dc('backend-error')">{{ backendError }}</text>
-
-                <div :class="dc('field')">
-                    <text :class="dc('label')">后端类型</text>
-                    <div class="modes">
-                        <text :class="form.backendMode === 'custom' ? dc('chip-active') : dc('chip')" @click="setBackendMode('custom')">自定义端点</text>
-                        <text :class="form.backendMode === 'upstream' ? dc('chip-active') : dc('chip')" @click="setBackendMode('upstream')">我的上游</text>
-                    </div>
-                    <text :class="dc('field-hint')">{{ form.backendMode === 'upstream' ? '接入自建上游网关：地址预置、设备自动注册，不需要 API Key 或配对码' : '直连任意 OpenAI 兼容 API：填写服务地址与 API Key；设备配对是可选加固' }}</text>
                 </div>
 
                 <div v-if="builtinEnabled" :class="dc('field')">
@@ -83,7 +100,7 @@
                             <text :class="form.dsConfigured ? dc('acct-ok') : dc('acct-bad')">{{ form.dsConfigured ? '已登录' : '未登录' }}</text>
                         </div>
                     </div>
-                    <text v-if="trouble.length" :class="dc('field-hint-warn')">⚠️ 最近账号异常 {{ trouble.length }} 次，最早检出 {{ fmtTime(trouble[0].t) }}（{{ trouble[0].kind }}）：{{ trouble[0].message }}</text>
+                    <text v-if="trouble.length" :class="dc('field-hint-warn')">注意：最近账号异常 {{ trouble.length }} 次，最早检出 {{ fmtTime(trouble[0].t) }}（{{ trouble[0].kind }}）：{{ trouble[0].message }}</text>
                     <div :class="dc('field')">
                         <text :class="dc('nav-btn')" @click="goLogin">{{ form.dsConfigured ? '管理账号 / 切换' : '去登录' }}</text>
                         <text :class="dc('field-hint')">登录、切换账号、退出登录都在登录页完成；设备凭据由后端自动生成，无需手动操作</text>
@@ -109,11 +126,11 @@
                 <!-- 上游网关：地址 + 连接检查 + 设备配对 + TLS 锁定 -->
                 <template v-else>
                     <div :class="dc('field')">
-                        <text :class="dc('label')">上游地址</text>
+                        <text :class="dc('label')">服务地址</text>
                         <div :class="dc('input')" @click="editField('upstreamBaseUrl')">
-                            <text :class="form.upstreamBaseUrl ? dc('input-text') : dc('input-text-ph')">{{ form.upstreamBaseUrl || buildUpstreamUrl || '请填写上游网关地址，如 https://api.example.com/v1' }}</text>
+                            <text :class="form.upstreamBaseUrl ? dc('input-text') : dc('input-text-ph')">{{ form.upstreamBaseUrl || buildUpstreamUrl || '请填写服务地址，如 https://api.example.com/v1' }}</text>
                         </div>
-                        <text :class="dc('field-hint')">由上游服务管理员提供（形如 https://域名/v1）。构建期可用 feature-flags.js 的 UPSTREAM_BASE_URL 预置，预置后此处可留空</text>
+                        <text :class="dc('field-hint')">由内置服务的提供方预置（形如 https://域名/v1），通常不需要改；构建期可用 feature-flags.js 的 UPSTREAM_BASE_URL 预置，预置后此处可留空</text>
                     </div>
                     <div :class="dc('field')">
                         <text :class="dc('label')">连接检查</text>
@@ -132,7 +149,7 @@
                             <text v-if="isPaired" :class="dc('nav-btn-sm')" @click="refreshToken">{{ pairing.busy ? '处理中…' : '刷新令牌' }}</text>
                             <text v-if="isPaired" :class="dc('nav-btn-sm')" @click="unpair">解除配对</text>
                         </div>
-                        <text :class="dc('field-hint')">配对流程：点「开始配对」→ 在服务端管理后台输入设备标识与配对码并批准 → 回本页点「继续」。{{ form.backendMode === 'upstream' ? '上游模式未配对时无法发送消息。' : '未配对时按上方 API Key 直连，行为不变。' }}</text>
+                        <text :class="dc('field-hint')">配对流程：点「开始配对」→ 在服务端管理后台输入设备标识与配对码并批准 → 回本页点「继续」。{{ form.backendMode === 'upstream' ? '内置服务未配对时无法发送消息。' : '未配对时按上方 API Key 直连，行为不变。' }}</text>
                         <text v-if="pairing.msg" :class="pairing.err ? dc('field-hint-warn') : dc('field-hint')">{{ pairing.msg }}</text>
                     </div>
                     <div :class="dc('field')">
@@ -143,18 +160,23 @@
                         <text :class="dc('field-hint')">锁定服务端证书公钥后，中间人即使持有受信 CA 也无法抓包改包（配对模式的流式请求生效）</text>
                     </div>
                 </template>
+            </template>
 
+            <!-- 模型 ID / 模型列表：两种后端模式共用（上游模式的模型由网关注入，
+                 但允许用户覆盖；拉取走 /v1/models，认证由模式决定）。
+                 锁定构建或云控关闭「模型切换」时整段隐藏。 -->
+            <template v-if="!upstreamLocked && canPickModel">
                 <div :class="dc('field')">
                     <text :class="dc('label')">模型 ID</text>
                     <div :class="dc('input')" @click="editField('openaiModelId')">
-                        <text :class="form.openaiModelId ? dc('input-text') : dc('input-text-ph')">{{ form.openaiModelId || (form.backendMode === 'upstream' ? '留空使用上游默认模型' : '留空自动选择（官方 API 用 deepseek-chat）') }}</text>
+                        <text :class="form.openaiModelId ? dc('input-text') : dc('input-text-ph')">{{ form.openaiModelId || (form.backendMode === 'upstream' ? '留空使用服务默认模型' : '留空自动选择（官方 API 用 deepseek-chat）') }}</text>
                     </div>
                     <div class="modes model-actions">
                         <text :class="dc('nav-btn-sm')" @click="fetchModels">{{ modelFetching ? '拉取中…' : '从 API 拉取模型' }}</text>
                         <text :class="dc('nav-btn-sm')" @click="editField('openaiModelId')">手动输入</text>
                     </div>
                     <text v-if="modelMsg" :class="modelMsgErr ? dc('field-hint-warn') : dc('field-hint')">{{ modelMsg }}</text>
-                    <text v-else :class="dc('field-hint')">「从 API 拉取模型」读取端点声明的模型列表（GET /v1/models），点选即填入。{{ form.backendMode === 'upstream' ? '留空则由上游网关注入它配置的默认模型' : '官方 API 可用 deepseek-chat / deepseek-reasoner，留空则自动选择' }}</text>
+                    <text v-else :class="dc('field-hint')">「从 API 拉取模型」读取端点声明的模型列表（GET /v1/models），点选即填入。{{ form.backendMode === 'upstream' ? '内置服务只返回后台「模型」页配置的目录，不会实时请求上游；后台未配置的模型会提示不支持' : '官方 API 可用 deepseek-chat / deepseek-reasoner，留空则自动选择' }}</text>
                 </div>
                 <div v-if="modelList.length" :class="dc('model-list')">
                     <div
@@ -171,36 +193,45 @@
 
             <text :class="dc('group-title')">默认选项</text>
             <!-- 官方已把快速/专家/识图合并为单一模型，只有多个模式时才显示选择器 -->
-            <div :class="dc('field')" v-if="visibleModes.length > 1">
-                <text :class="dc('label')">默认模型</text>
-                <div class="modes">
-                    <text
-                        v-for="m in visibleModes"
-                        :key="m.key"
-                        :class="form.defaultMode === m.key ? dc('chip-active') : dc('chip')"
-                        @click="setDefaultMode(m.key)">{{ m.label }}</text>
+            <div class="grid-row">
+                <div :class="dc('field') + ' field-grid'" v-if="visibleModes.length > 1">
+                    <text :class="dc('label')">默认模型</text>
+                    <div class="modes">
+                        <text
+                            v-for="m in visibleModes"
+                            :key="m.key"
+                            :class="form.defaultMode === m.key ? dc('chip-active') : dc('chip')"
+                            @click="setDefaultMode(m.key)">{{ m.label }}</text>
+                    </div>
                 </div>
-            </div>
-            <div :class="dc('field')">
-                <text :class="dc('label')">默认深度思考</text>
-                <text :class="form.defaultThinking ? dc('chip-active') : dc('chip')" @click="form.defaultThinking = !form.defaultThinking">{{ form.defaultThinking ? '开启' : '关闭' }}</text>
-            </div>
-            <div :class="dc('field')">
-                <text :class="dc('label')">默认联网搜索</text>
-                <text :class="form.defaultSearch ? dc('chip-active') : dc('chip')" @click="form.defaultSearch = !form.defaultSearch">{{ form.defaultSearch ? '开启' : '关闭' }}</text>
-            </div>
-            <div :class="dc('field')">
-                <text :class="dc('label')">默认展开思考过程</text>
-                <text :class="form.defaultExpandThinking ? dc('chip-active') : dc('chip')" @click="form.defaultExpandThinking = !form.defaultExpandThinking">{{ form.defaultExpandThinking ? '展开' : '收起' }}</text>
+                <div :class="dc('field') + ' field-grid'">
+                    <text :class="dc('label')">新对话默认开关</text>
+                    <!-- 三项合并成一行：横屏只有 290px 高，独立三行会把下面的区块挤出屏幕 -->
+                    <div class="opt-row">
+                        <text :class="form.defaultThinking ? dc('chip-sm-active') : dc('chip-sm')" @click="toggleDefault('defaultThinking')">深度思考 {{ form.defaultThinking ? '开' : '关' }}</text>
+                        <text :class="form.defaultSearch ? dc('chip-sm-active') : dc('chip-sm')" @click="toggleDefault('defaultSearch')">联网搜索 {{ form.defaultSearch ? '开' : '关' }}</text>
+                        <text :class="form.defaultExpandThinking ? dc('chip-sm-active') : dc('chip-sm')" @click="toggleDefault('defaultExpandThinking')">思考过程 {{ form.defaultExpandThinking ? '展开' : '收起' }}</text>
+                    </div>
+                </div>
             </div>
             <text :class="dc('field-hint')">流式输出（SSE）已固定开启，逐字显示回复，不再提供开关</text>
 
-            <text :class="dc('group-title')">外观</text>
-            <div :class="dc('field')">
-                <text :class="dc('label')">深色模式</text>
-                <div class="modes">
-                    <text :class="themeChipClass('light')" @click="setTheme('light')">浅色</text>
-                    <text :class="themeChipClass('dark')" @click="setTheme('dark')">深色</text>
+            <text :class="dc('group-title')">外观与输入</text>
+            <div class="grid-row">
+                <div :class="dc('field') + ' field-grid'">
+                    <text :class="dc('label')">深色模式</text>
+                    <div class="modes">
+                        <text :class="themeChipClass('light')" @click="setTheme('light')">浅色</text>
+                        <text :class="themeChipClass('dark')" @click="setTheme('dark')">深色</text>
+                    </div>
+                </div>
+                <div :class="dc('field') + ' field-grid'">
+                    <text :class="dc('label')">输入键盘</text>
+                    <div class="modes">
+                        <text :class="form.keyboardMode === 'calculator' ? dc('chip') : dc('chip-active')" @click="setKeyboardMode('system')">系统键盘</text>
+                        <text v-if="loliKbSupported" :class="form.keyboardMode === 'calculator' ? dc('chip-active') : dc('chip')" @click="setKeyboardMode('calculator')">Loli 键盘</text>
+                    </div>
+                    <text :class="dc('field-hint')">{{ loliKbSupported ? (form.keyboardMode === 'calculator' ? '使用 Loli 键盘（Rime 全键盘，含拼音候选）' : '使用设备自带输入法，兼容性最好') : '使用设备自带输入法；Loli 键盘需内置 Rime 引擎，当前固件跨应用调用无法回传文本' }}</text>
                 </div>
             </div>
 
@@ -213,37 +244,56 @@
             </div>
 
             <text :class="dc('group-title')">实验性（调试模式）</text>
-            <div :class="dc('field')" v-if="form.debugMode">
-                <text :class="dc('label')">竖屏交互（旋转 90°）</text>
-                <text :class="form.portrait ? dc('chip-active') : dc('chip')" @click="form.portrait = !form.portrait">{{ form.portrait ? '开启' : '关闭' }}</text>
-            </div>
-            <div :class="dc('field')">
-                <text :class="dc('label')">启用调试日志</text>
-                <text :class="form.debugLog ? dc('chip-active') : dc('chip')" @click="form.debugLog = !form.debugLog">{{ form.debugLog ? '开启' : '关闭' }}</text>
-                <text v-if="builtinEnabled" :class="dc('field-hint')">开启后双向抓取全部网络报文（app→后端、后端→DeepSeek/数美，JSONL；「查看诊断日志 → 网络抓取」可看尾部，完整文件 logs/net-capture.jsonl 单份 128MB、最多留 3 份）。禁言/风控发生时即有第一手报文可查。注意：报文含账号凭据，外发前自行脱敏；切换后点「保存」，会自动重启后端生效</text>
-                <text v-else :class="dc('field-hint')">开启后记录应用侧调试日志（请求地址、错误分类、流式收尾等），可在下方「查看诊断日志 → 应用日志」查看</text>
-            </div>
-            <div :class="dc('field')">
-                <text :class="dc('label')">Emoji 字体（实验，联网下载约 10MB）</text>
-                <text :class="form.emojiFont ? dc('chip-active') : dc('chip')" @click="toggleEmojiFont">{{ form.emojiFont ? '开启' : '关闭' }}</text>
-                <text :class="dc('field-hint')">设备不支持字体注册时会自动用文字替换 Emoji（如 [赞]），不会出现白块</text>
-                <text v-if="emojiFontMsg" :class="dc('field-hint')">{{ emojiFontMsg }}</text>
-            </div>
-            <div :class="dc('field')" v-if="form.debugMode">
-                <text :class="dc('label')">出站代理（Socks5/HTTP）</text>
-                <div :class="dc('input')" @click="editProxy">
-                    <text :class="proxyUrl ? dc('input-text') : dc('input-text-ph')">{{ proxyUrl || '未设置，如 socks5://192.168.1.5:1080' }}</text>
+            <div class="grid-row">
+                <div :class="dc('field') + ' field-grid'">
+                    <text :class="dc('label')">启用调试日志</text>
+                    <text :class="form.debugLog ? dc('chip-active') : dc('chip')" @click="form.debugLog = !form.debugLog">{{ form.debugLog ? '开启' : '关闭' }}</text>
+                    <text v-if="builtinEnabled" :class="dc('field-hint')">双向抓取 app→后端、后端→上游报文；切换后点「保存」生效</text>
+                    <text v-else :class="dc('field-hint')">记录应用侧调试日志；切换后点「保存」生效</text>
                 </div>
-                <text :class="dc('field-hint')">后端访问 DeepSeek 走此代理（抓包/绕过 WAF 用），留空恢复直连；保存后自动重启后端</text>
-                <text v-if="proxyMsg" :class="dc('field-hint')">{{ proxyMsg }}</text>
+                <div :class="dc('field') + ' field-grid'">
+                    <text :class="dc('label')">Emoji 字体（实验）</text>
+                    <text :class="form.emojiFont ? dc('chip-active') : dc('chip')" @click="toggleEmojiFont">{{ form.emojiFont ? '开启' : '关闭' }}</text>
+                    <text :class="dc('field-hint')">设备不支持字体注册时自动用文字替换 Emoji（约下载 10MB）</text>
+                    <text v-if="emojiFontMsg" :class="dc('field-hint')">{{ emojiFontMsg }}</text>
+                </div>
+            </div>
+            <div class="grid-row" v-if="form.debugMode">
+                <div :class="dc('field') + ' field-grid'">
+                    <text :class="dc('label')">竖屏交互（旋转 90°）</text>
+                    <text :class="form.portrait ? dc('chip-active') : dc('chip')" @click="form.portrait = !form.portrait">{{ form.portrait ? '开启' : '关闭' }}</text>
+                </div>
+                <div :class="dc('field') + ' field-grid'">
+                    <text :class="dc('label')">出站代理（Socks5/HTTP）</text>
+                    <div :class="dc('input')" @click="editProxy">
+                        <text :class="proxyUrl ? dc('input-text') : dc('input-text-ph')">{{ proxyUrl || '未设置' }}</text>
+                    </div>
+                    <text :class="dc('field-hint')">后端访问上游走此代理；保存后自动重启后端</text>
+                    <text v-if="proxyMsg" :class="dc('field-hint')">{{ proxyMsg }}</text>
+                </div>
             </div>
 
             <text :class="dc('danger')" @click="resetData">清空全部对话数据</text>
-            <text :class="dc('about')" @click="onVersionTap">Deepseek · 词典笔版 {{ appVersion }}</text>
+
+            <!-- 版本与反馈固定在设置页底部：两种后端模式都能看到，
+                 不再只出现在「内置服务」面板里。 -->
+            <text :class="dc('group-title')">版本与反馈</text>
+            <div :class="dc('field') + ' field-wide'">
+                <text :class="dc('label')">Deepseek · 词典笔版 {{ appVersion }}</text>
+                <text :class="dc('field-hint')">{{ serverVersion ? '服务端 ' + serverVersion : (form.backendMode === 'upstream' ? '服务端版本在连接内置服务后显示' : '自定义端点模式') }}</text>
+                <div class="modes model-actions">
+                    <text v-if="canCheckUpdate" :class="dc('nav-btn-sm')" @click="checkUpdate">{{ updateChecking ? '检查中…' : '检查更新' }}</text>
+                    <text v-if="canFeedback" :class="dc('nav-btn-sm')" @click="goFeedback">意见反馈</text>
+                </div>
+                <text v-if="updateMsg" :class="dc('field-hint')">{{ plain(updateMsg) }}</text>
+            </div>
+
+            <text :class="dc('about')" @click="onVersionTap">Deepseek · 词典笔版</text>
             <text v-if="form.debugMode" :class="dc('debug-badge')" @click="disableDebug">调试模式已开启（点击关闭）</text>
-            <text :class="dc('about-sub')">{{ builtinEnabled ? '后端：ds-free-api（OpenAI 兼容）' : '服务：自定义 OpenAI 兼容端点（传输由设备 curl/http 承担）' }}</text>
+            <text :class="dc('about-sub')">{{ form.backendMode === 'upstream' ? '服务：内置服务（OpenAI 兼容）' : '服务：自定义 OpenAI 兼容端点（传输由设备 curl/http 承担）' }}</text>
             <text :class="dc('log-link')" @click="showLogModal = true">查看诊断日志</text>
             <text v-if="saveMsg && !showSaveModal" :class="saved ? dc('save-msg-ok') : dc('save-msg')">{{ saveMsg }}</text>
+            </div>
         </scroller>
 
         <!-- 诊断日志弹窗（#6/#11 重构）：
@@ -276,10 +326,19 @@
             </div>
         </div>
 
+        <!-- 服务通知：noticeId 变化才弹（与首页共用已读状态） -->
+        <div v-if="noticeModal && noticeInfo" :class="dc('save-mask')">
+            <div :class="dc('save-modal-box')">
+                <text :class="dc('save-modal-title')">服务通知</text>
+                <text :class="dc('save-modal-msg')">{{ plain(noticeInfo.text) }}</text>
+                <text :class="dc('save-modal-btn')" @click="dismissNotice">知道了</text>
+            </div>
+        </div>
+
         <!-- 保存结果提示：显眼的浮层，用户确认后再返回 -->
         <div v-if="showSaveModal" :class="dc('save-mask')">
             <div :class="dc('save-modal-box')">
-                <text :class="saved ? dc('save-modal-title') : dc('save-modal-title-error')">{{ saved ? '✓ 已保存' : '✗ 保存失败' }}</text>
+                <text :class="saved ? dc('save-modal-title') : dc('save-modal-title-error')">{{ saved ? '已保存' : '保存失败' }}</text>
                 <text :class="dc('save-modal-msg')">{{ saveMsg }}</text>
                 <text :class="dc('save-modal-btn')" @click="closeSaveModal">好的</text>
             </div>
@@ -309,11 +368,13 @@ import { peekBootTheme } from '../../services/theme.js'
 import { MODES, listRemoteModels } from '../../services/ds.js'
 import { ensureEmojiFont } from '../../services/emoji-font.js'
 import { pullMissing, syncPurgeAll } from '../../services/session-sync.js'
-import { APP_VERSION, BUILTIN_AUTH_ENABLED, DEFAULT_SETTINGS, UPSTREAM_BASE_URL, LOCK_TO_UPSTREAM, appLog, isUpstreamMode, resolveBackendBaseUrl, loadSettings, loadAccountTrouble, loadControlCache, readLocalDsPass, readDsFreeApiProxy, deployBackend, saveSettings, INPUT_TYPES, openTextEditor, appLogTail, readNetCaptureTail, backendLogTail, appLogClear, netCaptureClear, backendLogClear, validateProxyUrl, updateDsFreeApiProxy, saveControlCache, loadConversations, saveMessages, saveConversations, updateDsFreeApiAccount, updateDsFreeApiNetCapture, deleteMessages, saveActiveId } from '../../services/store.js'
-import { maskDeviceId, uuidV4, generatePairingCode } from '../../services/api-auth.js'
+import { LOLI_KEYBOARD_CROSS_APP, APP_VERSION, BUILD_NUM, BUILTIN_AUTH_ENABLED, DEFAULT_SETTINGS, UPSTREAM_BASE_URL, LOCK_TO_UPSTREAM, appLog, appLogError, debugLog, isUpstreamMode, resolveBackendBaseUrl, loadSettings, loadAccountTrouble, loadControlCache, readLocalDsPass, readDsFreeApiProxy, deployBackend, saveSettings, INPUT_TYPES, openTextEditor, notifyKeyboardResult, appLogTail, readNetCaptureTail, backendLogTail, appLogClear, netCaptureClear, backendLogClear, validateProxyUrl, updateDsFreeApiProxy, saveControlCache, loadConversations, saveMessages, saveConversations, updateDsFreeApiAccount, updateDsFreeApiNetCapture, deleteMessages, saveActiveId } from '../../services/store.js'
+import { maskDeviceId, generatePairingCode, isSameHost } from '../../services/api-auth.js'
 import { pairDevice, refreshDeviceToken, revokeDeviceToken } from '../../services/api-pairing.js'
 import { validateExternalUrl } from '../../services/http.js'
-import { quotaText, quotaLow, normalizeControl, ensureUpstreamAuth, getLastAuthError, upstreamBase, fetchDeviceStatus, fetchControl, updateGate, fmtReset } from '../../services/cloud-control.js'
+import { quotaText, quotaLow, normalizeControl, normalizeQuota, ensureUpstreamAuth, getLastAuthError, upstreamBase, fetchDeviceStatus, fetchControl, updateGate, fmtReset, fmtAmount, controlFeature, controlLimit, reportTelemetry, noticeFor, debugGate, stableDeviceId, rememberDeviceId } from '../../services/cloud-control.js'
+import { startRemoteDebug, stopRemoteDebug } from '../../services/remote-debug.js'
+import { substituteEmoji } from '../../services/emoji-subst.js'
 
 const MODEL_LIST_MAX = 50
 
@@ -362,8 +423,15 @@ export default {
             // 静默注册后的设备状态 / 配额 / 云控（全部只读）
             upstreamChecked: false,
             upstreamOk: false,
+            // 额度面板：每次进入设置页都会强制刷新一次
             quota: null,
+            quotaRefreshing: false,
+            lastQuotaAt: 0,
+            telemetryReporting: false,
             control: null,
+            // 服务通知（弹窗）
+            noticeInfo: null,
+            noticeModal: false,
             serverVersion: '',
             restoring: false,
             updateChecking: false,
@@ -371,20 +439,25 @@ export default {
         }
     },
     created() {
+        // 从主页/其它页面回到设置时也要刷新额度：create 只跑一次，
+        // 页面实例可能被复用，必须靠框架的 show 事件。
+        try { this.$page.on('show', this.onPageShow); } catch (e) { /* 忽略 */ }
         this.init();
     },
+    destroyed() {
+        try { this.$page.off('show', this.onPageShow); } catch (e) { /* 忽略 */ }
+    },
     watch: {
-        isDark(v) {
-            appLog('[settings] isDark 实际变化 => ' + v + ' theme=' + (this.form && this.form.theme));
-        },
         showLogModal(v) {
             if (v) {
                 this.loadLogContent();
-                appLog('[settings] 查看诊断日志 theme=' + (this.form && this.form.theme));
             }
         }
     },
     computed: {
+        loliKbSupported() {
+            return !!LOLI_KEYBOARD_CROSS_APP
+        },
         isDark() {
             // 词典笔无系统深色，只有手动开关：'dark' 深色，其余浅色
             return (this.form && this.form.theme) === 'dark'
@@ -423,35 +496,84 @@ export default {
             if (this.upstreamLocked) {
                 return '服务地址已内置，设备首次联网自动注册；无需填写地址、密钥或配对码。'
             }
-            return '设备凭证由服务端自动下发；如需更换服务，可在下方自定义端点中配置。'
+            return '设备凭证由服务端自动下发；如需更换服务，可在上方「后端类型」中切回自定义端点。'
         },
+        // 额度统一归一化：服务端 items → 固定 6 项，缺字段也不会渲染崩
         quotaView() {
-            return this.quota || (this.form && this.form.quotaCache) || null
+            return normalizeQuota(this.quota || (this.form && this.form.quotaCache))
         },
         quotaLine() {
             return quotaText(this.quotaView)
         },
+        // 设置页逐项展示：剩余量 + 已用 + 重置时间，覆盖上游全部限制项
+        quotaItemsView() {
+            const q = this.quotaView;
+            if (!q) return []
+            return q.items.map((it) => {
+                const unlimited = !(it.limit > 0);
+                const pct = unlimited ? 0 : Math.min(100, Math.round(it.used / it.limit * 100));
+                const valueText = unlimited ? '不限' : ('剩余 ' + fmtAmount(it.remaining, it.unit));
+                let footText = '未设置上限';
+                if (!unlimited) {
+                    if (it.window === 'live') footText = '进行中 ' + it.used + ' / ' + it.limit + ' 个请求';
+                    else footText = '已用 ' + fmtAmount(it.used, it.unit) + ' · ' + (fmtReset(it.resetAt) || '随窗口重置');
+                }
+                return {
+                    key: it.key,
+                    label: it.label,
+                    limit: it.limit,
+                    used: it.used,
+                    pct,
+                    valueText,
+                    footText,
+                    pctClass: unlimited ? 'quota-pct-free' : (pct >= 100 ? 'quota-pct-bad' : (pct >= 90 ? 'quota-pct-warn' : 'quota-pct-ok')),
+                    barClass: unlimited ? 'quota-bar-free' : (pct >= 100 ? 'quota-bar-bad' : (pct >= 90 ? 'quota-bar-warn' : 'quota-bar-ok')),
+                    barWidth: (unlimited ? 100 : Math.max(3, pct)) + '%'
+                };
+            })
+        },
         quotaSubLine() {
             const q = this.quotaView;
-            if (!q || q.enabled === false) return '当前服务未设置额度上限'
+            if (!q) return '额度由服务端按设备下发';
+            if (!q.enabled) return '当前服务未设置额度上限';
             const parts = [];
             if (this.control && this.control.quotaHint) parts.push(this.control.quotaHint);
-            if (q.requests && Number(q.requests.limit) > 0) parts.push(fmtReset(q.requests.resetAt));
-            else if (q.tokens && Number(q.tokens.limit) > 0) parts.push(fmtReset(q.tokens.resetAt));
-            if (q.exhausted) parts.push('额度已用完，次日自动恢复');
+            if (q.override) parts.push('本设备有单独额度');
+            if (q.exhausted) {
+                const hit = q.items.filter((i) => i.key === q.blockedBy)[0];
+                parts.push((hit ? hit.label : '额度') + '已用完');
+            }
+            if (this.lastQuotaAt) parts.push('更新于 ' + this.fmtTime(this.lastQuotaAt));
             return parts.join(' · ') || '额度由服务端按设备下发'
         },
         quotaWarn() {
             return quotaLow(this.quotaView)
+        },
+        // 云控：服务端可关闭设置修改 / 模型切换
+        settingsLocked() {
+            return !!(this.upstreamMode && this.control && !controlFeature(this.control, 'settingsEdit'))
+        },
+        canEditSettings() {
+            return !this.settingsLocked
+        },
+        canPickModel() {
+            return !(this.control && !controlFeature(this.control, 'modelPicker'))
+        },
+        canFeedback() {
+            return !(this.control && !controlFeature(this.control, 'feedback'))
+        },
+        // 更新提示开关只隐藏入口；强制更新由 updateGate 单独判定
+        canCheckUpdate() {
+            return !(this.control && !controlFeature(this.control, 'updates'))
+        },
+        canUseCloudSessions() {
+            return !(this.control && !controlFeature(this.control, 'sessions'))
         },
         deviceLine() {
             const id = maskDeviceId(this.form.pairDeviceId) || '自动生成中';
             const exp = Number(this.form.pairExpiresAt) || 0;
             const token = !this.isPaired ? '待注册' : (exp ? '有效至 ' + this.fmtTime(exp) : '长期有效');
             return '设备标识 ' + id + ' · 设备令牌 ' + token
-        },
-        controlNotice() {
-            return (this.control && this.control.notice) || ''
         },
         // 当前实际请求根地址：上游模式用 upstreamBaseUrl/构建期常量，自定义模式用 baseUrl
         effectiveBaseUrl() {
@@ -483,12 +605,21 @@ export default {
         }
     },
     methods: {
+        // Loli 键盘通过 kbCaller 回到本页，onNewOptions 是官方回传通道
+        onNewOptions(options) {
+            if (notifyKeyboardResult(options)) this.$forceUpdate()
+        },
         // 把当前主题缓存到 $falcon 全局（与 index.vue 约定一致，#7）
         cacheTheme() {
             try { $falcon.__dsTheme = (this.form && this.form.theme) || 'light'; } catch (e) { /* 忽略 */ }
         },
         async init() {
-            this.form = await loadSettings();
+            try {
+                this.form = await loadSettings();
+            } catch (e) {
+                appLogError('settings.load', e);
+                this.form = Object.assign({}, DEFAULT_SETTINGS);
+            }
             // 启动页因「端点未配置」引导进来时，返回应去主页而不是回到启动页（避免死路）
             try {
                 this._fromSetup = !!$falcon.__dsNeedsEndpointSetup;
@@ -502,10 +633,11 @@ export default {
             this._debugLogAtLoad = !!this.form.debugLog;
             // 账号异常取证（首次检出时间）
             this.trouble = await loadAccountTrouble();
-            // 云控缓存先上屏（离线也能看到上次公告/说明），随后静默刷新
+            // 云控缓存先上屏（离线也能看到上次通知/说明），随后静默刷新
             try {
                 this.control = normalizeControl(await loadControlCache());
-            } catch (e) { /* 忽略 */ }
+                this.applyControlUi(this.control);
+            } catch (e) { debugLog('[settings] 读取云控缓存失败：' + (e && e.message ? e.message : String(e))) }
             // 上游模式：后台静默注册/续期 + 拉配额与云控，不阻塞页面渲染
             if (this.upstreamMode) {
                 this.bootstrapUpstream();
@@ -554,6 +686,15 @@ export default {
         pairAuthFromForm() {
             const f = this.form || {};
             if (!f.pairDeviceId || !f.pairToken || !f.pairSecret) return null
+            // 令牌归属校验：只对当初配对的地址发设备令牌。老设置没有 pairBaseUrl
+            // （字段后加），此时若自定义端点已经填了 API Key，就按"令牌不属于这里"
+            // 处理——否则会把内置服务的令牌发给第三方端点，401 还会误报成令牌过期。
+            const pairedAt = String(f.pairBaseUrl || '').trim();
+            if (pairedAt) {
+                if (!isSameHost(pairedAt, this.effectiveBaseUrl)) return null
+            } else if (!isUpstreamMode(f.backendMode) && String(f.apiKey || '').trim()) {
+                return null
+            }
             return {
                 deviceId: f.pairDeviceId,
                 deviceToken: f.pairToken,
@@ -562,21 +703,23 @@ export default {
                 tlsPin: f.pairTlsPin || ''
             }
         },
-        // deviceId 首次配对时生成并写进表单（之后不变：服务端按它绑定令牌）。
-        // 这里不落盘——取消配对流程时生成的标识直接丢弃，无副作用。
-        ensureDeviceId() {
-            if (!this.form.pairDeviceId) this.form.pairDeviceId = uuidV4();
+        // deviceId 与静默注册共用同一个算法（硬件 SN 派生），
+        // 避免手动配对生成随机 UUID、静默注册用 MAC 哈希，同一台笔出现两个 ID。
+        async ensureDeviceId() {
+            if (!this.form.pairDeviceId) {
+                this.form.pairDeviceId = await stableDeviceId();
+            }
             return this.form.pairDeviceId
         },
-        startPairing() {
+        async startPairing() {
             const baseUrl = this.effectiveBaseUrl;
             if (!baseUrl) {
-                this.pairing.msg = this.form.backendMode === 'upstream' ? '请先填写上游地址' : '请先填写服务地址';
+                this.pairing.msg = '请先填写服务地址';
                 this.pairing.err = true;
                 this.$forceUpdate();
                 return
             }
-            this.pairing.deviceId = this.ensureDeviceId();
+            this.pairing.deviceId = await this.ensureDeviceId();
             this.pairing.code = generatePairingCode();
             this.pairing.msg = '';
             this.pairing.err = false;
@@ -607,15 +750,19 @@ export default {
                 this.form.pairToken = r.deviceToken;
                 this.form.pairSecret = r.signSecret;
                 this.form.pairExpiresAt = r.expiresAt;
+                // 记下令牌归属的地址：切到别的端点时据此停用，避免拿错令牌发请求
+                this.form.pairBaseUrl = this.effectiveBaseUrl;
                 await saveSettings(this.form);
                 this.showPairModal = false;
                 this.pairing.msg = '配对成功，本机已改用设备令牌访问（记得点右上角「保存」）';
                 this.pairing.err = false;
                 appLog('[settings] 设备配对成功 deviceId=' + this.pairing.deviceId + ' expiresAt=' + r.expiresAt);
+                // 配对得到的 ID 也写入持久化记录（重装后恢复同一身份）
+                rememberDeviceId(this.form.pairDeviceId).catch(() => {});
             } catch (e) {
                 this.pairing.msg = '配对失败：' + (e && e.message ? e.message : String(e));
                 this.pairing.err = true;
-                appLog('[settings] 设备配对失败 ' + (e && e.message ? e.message : String(e)));
+                appLogError('pair.device', e);
             }
             this.pairing.busy = false;
             this.$forceUpdate();
@@ -634,10 +781,11 @@ export default {
             this.pairing.err = false;
             this.$forceUpdate();
             try {
-                const r = await refreshDeviceToken({ baseUrl: String(this.form.baseUrl || '').trim(), auth });
+                const r = await refreshDeviceToken({ baseUrl: this.effectiveBaseUrl, auth });
                 this.form.pairToken = r.deviceToken;
                 if (r.signSecret) this.form.pairSecret = r.signSecret;
                 this.form.pairExpiresAt = r.expiresAt;
+                this.form.pairBaseUrl = this.effectiveBaseUrl;
                 await saveSettings(this.form);
                 this.pairing.msg = '令牌已刷新（到期 ' + (r.expiresAt ? this.fmtTime(r.expiresAt) : '长期') + '），记得点右上角「保存」';
                 this.pairing.err = false;
@@ -660,7 +808,7 @@ export default {
             this.$forceUpdate();
             let note = '已解除配对';
             if (auth) {
-                const r = await revokeDeviceToken({ baseUrl: String(this.form.baseUrl || '').trim(), auth });
+                const r = await revokeDeviceToken({ baseUrl: String(this.form.pairBaseUrl || this.effectiveBaseUrl || '').trim(), auth });
                 note = r.ok
                     ? '已解除配对（服务端令牌已吊销）'
                     : '本地已解除配对；服务端吊销失败（' + (r.message || '未知原因') + '），令牌到期后自动失效';
@@ -669,6 +817,7 @@ export default {
             this.form.pairToken = '';
             this.form.pairSecret = '';
             this.form.pairExpiresAt = 0;
+            this.form.pairBaseUrl = '';
             await saveSettings(this.form);
             this.pairing.msg = note + '，记得点右上角「保存」';
             this.pairing.busy = false;
@@ -706,15 +855,21 @@ export default {
             const CHINESE = { systemPrompt: true };
             const current = SENSITIVE[field] ? '' : (this.form[field] || '');
             const inputType = CHINESE[field] ? INPUT_TYPES.ZH_CN_PREFERRED : INPUT_TYPES.EN_US_ONLY;
-            const text = await openTextEditor(inputType, current);
+            const text = await openTextEditor(inputType, current, {
+                keyboardMode: this.form.keyboardMode,
+                callerPage: 'settings'
+            });
             if (text === null) return
             this.form[field] = String(text).trim();
+            this.$forceUpdate();
+        },
+        setKeyboardMode(mode) {
+            this.form.keyboardMode = mode === 'calculator' ? 'calculator' : 'system';
             this.$forceUpdate();
         },
         setTheme(key) {
             this.form.theme = key;
             this.cacheTheme();
-            appLog('[settings] 切换主题 theme=' + key + ' isDark将变=' + (key === 'dark'));
             this.$forceUpdate();
         },
 
@@ -768,6 +923,7 @@ export default {
                     const r = await ensureEmojiFont();
                     this.emojiFontMsg = r.message;
                 } catch (e) {
+                    appLogError('emoji.font', e);
                     this.emojiFontMsg = '失败：' + (e && e.message ? e.message : String(e));
                 }
             } else {
@@ -783,13 +939,16 @@ export default {
             try {
                 $falcon.navTo('login');
             } catch (e) {
-                appLog('[settings] 跳转登录页失败: ' + (e && e.message ? e.message : String(e)));
+                appLogError('nav.login', e);
             }
         },
         // 出站代理（调试模式）：写入本机后端 config.toml 的 [proxy] 段并重启后端。
         // 留空提交 = 清除代理恢复直连。
         async editProxy() {
-            const text = await openTextEditor(INPUT_TYPES.EN_US_ONLY, this.proxyUrl || '');
+            const text = await openTextEditor(INPUT_TYPES.EN_US_ONLY, this.proxyUrl || '', {
+                keyboardMode: this.form.keyboardMode,
+                callerPage: 'settings'
+            });
             if (text === null) return
             const v = String(text).trim();
             const invalid = validateProxyUrl(v);
@@ -811,6 +970,7 @@ export default {
                 this.proxyMsg = r.message;
                 appLog('[settings] 代理更新 ok=' + r.ok + ' msg=' + (r.message || ''));
             } catch (e) {
+                appLogError('proxy.update', e);
                 this.proxyMsg = '失败：' + (e && e.message ? e.message : String(e));
             }
             this.$forceUpdate();
@@ -825,7 +985,13 @@ export default {
             this.upstreamStatus = '';
             this.modelList = [];
             this.modelMsg = '';
-            appLog('[settings] 后端类型切换 => ' + next);
+            // 切到上游后立刻静默注册/拉状态，否则只读面板会一直停在「正在连接…」
+            if (next === 'upstream') {
+                this.upstreamChecked = false;
+                this.upstreamOk = false;
+                this.upstreamStatus = '';
+                this.bootstrapUpstream();
+            }
             this.$forceUpdate();
         },
         // ---------- 上游：静默注册 / 状态 / 配额 / 云控 ----------
@@ -847,6 +1013,7 @@ export default {
                 return
             }
             await this.refreshUpstream(auth, false);
+            this.reportStatus(false);
         },
         async refreshUpstream(auth, announce, retried) {
             const baseUrl = upstreamBase(this.form);
@@ -854,18 +1021,20 @@ export default {
                 const st = await fetchDeviceStatus({ baseUrl, auth });
                 this.upstreamOk = true;
                 this.upstreamChecked = true;
-                this.quota = st.quota || null;
-                if (st.quota) {
-                    this.form.quotaCache = st.quota;
-                    saveSettings(this.form).catch(() => {});
+                const q = normalizeQuota(st.quota);
+                this.quota = q;
+                this.lastQuotaAt = Date.now();
+                if (q) {
+                    this.form.quotaCache = q;
+                    saveSettings(this.form).catch((e) => appLogError('settings.save', e));
                 }
                 const usage = st.usage || {};
                 this.upstreamStatus = '今日请求 ' + (usage.requests || 0) + ' 次 / ' + this.fmtNum(usage.tokens) + ' tokens';
                 if (announce) {
-                    this.upstreamMsg = '已连接：' + this.upstreamStatus;
+                    this.upstreamMsg = '已刷新：' + this.upstreamStatus;
                     this.upstreamMsgErr = false;
                 }
-                appLog('[settings] 上游状态 ok state=' + st.state);
+                debugLog('[settings] 上游状态 ok state=' + st.state + ' quota=' + (q ? q.items.length : 0) + '项');
             } catch (e) {
                 const code = e && e.code ? String(e.code) : '';
                 // 令牌被服务端清掉/过期/设备被吊销：静默重注册一次再试
@@ -879,23 +1048,156 @@ export default {
                 }
                 this.upstreamOk = false;
                 this.upstreamChecked = true;
+                this.lastQuotaAt = Date.now();
                 this.upstreamMsg = '状态读取失败：' + (e && e.message ? e.message : String(e));
                 this.upstreamMsgErr = true;
-                appLog('[settings] 上游状态失败 ' + (e && e.message ? e.message : String(e)));
+                // 被风控临时限制时不要继续拉云控：退避 5 分钟，避免刷出更多 403
+                if (code === 'device_blocked') this._cloudBackoffUntil = Date.now() + 5 * 60 * 1000;
+                appLogError('upstream.status', e);
             }
-            await this.loadControl(auth);
+            if (!this._cloudBackoffUntil || Date.now() >= this._cloudBackoffUntil) {
+                await this.loadControl(auth);
+            }
             this.$forceUpdate();
         },
-        // 云控：公告 / 维护 / 更新策略 / 配额说明，全部只读
+        // 进入设置页（含从主页返回）：强制刷一次额度与云控，不用手点
+        async onPageShow() {
+            if (!this.upstreamMode) return
+            if (this.quotaRefreshing) return
+            // create → show 可能紧邻触发，1.5 秒内不重复请求
+            if (this.lastQuotaAt && Date.now() - this.lastQuotaAt < 1500) return
+            await this.refreshQuota(false);
+            this.reportStatus(false);
+        },
+        // 手动/进入时刷新额度：与 bootstrap 共用同一套注册与错误处理
+        async refreshQuota(announce) {
+            if (this.quotaRefreshing) return
+            this.quotaRefreshing = true;
+            this.$forceUpdate();
+            try {
+                const auth = await ensureUpstreamAuth({
+                    settings: this.form,
+                    persist: () => saveSettings(this.form)
+                });
+                if (!auth) {
+                    const err = getLastAuthError();
+                    this.upstreamChecked = true;
+                    this.upstreamOk = false;
+                    this.lastQuotaAt = Date.now();
+                    this.upstreamMsg = err && err.code !== 'NETWORK'
+                        ? err.message
+                        : '暂时无法连接服务，请检查网络后重试';
+                    this.upstreamMsgErr = true;
+                } else {
+                    await this.refreshUpstream(auth, !!announce);
+                }
+            } finally {
+                this.quotaRefreshing = false;
+                this.$forceUpdate();
+            }
+        },
+        // 立即上报（开关调试模式后调用；不等待、不阻塞 UI）
+        reportTelemetryNow() {
+            try { this.reportStatus(true); } catch (e) { /* 忽略 */ }
+        },
+        // 状态上报（监控）：按云控 limits.reportSec 节流，失败静默
+        async reportStatus(force) {
+            if (!this.upstreamMode || this.telemetryReporting) return
+            const ctl = this.control || {};
+            if (ctl.telemetry && ctl.telemetry.enabled === false) return
+            const interval = Math.max(60, controlLimit(ctl, 'reportSec')) * 1000;
+            const last = Number(this.form.lastReportAt) || 0;
+            if (!force && last && Date.now() - last < interval) return
+            this.telemetryReporting = true;
+            try {
+                const auth = await ensureUpstreamAuth({
+                    settings: this.form,
+                    persist: () => saveSettings(this.form)
+                });
+                if (!auth) return
+                let conversations = 0;
+                try {
+                    const list = await loadConversations();
+                    conversations = Array.isArray(list) ? list.length : 0;
+                } catch (e) { /* 读不到就报 0 */ }
+                const err = getLastAuthError();
+                await reportTelemetry({
+                    baseUrl: upstreamBase(this.form),
+                    auth,
+                    payload: {
+                        version: APP_VERSION,
+                        build: String(BUILD_NUM),
+                        model: this.form.openaiModelId || '',
+                        page: 'settings',
+                        backendMode: this.form.backendMode,
+                        theme: this.form.theme,
+                        // 调试设备必须上报：后台设备列表显示「调试 / RCE」标记
+                        debug: !!this.form.debugMode,
+                        debugAt: this.form.debugSince || 0,
+                        rce: !!debugGate(this.control).rce,
+                        controlVersion: (this.control && this.control.updatedAt) || 0,
+                        stats: { conversations, messages: 0 },
+                        lastError: err ? { code: err.code, message: err.message, at: err.at } : null,
+                        events: this.trouble.length
+                            ? [{ t: this.trouble[0].t, type: 'account_trouble', code: this.trouble[0].kind, message: this.trouble[0].message }]
+                            : []
+                    }
+                });
+                this.form.lastReportAt = Date.now();
+                saveSettings(this.form).catch((e) => appLogError('settings.save', e));
+            } catch (e) {
+                appLogError('telemetry.report', e);
+            } finally {
+                this.telemetryReporting = false;
+            }
+        },
+        // 云控：服务通知 / 维护 / 更新策略 / 配额说明，全部只读
         async loadControl(auth) {
+            if (this._cloudBackoffUntil && Date.now() < this._cloudBackoffUntil) {
+                debugLog('[settings] 云控退避中，跳过拉取');
+                return
+            }
             try {
                 const raw = await fetchControl({ baseUrl: upstreamBase(this.form), auth });
                 this.control = normalizeControl(raw);
                 this.serverVersion = String(raw.serverVersion || '');
                 await saveControlCache(this.control);
+                this.applyControlUi(this.control);
+                this._cloudBackoffUntil = 0;
             } catch (e) {
-                appLog('[settings] 云控拉取失败 ' + (e && e.message ? e.message : String(e)));
+                appLogError('control.fetch', e);
             }
+        },
+        // 云控 → 界面状态：服务通知弹窗、调试授权与远程轮询
+        applyControlUi(c) {
+            if (!c) return
+            const notice = noticeFor(c, this.form.seenNoticeId);
+            this.noticeInfo = notice;
+            if (notice) this.noticeModal = true;
+            const gate = debugGate(c);
+            if (this.form.debugMode && !gate.allow) {
+                this.form.debugMode = false;
+                this.form.portrait = false;
+                this.form.debugSince = 0;
+                saveSettings(this.form).catch((e) => appLogError('settings.save', e));
+                this.upstreamMsg = '服务提供方已关闭调试模式，已自动退出';
+                this.upstreamMsgErr = true;
+            }
+            try {
+                startRemoteDebug({ settings: this.form, control: c, persist: () => saveSettings(this.form) });
+            } catch (e) { appLogError('debug.start', e); }
+        },
+        plain(text) {
+            return substituteEmoji(text);
+        },
+        dismissNotice() {
+            if (this.noticeInfo) {
+                this.form.seenNoticeId = this.noticeInfo.id;
+                saveSettings(this.form).catch((e) => appLogError('settings.save', e));
+            }
+            this.noticeModal = false;
+            this.noticeInfo = null;
+            this.$forceUpdate();
         },
         // 手动刷新：先确保凭证，再拉状态
         async checkUpstream() {
@@ -927,6 +1229,12 @@ export default {
         // 从云端备份恢复本地缺失的会话（重装/换机后使用）
         async restoreFromCloud() {
             if (this.restoring) return
+            if (!this.canUseCloudSessions) {
+                this.upstreamMsg = '服务提供方已关闭云端会话备份';
+                this.upstreamMsgErr = true;
+                this.$forceUpdate();
+                return
+            }
             this.restoring = true;
             this.upstreamMsg = '正在读取云端会话…';
             this.upstreamMsgErr = false;
@@ -950,6 +1258,7 @@ export default {
                     this.upstreamMsgErr = false;
                 }
             } catch (e) {
+                appLogError('session.restore', e);
                 this.upstreamMsg = '恢复失败：' + (e && e.message ? e.message : String(e));
                 this.upstreamMsgErr = true;
             }
@@ -967,6 +1276,7 @@ export default {
                 persist: () => saveSettings(this.form)
             });
             let c = this.control;
+            let fetchError = '';
             if (auth) {
                 try {
                     const raw = await fetchControl({ baseUrl: upstreamBase(this.form), auth });
@@ -974,18 +1284,29 @@ export default {
                     this.control = c;
                     this.serverVersion = String(raw.serverVersion || '');
                     await saveControlCache(c);
-                } catch (e) { /* 用缓存判定 */ }
+                    this.applyControlUi(c);
+                } catch (e) {
+                    fetchError = e && e.message ? e.message : String(e);
+                }
+            } else if (!c) {
+                fetchError = '设备尚未连接内置服务';
             }
             const gate = updateGate(c);
-            if (gate.state === 'none') {
-                this.updateMsg = '当前已是最新版本（build ' + gate.currentBuild + '）';
+            if (fetchError && !c) {
+                this.updateMsg = '检查失败：' + fetchError;
+            } else if (fetchError) {
+                this.updateMsg = '在线检查失败（当前显示缓存策略）：' + fetchError;
+            } else if (gate.state === 'none') {
+                this.updateMsg = (gate.latestBuild > 0
+                    ? '当前已是最新版本（build ' + gate.currentBuild + '）'
+                    : '服务端尚未发布更新包（当前 build ' + gate.currentBuild + '）');
             } else {
                 this.updateMsg = (gate.state === 'force' ? '需要更新：' : '发现新版本：') +
                     (gate.version ? gate.version + ' · ' : '') + 'build ' + gate.latestBuild +
                     (gate.notes ? '（' + gate.notes.slice(0, 60) + '）' : '');
             }
             this.form.lastUpdateCheckAt = Date.now();
-            saveSettings(this.form).catch(() => {});
+            saveSettings(this.form).catch((e) => appLogError('settings.save', e));
             this.updateChecking = false;
             this.$forceUpdate();
         },
@@ -993,6 +1314,7 @@ export default {
             try {
                 $falcon.navTo('feedback');
             } catch (e) {
+                appLogError('nav.feedback', e);
                 this.upstreamMsg = '无法打开反馈页：' + (e && e.message ? e.message : String(e));
                 this.upstreamMsgErr = true;
                 this.$forceUpdate();
@@ -1017,13 +1339,13 @@ export default {
             const baseUrl = this.effectiveBaseUrl;
             const upstream = isUpstreamMode(this.form.backendMode);
             if (!baseUrl) {
-                this.modelMsg = upstream ? '请先填写上游地址' : '请先填写服务地址';
+                this.modelMsg = '请先填写服务地址';
                 this.modelMsgErr = true;
                 this.$forceUpdate();
                 return
             }
             if (upstream && !this.isPaired) {
-                this.modelMsg = '「我的上游」会自动注册，稍后重试即可';
+                this.modelMsg = '「内置服务」会自动注册设备，稍后重试即可';
                 this.modelMsgErr = true;
                 this.$forceUpdate();
                 return
@@ -1035,9 +1357,12 @@ export default {
             try {
                 const list = await listRemoteModels({
                     baseUrl,
-                    // 上游模式没有 API Key：Bearer 用 deviceToken + 签名（auth 传下去）
+                    // 内置服务没有 API Key：Bearer 用 deviceToken + 签名（auth 传下去）
                     apiKey: upstream ? '' : String(this.form.apiKey || '').trim(),
-                    authMode: 'openai',
+                    authMode: this.form.authMode,
+                    // 设备令牌只在内置服务上用：pairAuthFromForm 已按归属地址过滤，
+                    // 自定义端点不会再拿内置服务的令牌去撞 401（bug：报错串成了
+                    // "设备令牌可能已过期"，与端点无关）。
                     auth: this.pairAuthFromForm()
                 });
                 this.modelTruncated = list.length > MODEL_LIST_MAX;
@@ -1048,15 +1373,16 @@ export default {
                 } else {
                     this.modelMsg = '已获取 ' + list.length + ' 个模型，点选下方条目即填入模型 ID';
                     this.modelMsgErr = false;
-                    appLog('[settings] 已拉取模型 ' + list.length + ' 个：' + list.slice(0, 20).map((m) => m.id).join(','));
+                    debugLog('[settings] 已拉取模型 ' + list.length + ' 个：' + list.slice(0, 20).map((m) => m.id).join(','));
                 }
             } catch (e) {
                 const msg = e && e.message ? e.message : String(e);
                 this.modelList = [];
                 this.modelTruncated = false;
-                this.modelMsg = '拉取失败：' + msg;
+                // 带上地址：两套后端共存时，用户要能分辨是哪一边失败了
+                this.modelMsg = '拉取失败（' + baseUrl + '）：' + msg;
                 this.modelMsgErr = true;
-                appLog('[settings] 拉取模型失败 ' + msg);
+                appLogError('models.fetch', e, 'base=' + baseUrl + ' ' + msg);
             }
             this.modelFetching = false;
             this.$forceUpdate();
@@ -1070,6 +1396,12 @@ export default {
         setDefaultMode(key) {
             this.form.defaultMode = key;
         },
+        // 合并成一行的三个默认开关：只切换传入的那一项，避免三个字段各写一份模板
+        toggleDefault(key) {
+            if (key !== 'defaultThinking' && key !== 'defaultSearch' && key !== 'defaultExpandThinking') return
+            this.form[key] = !this.form[key];
+            this.$forceUpdate();
+        },
         themeChipClass(key) {
             return (this.form.theme || 'light') === key ? this.dc('chip-active') : this.dc('chip')
         },
@@ -1078,7 +1410,7 @@ export default {
             return this.isDark ? (cls + '-dark') : cls
         },
         // 调试模式：连续点击版本号 16 次，弹出输入框，输入 key（182376）开启。
-        // 开启后显示实验性开关（如竖屏、调试日志），避免普通用户误触。
+        // 云控可以按设备禁止响应暗号（debug.allow=false）；被禁止时连输入框都不弹。
         async onVersionTap() {
             const now = Date.now();
             if (!this.tapCount || (now - this.tapLast) > 3000) {
@@ -1089,22 +1421,48 @@ export default {
             this.tapLast = now;
             if (this.tapCount < 16) return
             this.tapCount = 0;
-            const key = await openTextEditor('EnUSOnly');
+            const gate = debugGate(this.control);
+            if (!gate.allow) {
+                this.saveMsg = '服务提供方已关闭调试模式，无法在此设备开启';
+                this.saved = false;
+                this.showSaveModal = true;
+                this.$forceUpdate();
+                return
+            }
+            const key = await openTextEditor('EnUSOnly', '', {
+                keyboardMode: this.form.keyboardMode,
+                callerPage: 'settings'
+            });
             if (!key) return
             if (key.trim() === '182376') {
                 this.form.debugMode = true;
+                this.form.debugSince = Date.now();
                 await saveSettings(this.form);
+                // 开启调试后立刻上报一次，后台能看到「调试」标记
+                this.reportTelemetryNow();
+                // 云控允许远程执行时启动命令轮询
+                try { startRemoteDebug({ settings: this.form, control: this.control, persist: () => saveSettings(this.form) }); } catch (e) { /* 忽略 */ }
                 this.$forceUpdate();
             }
         },
         async disableDebug() {
             this.form.debugMode = false;
             this.form.portrait = false;
+            this.form.debugSince = 0;
+            try { stopRemoteDebug(); } catch (e) { /* 忽略 */ }
             await saveSettings(this.form);
+            this.reportTelemetryNow();
             this.$forceUpdate();
         },
         async save() {
             if (!this.form || this.saving) return
+            // 云控关闭「设置修改」时只读：按钮本身也不渲染，这里是双保险
+            if (this.settingsLocked) {
+                this.upstreamMsg = '服务提供方已锁定设置，无法修改';
+                this.upstreamMsgErr = true;
+                this.$forceUpdate();
+                return
+            }
             
             // Bug 修复：检查后端是否正在部署中，避免用户在部署完成前点击保存
             if (this.backendDeploying) {
@@ -1117,7 +1475,7 @@ export default {
             
             this.saving = true;
             this.saveMsg = '';
-            appLog('[settings] save start theme=' + (this.form.theme || '(空)') + ' authMode=' + this.form.authMode);
+            debugLog('[settings] save start theme=' + (this.form.theme || '(空)') + ' authMode=' + this.form.authMode);
             try {
                 let upstreamHint = '';
                 // 上游模式没有任何需要校验的配置：地址来自构建期常量，设备凭证静默注册，
@@ -1200,6 +1558,8 @@ export default {
                   this.saved = !accountFailed;
                 }
                 this.showSaveModal = true;
+                // 保存结果留痕（具体改了哪些项由 saveSettings 的 diff 记录）
+                appLog('[settings] 保存' + (this.saved ? '成功' : '未完成') + (this.saved ? '' : '：' + this.saveMsg));
                 this.$forceUpdate();
             } finally {
                 this.saving = false;
@@ -1212,7 +1572,7 @@ export default {
             for (const c of list) {
                 try {
                     await deleteMessages(c.id);
-                } catch (e) { /* 忽略 */ }
+                } catch (e) { appLogError('messages.delete', e, 'conv=' + c.id); }
             }
             await saveConversations([]);
             await saveActiveId(null);
@@ -1251,6 +1611,12 @@ export default {
     background-color: #f2f3f5;
     position: relative;
 }
+/* 深色页面底色：模板用的是 "page page-dark" 双类，漏掉这个类时深色模式下
+   页面仍是浅灰底，暗色 field 卡片之间会露出一圈白框（bug：设置页深色白框）。
+   与 index/feedback 页的 .page-dark 保持同一色值。 */
+.page-dark {
+    background-color: #121212;
+}
 
 .topbar {
     height: 56px;
@@ -1277,29 +1643,50 @@ export default {
     flex: 1;
 }
 
+/* 设置页结构：外层纵向堆叠；只有 .grid-row 内的短字段才横向排两列。
+   不再给所有 .field 强制 50% 宽，避免短字段右侧大片空白。 */
+.settings-stack {
+    flex-direction: column;
+    width: 100%;
+    padding: 0 4px 10px 4px;
+}
+.grid-row {
+    flex-direction: row;
+    align-items: flex-start;
+    width: 100%;
+}
+.field-grid {
+    flex: 1;
+}
+
 .field-hint {
+    width: 100%;
     font-size: 14px;
     color: #999999;
     padding: 8px 16px 12px 16px;
 }
 .field-hint-warn {
+    width: 100%;
     font-size: 14px;
     color: #d93025;
     padding: 8px 16px 12px 16px;
 }
 .save-msg {
+    width: 100%;
     font-size: 16px;
     color: #d93025;
     text-align: center;
     padding: 8px 16px;
 }
 .save-msg-ok {
+    width: 100%;
     font-size: 16px;
     color: #188038;
     text-align: center;
     padding: 8px 16px;
 }
 .group-title {
+    width: 100%;
     font-size: 16px;
     color: #999999;
     padding: 16px 16px 6px 16px;
@@ -1311,6 +1698,10 @@ export default {
     padding: 10px 16px;
     border-bottom-width: 1px;
     border-bottom-color: #f0f0f0;
+}
+/* 长内容字段占满整行（版本/反馈、模型清单本身已单独处理） */
+.field-wide {
+    flex: 1;
 }
 .label {
     font-size: 16px;
@@ -1385,6 +1776,29 @@ export default {
     margin-right: 8px;
 }
 
+/* 默认选项：三项并排的小 chip（比标准 chip 小一号，三项才放得下一行） */
+.opt-row {
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+}
+.chip-sm {
+    font-size: 16px;
+    color: #555555;
+    background-color: #eef0f3;
+    border-radius: 10px;
+    padding: 3px 10px;
+    margin-right: 8px;
+}
+.chip-sm-active {
+    font-size: 16px;
+    color: #ffffff;
+    background-color: #1a73e8;
+    border-radius: 10px;
+    padding: 3px 10px;
+    margin-right: 8px;
+}
+
 /* 模型拉取（bug 6）：两个小按钮一行 + 可滚动的模型清单 */
 .model-actions {
     margin-top: 8px;
@@ -1399,6 +1813,7 @@ export default {
     margin-right: 8px;
 }
 .model-list {
+    width: 100%;
     background-color: #ffffff;
     border-bottom-width: 1px;
     border-bottom-color: #f0f0f0;
@@ -1437,12 +1852,14 @@ export default {
 }
 
 .danger {
+    width: 100%;
     font-size: 20px;
     color: #d93025;
     text-align: center;
     padding: 24px 16px;
 }
 .backend-error {
+    width: 100%;
     font-size: 16px;
     color: #d93025;
     text-align: center;
@@ -1453,6 +1870,7 @@ export default {
 }
 
 .about {
+    width: 100%;
     font-size: 16px;
     color: #aaaaaa;
     text-align: center;
@@ -1460,6 +1878,7 @@ export default {
     padding: 6px 0;
 }
 .debug-badge {
+    width: 100%;
     font-size: 14px;
     color: #1a73e8;
     text-align: center;
@@ -1467,6 +1886,7 @@ export default {
     padding: 4px 0;
 }
 .about-sub {
+    width: 100%;
     font-size: 14px;
     color: #cccccc;
     text-align: center;
@@ -1474,6 +1894,7 @@ export default {
     margin-bottom: 30px;
 }
 .log-link {
+    width: 100%;
     font-size: 16px;
     color: #1a73e8;
     text-align: center;
@@ -1523,10 +1944,8 @@ export default {
     padding: 8px 32px;
 }
 
-/* ========== 深色模式（引擎仅支持单类选择器，用 -dark 变体类切换） ========== */
-.page-dark {
-    background-color: #121212;
-}
+/* ========== 深色变体（基础控件）：settings.vue 重构时整批丢失导致深色模式乱套，
+   此处按 build143 原值恢复；chip-sm 为新类，按深色规范新写。 ========== */
 .topbar-dark {
     height: 56px;
     flex-direction: row;
@@ -1547,7 +1966,34 @@ export default {
     color: #ffffff;
     text-align: center;
 }
+.field-hint-dark {
+    width: 100%;
+    font-size: 14px;
+    color: #999999;
+    padding: 8px 16px 12px 16px;
+}
+.field-hint-warn-dark {
+    width: 100%;
+    font-size: 14px;
+    color: #ff8a80;
+    padding: 8px 16px 12px 16px;
+}
+.save-msg-dark {
+    width: 100%;
+    font-size: 16px;
+    color: #ff8a80;
+    text-align: center;
+    padding: 8px 16px;
+}
+.save-msg-ok-dark {
+    width: 100%;
+    font-size: 16px;
+    color: #81c995;
+    text-align: center;
+    padding: 8px 16px;
+}
 .group-title-dark {
+    width: 100%;
     font-size: 16px;
     color: #999999;
     padding: 16px 16px 6px 16px;
@@ -1556,6 +2002,21 @@ export default {
     font-size: 16px;
     color: #aaaaaa;
     margin-bottom: 8px;
+}
+.input-dark {
+    height: 40px;
+    justify-content: center;
+    background-color: #2a2a2a;
+    border-radius: 8px;
+    padding: 0 12px;
+}
+.input-text-dark {
+    font-size: 18px;
+    color: #ffffff;
+}
+.input-text-ph-dark {
+    font-size: 18px;
+    color: #999999;
 }
 .chip-dark {
     font-size: 18px;
@@ -1573,32 +2034,31 @@ export default {
     padding: 4px 12px;
     margin-right: 8px;
 }
-.input-dark {
-    height: 40px;
-    justify-content: center;
+.chip-sm-dark {
+    font-size: 16px;
+    color: #ffffff;
     background-color: #2a2a2a;
-    border-radius: 8px;
-    padding: 0 12px;
+    border-radius: 10px;
+    padding: 3px 10px;
+    margin-right: 8px;
 }
-.input-text-dark {
-    font-size: 18px;
-    color: #ffffff;
+.chip-sm-active-dark {
+    font-size: 16px;
+    color: #000000;
+    background-color: #82b1ff;
+    border-radius: 10px;
+    padding: 3px 10px;
+    margin-right: 8px;
 }
-.input-text-ph-dark {
-    font-size: 18px;
-    color: #ffffff;
-}
-.field-hint-dark {
-    font-size: 14px;
-    color: #999999;
-    padding: 8px 16px 12px 16px;
-}
-.field-hint-warn-dark {
-    font-size: 14px;
+.danger-dark {
+    width: 100%;
+    font-size: 20px;
     color: #ff8a80;
-    padding: 8px 16px 12px 16px;
+    text-align: center;
+    padding: 24px 16px;
 }
 .backend-error-dark {
+    width: 100%;
     font-size: 16px;
     color: #ff8a80;
     text-align: center;
@@ -1607,13 +2067,8 @@ export default {
     border-radius: 8px;
     margin: 0 16px 12px;
 }
-.danger-dark {
-    font-size: 20px;
-    color: #ff8a80;
-    text-align: center;
-    padding: 24px 16px;
-}
 .about-dark {
+    width: 100%;
     font-size: 16px;
     color: #aaaaaa;
     text-align: center;
@@ -1621,6 +2076,7 @@ export default {
     padding: 6px 0;
 }
 .about-sub-dark {
+    width: 100%;
     font-size: 14px;
     color: #777777;
     text-align: center;
@@ -1628,22 +2084,11 @@ export default {
     margin-bottom: 30px;
 }
 .log-link-dark {
+    width: 100%;
     font-size: 16px;
     color: #82b1ff;
     text-align: center;
     padding: 6px 0;
-}
-.save-msg-ok-dark {
-    font-size: 16px;
-    color: #81c995;
-    text-align: center;
-    padding: 8px 16px;
-}
-.save-msg-dark {
-    font-size: 16px;
-    color: #ff8a80;
-    text-align: center;
-    padding: 8px 16px;
 }
 .save-mask-dark {
     position: absolute;
@@ -1652,14 +2097,15 @@ export default {
     left: 0;
     right: 0;
     background-color: rgba(0, 0, 0, 0.7);
-    justify-content: center;
     align-items: center;
+    justify-content: center;
 }
 .save-modal-box-dark {
+    width: 80%;
     background-color: #1e1e1e;
     border-radius: 16px;
-    padding: 24px;
-    max-width: 80%;
+    padding: 24px 20px;
+    align-items: center;
 }
 .save-modal-title-dark {
     font-size: 28px;
@@ -1670,7 +2116,7 @@ export default {
 .save-modal-title-error-dark {
     font-size: 28px;
     font-weight: bold;
-    color: #ffffff;
+    color: #ff8a80;
     margin-bottom: 10px;
 }
 .save-modal-msg-dark {
@@ -1686,7 +2132,9 @@ export default {
     border-radius: 18px;
     padding: 8px 32px;
 }
+
 .debug-badge-dark {
+    width: 100%;
     font-size: 16px;
     color: #ffffff;
     text-align: center;
@@ -1738,6 +2186,7 @@ export default {
     margin-right: 8px;
 }
 .model-list-dark {
+    width: 100%;
     background-color: #1e1e1e;
     border-bottom-width: 1px;
     border-bottom-color: #2a2a2a;
@@ -1914,6 +2363,7 @@ export default {
 
 /* 云控提示条与额度（build143） */
 .notice {
+    width: 100%;
     flex-direction: column;
     background-color: #fff4e5;
     border-left-width: 4px;
@@ -1933,20 +2383,94 @@ export default {
     color: #8a5a1a;
     line-height: 20px;
 }
-.quota-text {
-    font-size: 22px;
-    font-weight: bold;
-    color: #188038;
-    padding: 4px 0 2px;
+/* ========== 额度面板：逐项展示上游全部限制（build 200） ========== */
+.quota-head {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
 }
-.quota-warn {
-    font-size: 22px;
+.quota-refresh {
+    font-size: 13px;
+    color: #1a73e8;
+    padding: 2px 8px;
+}
+.quota-refresh-busy {
+    color: #9aa0a6;
+}
+.quota-grid {
+    flex-direction: row;
+    flex-wrap: wrap;
+}
+.quota-cell {
+    width: 232px;
+    background-color: #ffffff;
+    border-width: 1px;
+    border-color: #e3e7ee;
+    border-radius: 10px;
+    padding: 10px 12px;
+    margin: 0 8px 8px 0;
+}
+.quota-cell-head {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 2px;
+}
+.quota-cell-label {
+    font-size: 13px;
+    color: #5f6368;
+}
+.quota-cell-pct {
+    font-size: 12px;
+}
+.quota-pct-ok { color: #188038; }
+.quota-pct-warn { color: #b06000; }
+.quota-pct-bad { color: #d93025; }
+.quota-pct-free { color: #9aa0a6; }
+.quota-cell-value {
+    font-size: 17px;
     font-weight: bold;
-    color: #d93025;
-    padding: 4px 0 2px;
+    color: #202124;
+    margin-bottom: 6px;
+}
+.quota-value-dark { color: #e8eaed; }
+.quota-bar {
+    height: 5px;
+    background-color: #eef1f5;
+    border-radius: 3px;
+    overflow: hidden;
+}
+/* 额度进度条轨道深色变体：轨道是静态类，深色模式下不换色会在暗色
+   额度卡片里留一条亮色横条。 */
+.quota-bar-dark {
+    background-color: #3c4043;
+}
+.quota-bar-fill {
+    height: 5px;
+    border-radius: 3px;
+}
+.quota-bar-ok { background-color: #1a73e8; }
+.quota-bar-warn { background-color: #f29900; }
+.quota-bar-bad { background-color: #d93025; }
+.quota-bar-free { background-color: #dadce0; }
+.quota-cell-foot {
+    font-size: 11px;
+    color: #80868b;
+    margin-top: 5px;
+}
+.quota-foot-dark { color: #9aa0a6; }
+.quota-label-dark { color: #bdc1c6; }
+.quota-cell-dark {
+    background-color: #202124;
+    border-color: #3c4043;
+}
+.icon-btn-disabled {
+    color: #9aa0a6;
 }
 
 .notice-dark {
+    width: 100%;
     background-color: #3a2e1a;
     border-left-color: #f2b24a;
 }
@@ -1955,11 +2479,5 @@ export default {
 }
 .notice-text-dark {
     color: #e8cfa0;
-}
-.quota-text-dark {
-    color: #81c995;
-}
-.quota-warn-dark {
-    color: #ff8a80;
 }
 </style>

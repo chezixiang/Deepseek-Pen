@@ -4,27 +4,27 @@
             <text class="startup-logo">DeepSeek</text>
             
             <div v-if="status === 'checking'" class="status-container">
-                <text class="spinner">⏳</text>
+                <text class="spinner">…</text>
                 <text class="status-text">{{ builtinEnabled ? '正在启动后端服务...' : '正在启动...' }}</text>
                 <text class="status-detail">{{ statusDetail }}</text>
             </div>
             
             <div v-else-if="status === 'timeout'" class="status-container-error">
-                <text class="error-icon">⚠️</text>
+                <text class="error-icon">!</text>
                 <text class="error-text">启动超时</text>
                 <text class="error-detail">后端服务未能在 60 秒内响应</text>
                 <text class="retry-btn" @click="retry">重试</text>
             </div>
             
             <div v-else-if="status === 'error'" class="status-container-error">
-                <text class="error-icon">❌</text>
+                <text class="error-icon">×</text>
                 <text class="error-text">连接失败</text>
                 <text class="error-detail">{{ errorMessage }}</text>
                 <text class="retry-btn" @click="retry">重试</text>
             </div>
             
             <div v-else-if="status === 'ready'" class="status-container-success">
-                <text class="success-icon">✓</text>
+                <text class="success-icon">√</text>
                 <text class="success-text">启动成功</text>
                 <text class="status-detail">正在进入应用...</text>
             </div>
@@ -35,7 +35,7 @@
 <script>
 
 import { checkBackendHealth } from '../../services/backend-health.js'
-import { BUILTIN_AUTH_ENABLED, loadSettings, saveControlCache, ensureBackendRunning, saveSettings } from '../../services/store.js'
+import { BUILTIN_AUTH_ENABLED, loadSettings, saveControlCache, ensureBackendRunning, saveSettings, appLogError } from '../../services/store.js'
 import { ensureUpstreamAuth, fetchControl, upstreamBase, normalizeControl } from '../../services/cloud-control.js'
 
 export default {
@@ -92,6 +92,7 @@ export default {
             try {
                 await this.doBackendCheck();
             } catch (e) {
+                appLogError('startup', e);
                 this.status = 'error';
                 this.errorMessage = '启动流程异常：' + (e && e.message ? e.message : String(e));
             }
@@ -104,12 +105,12 @@ export default {
             try {
                 settings = await loadSettings();
                 $falcon.__dsTheme = (settings && settings.theme) || 'light';
-            } catch (e) { /* 忽略，主页会自行兜底 */ }
+            } catch (e) { appLogError('startup.settings', e); }
 
             // 账号登录模式已暂停：不部署、不拉起、不探测任何本机后端。
             // 两种后端各自判断"是否配置完成"：
             // - 自定义端点：服务地址 + API Key（或配对令牌）
-            // - 我的上游：上游地址 + 设备配对（loadSettings 已算好 endpointConfigured）
+            // - 内置服务：服务地址 + 设备配对（loadSettings 已算好 endpointConfigured）
             if (!BUILTIN_AUTH_ENABLED) {
                 const upstream = !!(settings && settings.upstreamMode);
                 // 上游模式：用户没有任何配置要做。这里只做两件后台事：
@@ -117,7 +118,7 @@ export default {
                 //   2) 拉一次云控（公告、维护、更新策略），失败就用缓存。
                 // 注册失败也放行进主页：聊天时会给出可重试的错误，比卡在启动页好。
                 if (upstream) {
-                    this.statusDetail = '正在连接我的上游…';
+                    this.statusDetail = '正在连接内置服务…';
                     this.$forceUpdate();
                     const auth = await ensureUpstreamAuth({
                         settings,
@@ -128,10 +129,10 @@ export default {
                         try {
                             const raw = await fetchControl({ baseUrl: upstreamBase(settings), auth, timeout: 4000 });
                             await saveControlCache(normalizeControl(raw));
-                        } catch (e) { /* 云控失败不影响进入 */ }
+                        } catch (e) { appLogError('startup.control', e); }
                     }
                     this.status = 'ready';
-                    this.statusDetail = auth ? '已连接我的上游' : '服务暂时不可用，稍后可重试';
+                    this.statusDetail = auth ? '已连接内置服务' : '服务暂时不可用，稍后可重试';
                     this.scheduleNav('index');
                     return
                 }
@@ -233,7 +234,7 @@ export default {
                     this.statusDetail = result.error || '正在等待后端服务...';
                 }
             } catch (err) {
-                console.log('Health check error:', err);
+                appLogError('startup.health', err);
             } finally {
                 this.checkingBackend = false;
             }
