@@ -26,14 +26,27 @@ export function normalizeConversation(c) {
 export function stripImagePayloads(list) {
   if (!Array.isArray(list)) return list
   return list.map((m) => {
-    if (!m || !Array.isArray(m.images) || m.images.length === 0) return m
+    const hasImages = m && Array.isArray(m.images) && m.images.length > 0
+    const hasFiles = m && Array.isArray(m.files) && m.files.length > 0
+    if (!hasImages && !hasFiles) return m
     const copy = Object.assign({}, m)
     const clean = (imgs) => imgs.map((i) => ({ name: i.name, path: i.path, dataUrl: null }))
-    copy.images = clean(copy.images)
-    if (Array.isArray(copy.revisions)) {
-      copy.revisions = copy.revisions.map((r) => (r && Array.isArray(r.images))
-        ? Object.assign({}, r, { images: clean(r.images) })
-        : r)
+    if (hasImages) {
+      copy.images = clean(copy.images)
+      if (Array.isArray(copy.revisions)) {
+        copy.revisions = copy.revisions.map((r) => (r && Array.isArray(r.images))
+          ? Object.assign({}, r, { images: clean(r.images) })
+          : r)
+      }
+    }
+    if (hasFiles) {
+      const cleanFiles = (fs) => fs.map((f) => ({ name: f.name, path: f.path, size: f.size || 0, mime: f.mime || '', dataUrl: null }))
+      copy.files = cleanFiles(copy.files)
+      if (Array.isArray(copy.revisions)) {
+        copy.revisions = copy.revisions.map((r) => (r && Array.isArray(r.files))
+          ? Object.assign({}, r, { files: cleanFiles(r.files) })
+          : r)
+      }
     }
     return copy
   })
@@ -51,6 +64,7 @@ export function normalizeMessages(list) {
         msg.revisions = [{
           content: msg.content || '',
           images: msg.images || [],
+          files: msg.files || [],
           createdAt: msg.createdAt
         }]
       }
@@ -60,6 +74,7 @@ export function normalizeMessages(list) {
       const rev = msg.revisions[msg.activeRevision]
       msg.content = rev.content || ''
       msg.images = rev.images || []
+      msg.files = rev.files || []
     } else if (msg.role === 'assistant') {
       if (!Array.isArray(msg.attempts) || msg.attempts.length === 0) {
         msg.attempts = [{

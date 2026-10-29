@@ -1,6 +1,34 @@
 import fs from 'fs';
 import globalModule from 'global';
-import { BUILD_NUM } from './build-info.js';
+import { BUILD_NUM, APP_VERSION } from './build-info.js';
+import { shellFileSize, shellTruncate, shellWriteFile } from './shell-write.js';
+// 日志统一由 app-log.js 写入：此前 store.js 与 app-log.js 各有一份 read-then-write
+// 实现，两个队列并发改写同一个文件会互相覆盖（日志丢行、轮转错乱）。
+// 现在只保留一个写入方，store 侧只做转发。
+import {
+  appLog,
+  appLogError,
+  appLogSetting,
+  appLogTail,
+  appLogClear,
+  backendLogTail,
+  backendLogClear,
+  buildLogBundle,
+  debugLog,
+  errText,
+  readAppLogFull,
+  setLogVerbose
+} from './app-log.js';
+
+// shell 写入兼容层的依赖桥（本模块内已有的原生封装；函数声明提升，模块级引用安全）
+const _shellBridge = {
+  execShell: (cmd) => execShell(cmd),
+  shq: (s) => shq(s),
+  waitForFile: (p, t, c) => waitForFile(p, t, c),
+  sleep: (ms) => sleep(ms),
+  dataDirBase: () => dataDirBase(),
+  joinPath: (b, ...p) => joinPath(b, ...p)
+};
 
 // 系统输入法编辑器封装：调用设备系统级输入法（有道输入法 youdao-im）编辑文本。
 
@@ -24,6 +52,12 @@ const INPUT_TYPES = {
    */
   RECORD_PREFERRED: 'RecordPreferred'
 };
+
+// loadSettings 的最近一次结果：输入法选择需要在 openTextEditor 内同步读取。
+// 页面启动时都会先 loadSettings，缓存未就绪时保持系统键盘，行为不变。
+let cachedSettings = null;
+// 启动配置摘要只在进程内第一次 loadSettings 时写一行（见 loadSettings）
+let _settingsSummaryLogged = false;
 
 let _g$1 = null;
 function g$1() {
@@ -184,88 +218,9 @@ function openTextEditor$1(inputType = INPUT_TYPES.ZH_CN_PREFERRED, initialText =
   })
 }
 
-// 应用侧文件日志：默认开启，写入 $dataDir/ds-app.log（追加模式）。
-
-const LOG_FILE = () => String($dataDir || '/tmp/').replace(/\/+$/, '') + '/ds-app.log';
-const MAX_LOG_LINES = 500;
-
-let logQueue = Promise.resolve();
-
-// 追加一行日志（带时间戳）。串行队列保证多行不互相覆盖。失败静默，不影响主流程。
-function appLog(...args) {
-  const line = new Date().toISOString() + ' | ' + args.map(String).join(' ');
-  logQueue = logQueue.then(() => doAppend(line)).catch(() => {});
-  return logQueue
-}
-
-async function doAppend(line) {
-  try {
-    let prev = '';
-    try {
-      const raw = await fs.readFile(LOG_FILE());
-      if (raw) prev = String(raw);
-    } catch (e) { /* 首次写入，无旧文件 */ }
-    const next = (prev ? prev.replace(/^\[object Promise\]\n?/, '') + '\n' : '') + line;
-    const lines = next.split('\n');
-    let trimmed = next;
-    if (lines.length > MAX_LOG_LINES) {
-      // 轮转保留（bug 修复）：被挤出的较旧内容转入 .old（尾部 1000 行），
-      // 不再直接丢弃——否则封号等事故发生前的日志无从查证
-      const overflow = lines.slice(0, lines.length - MAX_LOG_LINES).join('\n');
-      try {
-        let prevOld = '';
-        try {
-          const oldRaw = await fs.readFile(LOG_FILE() + '.old');
-          if (oldRaw) prevOld = String(oldRaw);
-        } catch (e) { /* 无上一份 */ }
-        const merged = (prevOld ? prevOld + '\n' : '') + overflow;
-        const oldLines = merged.split('\n');
-        await fs.writeFile(LOG_FILE() + '.old', oldLines.slice(-1000).join('\n'));
-      } catch (e) { /* 忽略 */ }
-      trimmed = lines.slice(-MAX_LOG_LINES).join('\n');
-    }
-    await fs.writeFile(LOG_FILE(), trimmed);
-  } catch (e) { /* 忽略 */ }
-}
-
-// 读取日志：gen=0 当前文件，gen=1 上一份（轮转保留的 .old）
-async function appLogTail(n = 10, gen = 0) {
-  try {
-    const path = LOG_FILE() + (gen === 1 ? '.old' : '');
-    const raw = String(await fs.readFile(path) || '');
-    return raw.split('\n').filter(Boolean).slice(-n).join('\n')
-  } catch (e) {
-    return ''
-  }
-}
-
-// 清空应用日志（含上一份）
-async function appLogClear() {
-  try { await fs.writeFile(LOG_FILE(), ''); } catch (e) { /* 忽略 */ }
-  try { await fs.writeFile(LOG_FILE() + '.old', ''); } catch (e) { /* 忽略 */ }
-}
-
-// ---------- 后端日志（ds-free-api runtime.log） ----------
-// build 22 起 ds-free-api 部署在 $dataDir/ds-free-api，fs 可直接读。
-// 直接用 fs 而不经 native.js，避免与 native.js → appLog 的循环依赖。
-// gen=1 读 runtime.log.1（native.js 截断时保留的上一份，尾部 800 行）。
-const BACKEND_LOG_FILE = (gen = 0) =>
-  String($dataDir || '/tmp/').replace(/\/+$/, '') +
-  '/ds-free-api/logs/runtime.log' + (gen === 1 ? '.1' : '');
-
-async function backendLogTail(n = 100, gen = 0) {
-  try {
-    const raw = String(await fs.readFile(BACKEND_LOG_FILE(gen)) || '');
-    return raw.split('\n').filter(Boolean).slice(-n).join('\n')
-  } catch (e) {
-    return ''
-  }
-}
-
-async function backendLogClear() {
-  try { await fs.writeFile(BACKEND_LOG_FILE(0), ''); } catch (e) { /* 忽略 */ }
-  try { await fs.writeFile(BACKEND_LOG_FILE(1), ''); } catch (e) { /* 忽略 */ }
-}
+// 应用日志 / 后端日志的实现统一在 services/app-log.js（唯一写入方）。
+// 历史上这里有一份完全相同的 read-then-write 实现，和 app-log.js 的队列并发
+// 改写同一个文件，会互相覆盖导致丢行；现已删除，store 只做转发导出。
 
 // ---------- 网络抓取（ds-free-api net-capture.jsonl） ----------
 // 「启用调试日志」开关联动抓取的上游报文（后端 net_capture.rs 双向落盘，
@@ -277,7 +232,10 @@ const NET_CAPTURE_FILE = (gen = 0) =>
 
 async function netCaptureClear() {
   for (const gen of [0, 1, 2]) {
-    try { await fs.writeFile(NET_CAPTURE_FILE(gen), ''); } catch (e) { /* 忽略 */ }
+    try {
+      const r = await fs.writeFile(NET_CAPTURE_FILE(gen), '');
+      if (r === false) throw new Error('fs write unavailable');
+    } catch (e) { await shellTruncate(_shellBridge, NET_CAPTURE_FILE(gen)).catch(() => {}); }
   }
 }
 
@@ -339,14 +297,11 @@ function makeErr(code, msg) {
   return { ok: false, code, message: msg }
 }
 
-// 调试日志全局开关：由设置页"启用调试日志"控制，避免每次输入/请求都刷日志。
-let _debugLogEnabled = false;
+// 调试日志全局开关：由设置页"启用调试日志"控制。
+// 开启后 debugLog 同时写入文件日志（[debug] 前缀），关闭时完全不产生噪声。
+// 实现在 app-log.js，store 只保留对外入口（native.js 有自己的同名导出）。
 function setDebugLogEnabled(v) {
-  _debugLogEnabled = !!v;
-}
-function debugLog(...args) {
-  if (!_debugLogEnabled) return
-  try { console.error('DSLOG | ' + args.join(' ')); } catch (e) { /* 忽略 */ }
+  setLogVerbose(v);
 }
 
 let _g = null;
@@ -387,8 +342,24 @@ async function readFileWithShellFallback(path) {
   return String(via)
 }
 
+// OS 4.9.7 的 falcon fs 没有 fs.writeFile（真机确认）：先试 fs，失败走 shell base64 兜底
 async function writeFile(path, content) {
-  try { return await fs.writeFile(path, content) } catch (e) { return false }
+  try {
+    const ok = await fs.writeFile(path, content);
+    if (ok !== false) return true
+  } catch (e) { /* fs.writeFile 缺失或失败 → shell 兜底 */ }
+  return shellWriteFile(_shellBridge, path, content)
+}
+
+// fs.writeFile 在个别机型上会静默失败（返回 false / 内容未落盘）：
+// chatStream 的 req/cfg 文件写空会让 curl 报「no URL specified!」这种毫无信息量的错。
+// 这里封装「写失败重试一次，仍失败返回 false」——调用方必须检查返回值并给出可读错误。
+async function writeFileRetry(path, content, attempts = 2) {
+  for (let i = 0; i < Math.max(1, attempts); i++) {
+    if (await writeFile(path, content)) return true
+    await sleep(80)
+  }
+  return false
 }
 
 async function exists(path) {
@@ -398,8 +369,9 @@ async function exists(path) {
 async function statSize(path) {
   try {
     const st = await fs.stat(path);
-    return st && st.size ? st.size : 0
-  } catch (e) { return 0 }
+    if (st && st.size) return st.size;
+  } catch (e) { /* fs.stat 缺失或失败 → shell wc -c 兜底 */ }
+  return shellFileSize(_shellBridge, path)
 }
 
 async function readdir(path) {
@@ -764,6 +736,7 @@ async function updateDsFreeApiAccount(user, pass) {
         : '账号已保存，但 DeepSeek 登录未成功（可能是账号密码错误、需要验证码或网络不通；可在"查看日志"里看后端原因）'
     )
   } catch (e) {
+    appLogError('account.update', e);
     return makeErr(10002, '更新失败：' + (e && e.message ? e.message : String(e)))
   }
 }
@@ -810,6 +783,7 @@ async function clearDsFreeApiAccount() {
       message: healthy ? '已移除账号' : '账号已移除，后端仍在重启中'
     }
   } catch (e) {
+    appLogError('account.clear', e);
     return makeErr(10002, '移除账号失败：' + (e && e.message ? e.message : String(e)))
   }
 }
@@ -935,6 +909,7 @@ async function updateDsFreeApiProxy(url) {
     }
     return { ok: true, message: healthy ? '已恢复直连' : '已恢复直连并重启后端，探活未通过' }
   } catch (e) {
+    appLogError('proxy.update', e);
     return makeErr(10002, '更新代理失败：' + (e && e.message ? e.message : String(e)))
   }
 }
@@ -1020,6 +995,7 @@ async function updateDsFreeApiNetCapture(enabled) {
         : (enabled ? '抓取已写入并重启后端，探活未通过（稍后自动恢复）' : '已写入关闭并重启后端，探活未通过')
     }
   } catch (e) {
+    appLogError('capture.update', e);
     return makeErr(10002, '更新网络抓取开关失败：' + (e && e.message ? e.message : String(e)))
   }
 }
@@ -1100,7 +1076,7 @@ async function restartDsFreeApi() {
     '(DS_DATA_DIR=' + shq(DS_FREE_API_DIR) + ' nohup ./ds-free-api >> ' + shq(logFile) + ' 2>&1 & echo $! > ' + shq(pidFile) + ') && ' +
     'printf started > ' + shq(resultFile);
   const execOk = execShell(command);
-  appLog('[restart] execShell=' + execOk + ' oldPid=' + (oldPid || '无'));
+  debugLog('[restart] execShell=' + execOk + ' oldPid=' + (oldPid || '无'));
   if (!execOk) return makeErr(10302, '启动 ds-free-api 重启命令失败')
 
   const result = String(await waitForFile(resultFile, 10000) || '').trim();
@@ -1132,7 +1108,7 @@ async function healthCheck() {
       const out = await waitForFile(probe, 1500);
       execShell('rm -f ' + shq(probe) + ' 2>/dev/null || true');
       if (out !== null && String(out).indexOf('"status":"ok"') >= 0) {
-        appLog('[health] ok port=' + port + ' round=' + (i + 1));
+        debugLog('[health] ok port=' + port + ' round=' + (i + 1));
         return true
       }
     }
@@ -1387,7 +1363,7 @@ async function doDeployBackend() {
   if (targetBinExists) {
     const st = await statSize(targetBin);
     if (st > 0 && (await deployedBackendMatches())) {
-      appLog('[deploy] 已存在且摘要匹配（size=' + st + '），跳过解码比较');
+      debugLog('[deploy] 已存在且摘要匹配（size=' + st + '），跳过解码比较');
       const resultFile = joinDataDir('ds-deploy-result.txt');
       await writeFile(resultFile, '');
       execShell('mkdir -p ' + shq(targetLogDir) + '; chmod +x ' + shq(targetBin) + '; printf unchanged > ' + shq(resultFile));
@@ -1418,7 +1394,6 @@ async function doDeployBackend() {
   appLog('[deploy] 全量部署 start dataDir=' + String($dataDir) + ' target=' + targetDir);
   try {
     const writeB64Ok = await writeFile(tmpB64, BACKEND_B64);
-    appLog('[deploy] write b64=' + writeB64Ok + ' len=' + ('').length);
     if (!writeB64Ok) {
       return makeErr(10402, '写入临时 base64 文件失败（$dataDir=' + String($dataDir) + '）')
     }
@@ -1434,7 +1409,6 @@ async function doDeployBackend() {
       'chmod +x ' + shq(targetBin) + ' && ' +
       'printf updated > ' + shq(resultFile) + '; fi || printf failed > ' + shq(resultFile);
     const execOk = execShell(command);
-    appLog('[deploy] execShell=' + execOk + ' cmdLen=' + command.length);
     if (!execOk) return makeErr(10403, '启动后端更新命令失败')
     const result = String(await waitForFile(resultFile, 30000) || '').trim();
     appLog('[deploy] result=' + (result || '(空)'));
@@ -1448,7 +1422,7 @@ async function doDeployBackend() {
     var backendUpdated = result === 'updated';
     appLog('[deploy] ok updated=' + backendUpdated + ' sha=' + ('无'));
   } catch (e) {
-    appLog('[deploy] EXCEPTION ' + (e && e.message ? e.message : String(e)));
+    appLogError('deploy', e);
     return makeErr(10002, '部署后端失败：' + (e && e.message ? e.message : String(e)))
   } finally {
     execShell('rm -f ' + shq(tmpB64) + ' ' + shq(tmpBin) + ' ' + shq(stagedBin) + ' ' + shq(resultFile) + ' 2>/dev/null || true');
@@ -1545,13 +1519,307 @@ function extractEditFromArgs(args) {
   return { text: '', canceled: false, found: false }
 }
 
+// ---------- 计算器 miniapp 的键盘页面（实验能力） ----------
+// 计算器包内含 pages/tools/keyboard 的完整 Rime 键盘，但没有可被 import 的模块。
+// 调用协议来自计算器外部键盘服务的反编译确认：
+//   kbReq     请求 ID（kb_ + 32 hex）
+//   data      初始文本
+//   inputMode chinese/english/numeric/...
+//   kbCaller  falcon://当前AppID/页面名
+// 结束时计算器页可触发 tools_keyboard 事件，也可 navTo(kbCaller, result) 回来。
+// Loli 键盘宿主应用（旧版计算器包，内含 rime 键盘页）。
+const CALC_APPID = '8001687764241341'
+// 跨应用调用只能弹出键盘、拿不到回传文本：页面完成时只做
+// $falcon.trigger(eventName, …)，而 JS 触发的事件仅作用于当前应用；
+// 回跳 kbCaller 也不带参数（实测 {}）。CloudBrowser 能用是因为它把
+// 键盘和 Rime 引擎整个内置进了自己的包，不是跨应用调用。
+const LOLI_KEYBOARD_CROSS_APP = false
+const CALC_MANIFESTS = [
+  '/userdisk/secondary/miniapp/data/mini_app/pkg/' + CALC_APPID + '/b/manifest.json',
+  '/userdisk/secondary/miniapp/data/mini_app/pkg/' + CALC_APPID + '/a/manifest.json',
+  '/userdata/miniapp/data/mini_app/pkg/' + CALC_APPID + '/b/manifest.json'
+]
+
+async function calculatorKeyboardAvailable() {
+  for (const file of CALC_MANIFESTS) {
+    try {
+      const raw = await fs.readFile(file);
+      if (String(raw || '').indexOf(CALC_APPID) >= 0) return true
+    } catch (e) { /* 尝试下一个安装位置 */ }
+  }
+  return false
+}
+
+function calcInputMode(inputType) {
+  const t = String(inputType || '')
+  // 计算器页只识别 chinese/english/numeric/password/email。
+  if (t.indexOf('EnUS') === 0) return 'english'
+  if (t.indexOf('Numeric') === 0 || t.indexOf('Number') === 0) return 'numeric'
+  return 'chinese'
+}
+
+// 当前 Loli 键盘会话。页面 onNewOptions 收到 kbCaller 返回时据此结算。
+let calcKeyboardSettle = null;
+
+function randomHex32() {
+  let out = ''
+  for (let i = 0; i < 16; i++) out += ('0' + Math.floor(Math.random() * 256).toString(16)).slice(-2)
+  return out
+}
+
+// 统一从事件 / onNewOptions 载荷中取文本。载荷可能有多种包装形态：
+// string、{text,value,data}、{result:{...}}、FalconEvent 包装。
+function extractCalcKeyboardValue(value) {
+  let current = value
+  for (let depth = 0; current && depth < 4; depth++) {
+    if (typeof current === 'string') {
+      // 纯文本回传，也可能是 "data=xxx&kbReq=yyy" 形式的 query 串
+      if (current.indexOf('=') >= 0 && current.indexOf('&') >= 0) {
+        const parsed = {}
+        current.split('&').forEach(function (pair) {
+          const idx = pair.indexOf('=')
+          if (idx <= 0) return
+          const key = pair.slice(0, idx)
+          let val = pair.slice(idx + 1)
+          try { val = decodeURIComponent(val.replace(/\+/g, ' ')) } catch (e) { /* 保留原值 */ }
+          parsed[key] = val
+        })
+        if (Object.keys(parsed).length) { current = parsed; continue }
+      }
+      return { text: current, canceled: false, found: true }
+    }
+    if (typeof current !== 'object') break
+    if (current.canceled === true || current.cancelled === true || current.editCanceled === true) {
+      return { text: '', canceled: true, found: true }
+    }
+    if (current.editConfirmed === false) {
+      return { text: '', canceled: true, found: true }
+    }
+    const direct = ['text', 'value', 'content', 'resultText'];
+    for (const key of direct) {
+      if (typeof current[key] === 'string') {
+        return { text: current[key], canceled: false, found: true }
+      }
+    }
+    // data 可能是结果文本，也可能还是一层包装。
+    if (current.data !== undefined && current.data !== null) {
+      if (typeof current.data === 'string') {
+        return { text: current.data, canceled: false, found: true }
+      }
+      current = current.data
+      continue
+    }
+    if (current.result !== undefined && current.result !== null) {
+      current = current.result
+      continue
+    }
+    break
+  }
+  return { text: '', canceled: false, found: false }
+}
+
+// 跨应用 navTo 的参数必须放在 URI query 里（官方文档 2.1）：
+// 第二个 options 参数会被整体当作页面 data 传给目标页，
+// 直接塞 kbReq/kbCaller 会让目标页收到一个对象（表现为输入框里出现
+// "[object Object]"），回调参数也就全部丢失。
+function buildKbQuery(params) {
+  return Object.keys(params).map(function (key) {
+    // 只对可能含中文/空格的初始文本编码，其余参数保持原样，
+    // 便于目标页按官方正则校验 kbCaller。
+    const value = key === 'data' ? encodeURIComponent(String(params[key])) : String(params[key])
+    return key + '=' + value
+  }).join('&')
+}
+
+function resolveCalcKeyboard(value) {
+  const settle = calcKeyboardSettle
+  if (!settle) return false
+  const r = extractCalcKeyboardValue(value)
+  if (!r.found) return false
+  calcKeyboardSettle = null
+  appLog('[keyboard] Loli 键盘回传已收到：canceled=' + r.canceled + ' len=' + String(r.text || '').length);
+  settle(r.canceled ? null : r.text)
+  return true
+}
+
+// 页面 onNewOptions 必须调用：Loli 键盘 kbCaller 返回时会带结果参数。
+function notifyKeyboardResult(options) {
+  if (!calcKeyboardSettle) return false
+  // 只记结构不记内容：onNewOptions 里带用户刚输入/编辑的文本，不能进会上传的日志
+  try { debugLog('[keyboard] onNewOptions keys=' + Object.keys(options || {}).join(',') + ' len=' + String(options && options.data ? options.data : '').length) } catch (e) { /* 忽略 */ }
+  if (options && typeof options === 'object' && Object.keys(options).length) {
+    if (resolveCalcKeyboard(options)) return true
+  }
+  // 跨应用回跳可能不带参数；键盘在外部模式下会把结果写到
+  // /userdisk/loli/datas/kb_ext_result_<kbReq>.db，这里补读一次。
+  if (calcKeyboardPending) {
+    settleFromResultFile().then(function (ok) {
+      // 结果文件也没有：说明这次回跳没带任何可用文本，
+      // 按“不可用”结算，让调用方回退系统键盘，避免死等。
+      if (!ok) abortKeyboardSession()
+    })
+    return true
+  }
+  return false
+}
+
+function abortKeyboardSession() {
+  const abort = calcKeyboardAbort
+  if (!abort) return false
+  appLog('[keyboard] 回跳未携带文本，回退系统键盘')
+  abort()
+  return true
+}
+
+// 键盘宿主（Loli 键盘）落盘的结果文件。外部模式的返回通道。
+let calcKeyboardPending = null
+let calcKeyboardAbort = null
+let kbEventSeq = 0
+
+function resultPathFor(req) {
+  // 键盘宿主（Loli 键盘）在不同安装位置下的结果文件目录。
+  return [
+    '/userdisk/loli/datas/kb_ext_result_' + req + '.db',
+    '/userdisk/secondary/miniapp/data/mini_app/pkg/' + CALC_APPID + '/data/kb_ext_result_' + req + '.db'
+  ]
+}
+
+async function settleFromResultFile() {
+  const pending = calcKeyboardPending
+  const settle = calcKeyboardSettle
+  if (!pending || !settle) return false
+  for (const file of pending.paths) {
+    try {
+      const raw = await fs.readFile(file)
+      const obj = JSON.parse(String(raw || '{}'))
+      calcKeyboardPending = null
+      calcKeyboardSettle = null
+      appLog('[keyboard] 读取结果文件成功 cancelled=' + !!obj.cancelled + ' len=' + String(obj.value || '').length)
+      settle(obj.cancelled ? null : String(obj.value || ''))
+      return true
+    } catch (e) { /* 尝试下一个路径 */ }
+  }
+  return false
+}
+
+function safeJson(value) {
+  try {
+    const text = JSON.stringify(value)
+    if (!text) return String(value)
+    return text.length > 400 ? text.slice(0, 400) + '…' : text
+  } catch (e) {
+    return String(value)
+  }
+}
+
+async function tryCalculatorKeyboard(inputType, initialText, callerPage) {
+  if (!(await calculatorKeyboardAvailable())) return { available: false }
+  // 上一次会话异常残留时先按取消结算，防止 Promise 与监听器泄漏。
+  if (calcKeyboardSettle) {
+    const prev = calcKeyboardSettle
+    calcKeyboardSettle = null
+    try { prev(null) } catch (e) { /* 忽略 */ }
+  }
+  return new Promise((resolve) => {
+    const text = String(initialText === undefined || initialText === null ? '' : initialText)
+    const req = randomHex32()
+    const resultPaths = resultPathFor(req)
+    // LoliMedia / CloudBrowser 的官方调用方式：
+    //   navTo('falcon://8001687764241341/tools_keyboard', {kbReq, data, placeholder, inputMode, eventName})
+    // 键盘完成后 trigger(eventName, {value, cancelled})，事件名每次递增。
+    kbEventSeq += 1
+    const eventName = 'tools_keyboard_result_' + kbEventSeq
+    let settled = false
+    let eventHandlerId = null
+    let watcher = null
+    let guardTimer = null
+    const cleanup = () => {
+      calcKeyboardSettle = null
+      calcKeyboardAbort = null
+      calcKeyboardPending = null
+      if (watcher) { clearInterval(watcher); watcher = null }
+      if (guardTimer) { clearTimeout(guardTimer); guardTimer = null }
+      if (eventHandlerId !== null) {
+        try { $falcon.off(eventName, eventHandlerId); } catch (e) { /* 忽略 */ }
+        eventHandlerId = null
+      }
+    }
+    const finish = (value) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      resolve({ available: true, text: value })
+    }
+    const abort = () => {
+      if (settled) return
+      settled = true
+      cleanup()
+      resolve({ available: false })
+    }
+    calcKeyboardSettle = finish
+    calcKeyboardAbort = abort
+    const handler = function (event) {
+      const raw = event && typeof event === 'object' && event.data !== undefined ? event.data : event
+      try { debugLog('[keyboard] 收到 ' + eventName + ' 事件 keys=' + Object.keys(raw || {}).join(',')) } catch (e) { /* 忽略 */ }
+      const r = extractCalcKeyboardValue(raw)
+      if (r.found) finish(r.canceled ? null : r.text)
+    }
+    try { eventHandlerId = $falcon.on(eventName, handler); } catch (e) { appLogError('keyboard.subscribe', e, eventName) }
+    // 键盘宿主（外部模式）会把结果写到固定路径，用 kbReq 关联。
+    calcKeyboardPending = { req: req, paths: resultPaths }
+    watcher = setInterval(function () {
+      if (!calcKeyboardSettle) { if (watcher) { clearInterval(watcher); watcher = null } return }
+      settleFromResultFile()
+    }, 1000)
+    // 兜底：页面被系统切走/回跳丢失时不能让 Promise 永久悬挂。
+    guardTimer = setTimeout(function () {
+      if (settled) return
+      appLog('[keyboard] Loli 键盘超时未返回，回退系统键盘')
+      abort()
+    }, 5 * 60 * 1000)
+    const options = {
+      kbReq: req,
+      data: text,
+      placeholder: '请输入内容',
+      inputMode: calcInputMode(inputType),
+      eventName: eventName
+    }
+    try {
+      // 初始文本属于用户输入，日志里只保留配置字段（不要 safeJson(options) 整包）
+      debugLog('[keyboard] navTo ' + CALC_APPID + ' inputType=' + (options && options.inputType) + ' len=' + String((options && options.contents) || '').length)
+      $falcon.navTo('falcon://' + CALC_APPID + '/tools_keyboard', options)
+    } catch (e) {
+      appLogError('keyboard.nav', e)
+      cleanup()
+      resolve({ available: false })
+    }
+  })
+}
+
 /**
- * 打开系统原生输入法编辑当前文本。
+ * 打开文本编辑器。keyboardMode='calculator' 时优先使用计算器小程序的
+ * Rime 键盘；它未安装或调用失败时自动回退系统输入法。
  * @param {string} inputType 键盘模式（见 INPUT_TYPES）
- * @param {string} initialText 预填充文本（用户能直接看到并继续编辑）
+ * @param {string} initialText 预填充文本
+ * @param {{keyboardMode?: string, callerPage?: string}} [opts]
  * @returns {Promise<?string>} 确认后的文本；null=取消；''=确认清空
  */
-function openTextEditor(inputType = INPUT_TYPES.ZH_CN_PREFERRED, initialText = '') {
+async function openTextEditor(inputType = INPUT_TYPES.ZH_CN_PREFERRED, initialText = '', opts = {}) {
+  const mode = String(opts.keyboardMode || (cachedSettings && cachedSettings.keyboardMode) || 'system')
+  if (mode === 'calculator' && LOLI_KEYBOARD_CROSS_APP) {
+    try {
+      const r = await tryCalculatorKeyboard(inputType, initialText, opts.callerPage)
+      if (r.available) return r.text
+      appLog('[keyboard] Loli 键盘不可用，回退系统键盘');
+    } catch (e) {
+      appLogError('keyboard.open', e, '回退系统键盘');
+    }
+  }
+  return openSystemTextEditor(inputType, initialText)
+}
+
+/** 系统原生输入法实现（原 openTextEditor）。 */
+function openSystemTextEditor(inputType = INPUT_TYPES.ZH_CN_PREFERRED, initialText = '') {
   return new Promise((resolve) => {
     const gg = editGlobal();
     if (!gg || typeof gg.startTextEdit !== 'function') {
@@ -1634,6 +1902,8 @@ async function storageSet(key, data) {
     await $falcon.jsapi.storage.setStorage({ key, data: String(data) });
     return true
   } catch (e) {
+    // 持久化失败会让设置/会话在重启后消失，必须进日志
+    appLogError('storage.set', e, 'key=' + key);
     return false
   }
 }
@@ -1641,9 +1911,15 @@ async function storageSet(key, data) {
 async function storageGet(key) {
   try {
     const r = await $falcon.jsapi.storage.getStorage({ key });
+    if (r && r.error) {
+      // 框架用 {error:3} 表示"无此键"，不是故障；其余 code 记录
+      if (Number(r.error) !== 3) appLogError('storage.get', new Error('getStorage error=' + r.error), 'key=' + key);
+      return null
+    }
     if (r && r.data !== undefined && r.data !== null) return String(r.data)
     return null
   } catch (e) {
+    appLogError('storage.get', e, 'key=' + key);
     return null
   }
 }
@@ -1653,6 +1929,7 @@ async function storageRemove(key) {
     await $falcon.jsapi.storage.removeStorage({ key });
     return true
   } catch (e) {
+    appLogError('storage.remove', e, 'key=' + key);
     return false
   }
 }
@@ -1812,7 +2089,11 @@ const BACKEND_MODE_UPSTREAM = 'upstream';
 // 构建期锁定：true 时这个包就是"我的上游"专用客户端——
 // 不显示后端类型选择，也不提供任何端点 / 配对 / 模型配置项。
 // 上游模式下一切静默完成：地址取下面的常量、设备首次联网自动注册、模型由云控下发。
-const LOCK_TO_UPSTREAM = true;
+//
+// 注意：锁定为 true 时 normalizeBackendMode() 恒返回 upstream，
+// 设置页会整体走只读上游面板——「自定义端点」与模型列表都会消失。
+// 默认构建不锁定，两种后端类型都可在设置页切换。
+const LOCK_TO_UPSTREAM = false;
 
 const UPSTREAM_BASE_URL = 'https://penai.aquavie.top/v1';
 
@@ -1839,6 +2120,13 @@ function isUpstreamMode(mode) {
  */
 function resolveBackendBaseUrl({ backendMode, baseUrl, upstreamBaseUrl, defaultBaseUrl } = {}) {
   if (isUpstreamMode(backendMode)) {
+    // 锁定构建（LOCK_TO_UPSTREAM）只认常量，避免"配置漂移"；可切换构建下，
+    // 设置页「服务地址」就是这个模式的覆盖入口——之前这里恒返回常量，字段填了
+    // 也不生效，用户会以为"改了地址没反应"。空值/非法值仍回落到构建期常量。
+    const override = String(upstreamBaseUrl || '').trim();
+    if (!LOCK_TO_UPSTREAM && /^https?:\/\/[^/]+/i.test(override)) {
+      return override.replace(/\/+$/, '')
+    }
     return String(UPSTREAM_BASE_URL ).trim().replace(/\/+$/, '')
   }
   const custom = String(baseUrl || '').trim();
@@ -1896,11 +2184,14 @@ function uid$1(prefix = 'id') {
   return `${prefix}_${Date.now().toString(36)}_${seq}_${Math.floor(Math.random() * 1e6).toString(36)}`
 }
 
-// 兼容旧会话：补全 mode / thinking / search 等字段，避免旧数据因字段缺失导致开关失效。
+// 兼容旧会话：补全 mode / thinking / thinkingLevel / search 等字段，
+// 避免旧数据因字段缺失导致开关失效。thinkingLevel 为空表示"未显式设置"，
+// 由页面按当前模型的挡位表折算（见 thinking-levels.js）。
 function normalizeConversation(c) {
   return Object.assign({
     mode: 'fast',
     thinking: true,
+    thinkingLevel: '',
     search: false
   }, c || {})
 }
@@ -1913,14 +2204,27 @@ function normalizeConversation(c) {
 function stripImagePayloads(list) {
   if (!Array.isArray(list)) return list
   return list.map((m) => {
-    if (!m || !Array.isArray(m.images) || m.images.length === 0) return m
+    const hasImages = m && Array.isArray(m.images) && m.images.length > 0;
+    const hasFiles = m && Array.isArray(m.files) && m.files.length > 0;
+    if (!hasImages && !hasFiles) return m
     const copy = Object.assign({}, m);
     const clean = (imgs) => imgs.map((i) => ({ name: i.name, path: i.path, dataUrl: null }));
-    copy.images = clean(copy.images);
-    if (Array.isArray(copy.revisions)) {
-      copy.revisions = copy.revisions.map((r) => (r && Array.isArray(r.images))
-        ? Object.assign({}, r, { images: clean(r.images) })
-        : r);
+    const cleanFiles = (fs) => fs.map((f) => ({ name: f.name, path: f.path, size: f.size || 0, mime: f.mime || '', dataUrl: null }));
+    if (hasImages) {
+      copy.images = clean(copy.images);
+      if (Array.isArray(copy.revisions)) {
+        copy.revisions = copy.revisions.map((r) => (r && Array.isArray(r.images))
+          ? Object.assign({}, r, { images: clean(r.images) })
+          : r);
+      }
+    }
+    if (hasFiles) {
+      copy.files = cleanFiles(copy.files);
+      if (Array.isArray(copy.revisions)) {
+        copy.revisions = copy.revisions.map((r) => (r && Array.isArray(r.files))
+          ? Object.assign({}, r, { files: cleanFiles(r.files) })
+          : r);
+      }
     }
     return copy
   })
@@ -1938,6 +2242,7 @@ function normalizeMessages(list) {
         msg.revisions = [{
           content: msg.content || '',
           images: msg.images || [],
+          files: msg.files || [],
           createdAt: msg.createdAt
         }];
       }
@@ -1947,6 +2252,7 @@ function normalizeMessages(list) {
       const rev = msg.revisions[msg.activeRevision];
       msg.content = rev.content || '';
       msg.images = rev.images || [];
+      msg.files = rev.files || [];
     } else if (msg.role === 'assistant') {
       if (!Array.isArray(msg.attempts) || msg.attempts.length === 0) {
         msg.attempts = [{
@@ -2004,9 +2310,12 @@ function maskAccountId(id) {
 
 const uid = uid$1;
 
-// 应用版本号：格式 "主.次.修订 build N"。build N 由 scripts/build-wrapper.js
-// 在每次构建时对 build-info.js 的 BUILD_NUM 自动 +1（#17），便于用户确认是否更新。
-const APP_VERSION = '0.1.5 build ' + BUILD_NUM;
+// 应用版本号：来自 build-info.js 的 APP_VERSION —— 构建期已融合成单个字符串
+// 字面量 "主.次.修订 build N"（BUILD_NUM 由 scripts/build-wrapper.js 每次构建
+// 自动 +1，#17），便于用户确认是否更新。
+// ⚠ 不要改回运行时拼接（'0.2.0 build ' + BUILD_NUM）：dev/未常量折叠的产物里
+// 拼接形态不会生成 "0.2.0 build 176" 这样的完整字面量，发布后台扫描包内
+// JS/字节码文本时认不出构建号，上传 AMR 会报「未能从包内提取构建号」。
 
 const KEY_CONVERSATIONS = 'ds:conversations';
 const KEY_SETTINGS = 'ds:settings';
@@ -2038,32 +2347,43 @@ const DEFAULT_SETTINGS = {
   // pairSecret    每设备签名密钥（HMAC-SHA256，服务端可轮换）
   // pairExpiresAt 令牌到期时间（ms 时间戳；0 表示服务端未返回过期时间）
   // pairTlsPin    证书公钥锁定（sha256//Base64(SPKI)，留空不启用）
+  // pairBaseUrl   配对时的服务地址：设备令牌只对签发它的服务有效，切到别的
+  //               端点（如从内置服务切到自定义端点）时必须停用，否则请求带着
+  //               别人的令牌被 401 拒绝，还会误报成"令牌过期"。
   // 三者（deviceId/token/secret）齐全才算已配对；未配对时全部请求走旧行为。
   pairDeviceId: '',
   pairToken: '',
   pairSecret: '',
   pairExpiresAt: 0,
   pairTlsPin: '',
+  pairBaseUrl: '',
   // 静默注册完成时间（诊断用；凭证仍是上面四项）
   lastEnrollAt: 0,
   // 最近一次配额快照：断网时设置页显示上次结果，而不是一片空白
   quotaCache: null,
-  // 自动更新：用户跳过的构建号、已读公告 id、上次检查时间
+  // 自动更新：用户跳过的构建号、上次检查时间
   skippedUpdateBuild: 0,
-  seenAnnouncementId: '',
+  // 已读的服务通知 id（noticeId 变化后才再弹）
+  seenNoticeId: '',
   lastUpdateCheckAt: 0,
+  // 状态上报节流（监控心跳）。服务端按云控 limits.reportSec 下发间隔。
+  lastReportAt: 0,
   defaultMode: 'fast',
   defaultThinking: true,
   defaultSearch: false,
   defaultExpandThinking: true,
-  // 流式输出（SSE）已固定开启，不再提供开关：非流式分支在设备上体验差
-  // （整段等完才出字），且两条路径要各自维护错误处理。旧设置里的 sse 字段被忽略。
+  // 流式输出（SSE）固定开启：非流式分支在设备上体验差（整段等完才出字），
+  // 且两条路径要各自维护错误处理，因此不设开关。
   systemPrompt: '',
   portrait: false,
   debugMode: false,
+  // 进入调试模式的时间（监控上报用；也用于后台判断是否仍在调试）
+  debugSince: 0,
   debugLog: false,
   // Emoji 字体（实验）：联网下载 NotoColorEmoji 并注册，解决 emoji 白块
   emojiFont: false,
+  // 输入键盘：'system' 系统输入法 | 'calculator' 计算器 miniapp 的 Rime 键盘（不可用时自动回退）
+  keyboardMode: 'system',
   // 深色模式：'light' | 'dark'（词典笔无系统深色，去掉 auto）
   theme: 'light'
 };
@@ -2112,13 +2432,17 @@ async function getJSON(key, fallback) {
   if (fileRaw !== null && fileRaw !== undefined && String(fileRaw).trim() !== '') {
     try {
       return JSON.parse(String(fileRaw))
-    } catch (e) { /* 文件损坏则继续走 storage */ }
+    } catch (e) {
+      // 文件损坏会被静默当成"没有数据"（用户表现为设置/会话全部丢失），必须留痕
+      appLogError('store.parse', e, 'key=' + key + ' file=' + filePathFor(key));
+    }
   }
   const raw = await storageGet(key);
   if (raw === null || raw === undefined || raw === '') return fallback
   try {
     return JSON.parse(raw)
   } catch (e) {
+    appLogError('store.parse', e, 'key=' + key + ' source=storage');
     return fallback
   }
 }
@@ -2131,10 +2455,12 @@ async function setJSON(key, value) {
     okFile = await writeFile(filePathFor(key), text);
   } catch (e) {
     okFile = false;
+    appLogError('store.write', e, 'key=' + key);
   }
   if (!okFile) {
     // 文件写失败（磁盘满/权限）时清空旧文件：getJSON 是文件优先，
     // 留着旧内容会把刚写进 storage 的新值永久遮住（读到的是过期数据）
+    appLogError('store.write', new Error('文件写入失败，降级为仅 storage'), 'key=' + key);
     try { await writeFile(filePathFor(key), ''); } catch (e) { /* 尽力而为 */ }
   }
   await storageSet(key, text);
@@ -2198,7 +2524,8 @@ async function loadSettings() {
     appLog('[store] 账号登录模式已暂停，authMode 由 builtin 归一为 openai（原账号信息保留，本机后端 Key 已清空）');
   }
 
-  appLog('[store] loadSettings theme=' + merged.theme + ' authMode=' + merged.authMode + ' backendMode=' + merged.backendMode + ' baseUrl=' + merged.baseUrl + ' apiKey=' + (merged.apiKey ? '已设置' : '空') + ' openaiModelId=' + (merged.openaiModelId || '(空)') + ' paired=' + (merged.pairToken ? '是' : '否'));
+  // 启动配置只记一次（每次进页面都 loadSettings，逐次记录会把真正的事件挤出窗口）。
+  // 设置变更由 saveSettings 的 diff 逐项记录，这里只回答"这次启动时生效的是什么"。
 
   {
     // OpenAI 兼容端点下**不再**回填本机 key：本机 ds-free-api 的 key 对外部端点毫无意义，
@@ -2233,26 +2560,76 @@ async function loadSettings() {
   } else {
     merged.endpointConfigured = !!String(merged.apiKey || '').trim() || pairedNow;
   }
+  merged.keyboardMode = merged.keyboardMode === 'calculator' ? 'calculator' : 'system';
+  if (!_settingsSummaryLogged) {
+    _settingsSummaryLogged = true;
+    appLog('[settings] 启动配置 theme=' + merged.theme +
+      ' authMode=' + merged.authMode +
+      ' backendMode=' + merged.backendMode +
+      ' effectiveBaseUrl=' + (merged.effectiveBaseUrl || '(空)') +
+      ' apiKey=' + (merged.apiKey ? '已设置' : '空') +
+      ' model=' + (merged.openaiModelId || '(默认)') +
+      ' paired=' + (merged.pairToken ? '是' : '否') +
+      ' keyboard=' + merged.keyboardMode +
+      ' debugLog=' + (merged.debugLog ? '开' : '关'));
+  }
+  cachedSettings = merged;
   return merged
 }
 
-async function saveSettings(s) {
-  // 落盘前清掉运行时派生字段：它们由 loadSettings 每次重算，
-  // 写进存储只会留下过期状态（例如迁移标记、dsConfigured、明文密码）。
+// 设置变更日志：saveSettings 是所有设置的唯一落盘口，在这里做一次全量 diff，
+// 比在每个开关处手写日志可靠（漏写一处就查不到"谁改了什么"）。
+// 高频运行时字段（额度缓存、云控缓存、上报时间）不算"设置"，跳过以免刷屏。
+const SETTINGS_LOG_SKIP = {
+  quotaCache: true,
+  controlCache: true,
+  lastReportAt: true,
+  lastControlAt: true,
+  lastControlFetchAt: true,
+  controlFetchedAt: true,
+  noticeSeenId: true,
+  updateSkipBuild: true
+};
+
+function logSettingsDiff(prev, next) {
+  const keys = {};
+  Object.keys(next || {}).forEach((k) => { keys[k] = true; });
+  Object.keys(prev || {}).forEach((k) => { keys[k] = true; });
+  Object.keys(keys).sort().forEach((k) => {
+    if (SETTINGS_LOG_SKIP[k]) return
+    const a = prev ? prev[k] : undefined;
+    const b = next ? next[k] : undefined;
+    // 对象/数组（如模型缓存）不参与逐项日志，避免打出一坨 JSON
+    if (a && typeof a === 'object') return
+    if (b && typeof b === 'object') return
+    if (String(a) === String(b)) return
+    appLogSetting(k, a, b);
+  });
+}
+
+// 落盘前清掉运行时派生字段：它们由 loadSettings 每次重算，写进存储只会留下
+// 过期状态（例如迁移标记、dsConfigured、明文密码）。diff 日志也要用同一份清洗
+// 后的对象，否则会把"派生字段被删除"误记成用户改了设置。
+const SETTINGS_DERIVED_KEYS = [
+  'dsPass', 'dsPassPreview', 'dsConfigured', 'dsConfigReadable',
+  'endpointConfigured', 'builtinModeMigrated', 'builtinAuthAvailable',
+  'effectiveBaseUrl', 'upstreamMode', 'upstreamConfigured', 'paired'
+];
+
+function cleanSettingsForSave(s) {
   const clean = Object.assign({}, s || {});
-  delete clean.dsPass;
-  delete clean.dsPassPreview;
-  delete clean.dsConfigured;
-  delete clean.dsConfigReadable;
-  delete clean.endpointConfigured;
-  delete clean.builtinModeMigrated;
-  delete clean.builtinAuthAvailable;
-  // 后端模式派生字段：每次 loadSettings 重算，不落盘（否则切模式后会留下过期状态）
-  delete clean.effectiveBaseUrl;
-  delete clean.upstreamMode;
-  delete clean.upstreamConfigured;
-  delete clean.paired;
-  return setJSON(KEY_SETTINGS, clean)
+  SETTINGS_DERIVED_KEYS.forEach((k) => { delete clean[k]; });
+  return clean
+}
+
+async function saveSettings(s) {
+  const clean = cleanSettingsForSave(s);
+  const base = cachedSettings || (await getJSON(KEY_SETTINGS, {})) || {};
+  const prev = cleanSettingsForSave(base);
+  logSettingsDiff(prev, clean);
+  const result = await setJSON(KEY_SETTINGS, clean);
+  cachedSettings = Object.assign({}, cachedSettings || {}, clean);
+  return result
 }
 
 async function loadActiveId() {
@@ -2274,7 +2651,9 @@ async function recordAccountTrouble(kind, message) {
     const arr = Array.isArray(list) ? list : [];
     arr.push({ t: Date.now(), kind: String(kind || ''), message: String(message || '').slice(0, 200) });
     await setJSON(KEY_TROUBLE, arr.slice(-20));
-  } catch (e) { /* 忽略 */ }
+    // 账号异常是最需要回溯的事件：同时写进应用日志（会随反馈上传）
+    appLog('[account] 异常取证 kind=' + String(kind || '') + ' msg=' + String(message || '').slice(0, 120));
+  } catch (e) { appLogError('account.trouble', e); }
 }
 
 async function loadAccountTrouble() {
@@ -2416,6 +2795,7 @@ async function loadFeedbackDraft() {
   try {
     return (await getJSON(KEY_FEEDBACK_DRAFT, null)) || null
   } catch (e) {
+    appLogError('feedback.draft.read', e);
     return null
   }
 }
@@ -2424,6 +2804,7 @@ async function saveFeedbackDraft(draft) {
   try {
     return await setJSON(KEY_FEEDBACK_DRAFT, draft || {})
   } catch (e) {
+    appLogError('feedback.draft.save', e);
     return false
   }
 }
@@ -2433,8 +2814,9 @@ async function clearFeedbackDraft() {
     await removeJSON(KEY_FEEDBACK_DRAFT);
     return true
   } catch (e) {
+    appLogError('feedback.draft.clear', e);
     return false
   }
 }
 
-export { readDsFreeApiProxy, APP_VERSION, BUILTIN_AUTH_ENABLED, saveMessages, DEFAULT_SETTINGS, saveConversations, saveActiveId, loadMessages, uid, INPUT_TYPES, recordAccountTrouble, setDebugLogEnabled, loadConversations, loadActiveId, deleteMessages, stopStream, readdir, mkdir, exists, shq, isBuiltinMode, UPSTREAM_ENROLL_TOKEN, DEFAULT_AUTH_MODE, UPSTREAM_BASE_URL, uid$1, normalizeMessages, LOCK_TO_UPSTREAM, readLocalDsPass, saveSettings, deployBackend, appLogTail, readNetCaptureTail, backendLogTail, appLogClear, netCaptureClear, backendLogClear, validateProxyUrl, updateDsFreeApiProxy, updateDsFreeApiNetCapture, loadFeedbackDraft, clearFeedbackDraft, saveFeedbackDraft, BUILD_NUM, appLog, readFile, ensureBackendRunning, loadAccountTrouble, loadAccountList, upsertAccount, isUpstreamMode, updateDsFreeApiAccount, setActiveAccount, loadSettings, clearDsFreeApiAccount, removeAccountById, openTextEditor, execShell, sleep, resolveBackendBaseUrl, saveControlCache, joinPath, upstreamRootUrl, dataDirBase, writeFile, statSize, waitForFile, loadControlCache };
+export { LOLI_KEYBOARD_CROSS_APP, readDsFreeApiProxy, APP_VERSION, BUILTIN_AUTH_ENABLED, saveMessages, DEFAULT_SETTINGS, saveConversations, saveActiveId, loadMessages, uid, INPUT_TYPES, recordAccountTrouble, setDebugLogEnabled, loadConversations, loadActiveId, deleteMessages, stopStream, readdir, mkdir, exists, shq, isBuiltinMode, UPSTREAM_ENROLL_TOKEN, DEFAULT_AUTH_MODE, UPSTREAM_BASE_URL, uid$1, normalizeMessages, LOCK_TO_UPSTREAM, readLocalDsPass, saveSettings, deployBackend, appLogTail, readNetCaptureTail, backendLogTail, appLogClear, netCaptureClear, backendLogClear, validateProxyUrl, updateDsFreeApiProxy, updateDsFreeApiNetCapture, loadFeedbackDraft, clearFeedbackDraft, saveFeedbackDraft, BUILD_NUM, appLog, appLogError, appLogSetting, buildLogBundle, readAppLogFull, debugLog, readFile, ensureBackendRunning, loadAccountTrouble, loadAccountList, upsertAccount, isUpstreamMode, updateDsFreeApiAccount, setActiveAccount, loadSettings, clearDsFreeApiAccount, removeAccountById, openTextEditor, notifyKeyboardResult, abortKeyboardSession, execShell, sleep, resolveBackendBaseUrl, saveControlCache, joinPath, upstreamRootUrl, dataDirBase, writeFile, writeFileRetry, statSize, waitForFile, loadControlCache };

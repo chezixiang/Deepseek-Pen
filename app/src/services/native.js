@@ -5,7 +5,8 @@
 
 import fs from 'fs'
 import globalModule from 'global'
-import { appLog } from './app-log.js'
+import { appLog, appLogError, debugLog as fileDebugLog, isLogVerbose, setLogVerbose } from './app-log.js'
+import { shellFileSize, shellWriteFile } from './shell-write.js'
 import {
   openTextEditor as coreOpenTextEditor,
   isAsrEnabled as coreIsAsrEnabled,
@@ -68,18 +69,16 @@ function makeErr(code, msg) {
   return { ok: false, code, message: msg }
 }
 
-// 调试日志全局开关：由设置页"启用调试日志"控制，避免每次输入/请求都刷日志。
-let _debugLogEnabled = false
+// 调试日志全局开关：由设置页"启用调试日志"控制。
+// 实现在 app-log.js（与 store.js 共用同一个开关与写入队列）：
+// 开启后 debugLog 会以 [debug] 前缀落盘，关闭时完全不产生噪声。
 export function setDebugLogEnabled(v) {
-  _debugLogEnabled = !!v
+  setLogVerbose(v)
 }
 export function debugLogEnabled() {
-  return _debugLogEnabled
+  return isLogVerbose()
 }
-export function debugLog(...args) {
-  if (!_debugLogEnabled) return
-  try { console.error('DSLOG | ' + args.join(' ')) } catch (e) { /* 忽略 */ }
-}
+export const debugLog = fileDebugLog
 
 let _g = null
 function g() {
@@ -142,8 +141,36 @@ export async function readFileWithShellFallback(path) {
   return String(via)
 }
 
+// shell 写入兼容层的依赖桥：全部来自本模块（函数声明已提升，模块级引用安全）
+const _shellBridge = {
+  execShell: (cmd) => execShell(cmd),
+  shq: (s) => shq(s),
+  waitForFile: (p, t, c) => waitForFile(p, t, c),
+  sleep: (ms) => sleep(ms),
+  dataDirBase: () => dataDirBase(),
+  joinPath: (b, ...p) => joinPath(b, ...p)
+}
+
+// OS 4.9.7 的 falcon fs 没有 fs.writeFile（真机确认）：这里先试 fs，
+// 失败则走 shell base64 写入兜底。返回 false = 两条路都失败（调用方必须处理）。
 export async function writeFile(path, content) {
-  try { return await fs.writeFile(path, content) } catch (e) { return false }
+  try {
+    const ok = await fs.writeFile(path, content)
+    if (ok !== false) return true
+  } catch (e) { /* fs.writeFile 缺失或失败 → shell 兜底 */ }
+  return shellWriteFile(_shellBridge, path, content)
+}
+
+// fs.writeFile 在个别机型上会静默失败（返回 false / 内容未落盘）：
+// chatStream 的 req/cfg 文件写空会让 curl 报「no URL specified!」这种毫无信息量的错。
+// 这里封装「写失败重试一次，仍失败返回 false」——调用方必须检查返回值并给出可读错误。
+// 注意：writeFile 本身已带 shell 兜底，重试主要覆盖瞬时失败（磁盘抖动等）。
+export async function writeFileRetry(path, content, attempts = 2) {
+  for (let i = 0; i < Math.max(1, attempts); i++) {
+    if (await writeFile(path, content)) return true
+    await sleep(80)
+  }
+  return false
 }
 
 export async function exists(path) {
@@ -153,8 +180,9 @@ export async function exists(path) {
 export async function statSize(path) {
   try {
     const st = await fs.stat(path)
-    return st && st.size ? st.size : 0
-  } catch (e) { return 0 }
+    if (st && st.size) return st.size
+  } catch (e) { /* fs.stat 缺失或失败 → shell wc -c 兜底 */ }
+  return shellFileSize(_shellBridge, path)
 }
 
 export async function readdir(path) {
@@ -536,6 +564,7 @@ export async function updateDsFreeApiAccount(user, pass) {
         : '账号已保存，但 DeepSeek 登录未成功（可能是账号密码错误、需要验证码或网络不通；可在"查看日志"里看后端原因）'
     )
   } catch (e) {
+    appLogError('account.update', e)
     return makeErr(10002, '更新失败：' + (e && e.message ? e.message : String(e)))
   }
 }
@@ -582,6 +611,7 @@ export async function clearDsFreeApiAccount() {
       message: healthy ? '已移除账号' : '账号已移除，后端仍在重启中'
     }
   } catch (e) {
+    appLogError('account.clear', e)
     return makeErr(10002, '移除账号失败：' + (e && e.message ? e.message : String(e)))
   }
 }
@@ -707,6 +737,7 @@ export async function updateDsFreeApiProxy(url) {
     }
     return { ok: true, message: healthy ? '已恢复直连' : '已恢复直连并重启后端，探活未通过' }
   } catch (e) {
+    appLogError('proxy.update', e)
     return makeErr(10002, '更新代理失败：' + (e && e.message ? e.message : String(e)))
   }
 }
@@ -792,6 +823,7 @@ export async function updateDsFreeApiNetCapture(enabled) {
         : (enabled ? '抓取已写入并重启后端，探活未通过（稍后自动恢复）' : '已写入关闭并重启后端，探活未通过')
     }
   } catch (e) {
+    appLogError('capture.update', e)
     return makeErr(10002, '更新网络抓取开关失败：' + (e && e.message ? e.message : String(e)))
   }
 }
@@ -872,7 +904,7 @@ async function restartDsFreeApi() {
     '(DS_DATA_DIR=' + shq(DS_FREE_API_DIR) + ' nohup ./ds-free-api >> ' + shq(logFile) + ' 2>&1 & echo $! > ' + shq(pidFile) + ') && ' +
     'printf started > ' + shq(resultFile)
   const execOk = execShell(command)
-  appLog('[restart] execShell=' + execOk + ' oldPid=' + (oldPid || '无'))
+  debugLog('[restart] execShell=' + execOk + ' oldPid=' + (oldPid || '无'))
   if (!execOk) return makeErr(10302, '启动 ds-free-api 重启命令失败')
 
   const result = String(await waitForFile(resultFile, 10000) || '').trim()
@@ -904,7 +936,7 @@ async function healthCheck() {
       const out = await waitForFile(probe, 1500)
       execShell('rm -f ' + shq(probe) + ' 2>/dev/null || true')
       if (out !== null && String(out).indexOf('"status":"ok"') >= 0) {
-        appLog('[health] ok port=' + port + ' round=' + (i + 1))
+        debugLog('[health] ok port=' + port + ' round=' + (i + 1))
         return true
       }
     }
@@ -1205,7 +1237,7 @@ async function doDeployBackend() {
   if (targetBinExists) {
     const st = await statSize(targetBin)
     if (st > 0 && (await deployedBackendMatches())) {
-      appLog('[deploy] 已存在且摘要匹配（size=' + st + '），跳过解码比较')
+      debugLog('[deploy] 已存在且摘要匹配（size=' + st + '），跳过解码比较')
       const resultFile = joinDataDir('ds-deploy-result.txt')
       await writeFile(resultFile, '')
       execShell('mkdir -p ' + shq(targetLogDir) + '; chmod +x ' + shq(targetBin) + '; printf unchanged > ' + shq(resultFile))
@@ -1236,7 +1268,6 @@ async function doDeployBackend() {
   appLog('[deploy] 全量部署 start dataDir=' + String($dataDir) + ' target=' + targetDir)
   try {
     const writeB64Ok = await writeFile(tmpB64, BACKEND_B64)
-    appLog('[deploy] write b64=' + writeB64Ok + ' len=' + (BACKEND_B64 || '').length)
     if (!writeB64Ok) {
       return makeErr(10402, '写入临时 base64 文件失败（$dataDir=' + String($dataDir) + '）')
     }
@@ -1252,7 +1283,6 @@ async function doDeployBackend() {
       'chmod +x ' + shq(targetBin) + ' && ' +
       'printf updated > ' + shq(resultFile) + '; fi || printf failed > ' + shq(resultFile)
     const execOk = execShell(command)
-    appLog('[deploy] execShell=' + execOk + ' cmdLen=' + command.length)
     if (!execOk) return makeErr(10403, '启动后端更新命令失败')
     const result = String(await waitForFile(resultFile, 30000) || '').trim()
     appLog('[deploy] result=' + (result || '(空)'))
@@ -1269,7 +1299,7 @@ async function doDeployBackend() {
     if (BACKEND_SHA) await writeFile(backendMarkerPath(), BACKEND_SHA)
     appLog('[deploy] ok updated=' + backendUpdated + ' sha=' + (BACKEND_SHA || '无'))
   } catch (e) {
-    appLog('[deploy] EXCEPTION ' + (e && e.message ? e.message : String(e)))
+    appLogError('deploy', e)
     return makeErr(10002, '部署后端失败：' + (e && e.message ? e.message : String(e)))
   } finally {
     execShell('rm -f ' + shq(tmpB64) + ' ' + shq(tmpBin) + ' ' + shq(stagedBin) + ' ' + shq(resultFile) + ' 2>/dev/null || true')

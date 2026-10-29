@@ -1,5 +1,5 @@
 import { deleteRemoteSession, ensureUpstreamAuth, fetchRemoteSession, listRemoteSessions, purgeRemoteSessions, pushSession, upstreamBase } from './cloud-control.js'
-import { appLog, normalizeMessages, uid$1 as uid } from './store.js'
+import { appLog, appLogError, normalizeMessages, uid$1 as uid } from './store.js'
 
 // 会话云同步（上游模式）。
 
@@ -35,7 +35,10 @@ function queueSessionPush({ settings, conversation, messages, persist }) {
 // 立即推送（删除前/退出时可调用；正常路径走 queueSessionPush）
 async function pushNow({ settings, conversation, messages, persist }) {
   const ctx = await authCtx(settings, persist);
-  if (!ctx) return { ok: false, reason: 'no_auth' }
+  if (!ctx) {
+    appLogError('sync.auth', new Error('设备未注册或网络不可用，会话未上传'), 'conv=' + (conversation && conversation.id));
+    return { ok: false, reason: 'no_auth' }
+  }
   try {
     const r = await pushSession({
       baseUrl: ctx.baseUrl,
@@ -46,7 +49,7 @@ async function pushNow({ settings, conversation, messages, persist }) {
     conversation.remoteSyncedAt = Date.now();
     return { ok: true, result: r }
   } catch (e) {
-    appLog('[sync] 会话上传失败 ' + (conversation && conversation.id) + '：' + (e && e.message ? e.message : String(e)));
+    appLogError('sync.push', e, 'conv=' + (conversation && conversation.id));
     return { ok: false, message: e && e.message ? e.message : String(e) }
   }
 }
@@ -56,13 +59,16 @@ async function syncDelete({ settings, conversation, persist }) {
   const conv = conversation || {};
   if (!settings || !settings.upstreamMode || !conv.id) return { ok: true, skipped: true }
   const ctx = await authCtx(settings, persist);
-  if (!ctx) return { ok: false, reason: 'no_auth' }
+  if (!ctx) {
+    appLogError('sync.auth', new Error('设备未注册或网络不可用，云端会话未删除'), 'conv=' + (conv.id || conv.cloudId));
+    return { ok: false, reason: 'no_auth' }
+  }
   try {
     await deleteRemoteSession({ baseUrl: ctx.baseUrl, auth: ctx.auth, sessionId: conv.cloudId || conv.id });
     appLog('[sync] 已删除云端会话 ' + (conv.cloudId || conv.id));
     return { ok: true }
   } catch (e) {
-    appLog('[sync] 删除云端会话失败 ' + (conv.id) + '：' + (e && e.message ? e.message : String(e)));
+    appLogError('sync.delete', e, 'conv=' + conv.id);
     return { ok: false, message: e && e.message ? e.message : String(e) }
   }
 }
@@ -71,13 +77,16 @@ async function syncDelete({ settings, conversation, persist }) {
 async function syncPurgeAll({ settings, persist }) {
   if (!settings || !settings.upstreamMode) return { ok: true, skipped: true }
   const ctx = await authCtx(settings, persist);
-  if (!ctx) return { ok: false, reason: 'no_auth' }
+  if (!ctx) {
+    appLogError('sync.auth', new Error('设备未注册或网络不可用，云端会话未清空'));
+    return { ok: false, reason: 'no_auth' }
+  }
   try {
     const r = await purgeRemoteSessions({ baseUrl: ctx.baseUrl, auth: ctx.auth });
     appLog('[sync] 已清空云端会话 ' + (r && r.deleted ? r.deleted : 0) + ' 条');
     return { ok: true, deleted: (r && r.deleted) || 0 }
   } catch (e) {
-    appLog('[sync] 清空云端会话失败：' + (e && e.message ? e.message : String(e)));
+    appLogError('sync.purge', e);
     return { ok: false, message: e && e.message ? e.message : String(e) }
   }
 }
@@ -92,10 +101,14 @@ function remoteToMessages(list) {
   for (const m of list || []) {
     if (!m || !m.role) continue
     if (m.role === 'user') {
+      const mapFiles = (fs) => (Array.isArray(fs) ? fs : [])
+        .filter((f) => f && f.path)
+        .map((f) => ({ name: f.name || '', path: f.path, size: Number(f.size) || 0, mime: f.mime || '' }));
       const revisions = Array.isArray(m.revisions) && m.revisions.length
         ? m.revisions.map((r) => ({
           content: r.content || '',
           images: mapImages(r.images),
+          files: mapFiles(r.files),
           createdAt: Number(r.createdAt) || now
         }))
         : null;
@@ -104,6 +117,7 @@ function remoteToMessages(list) {
         role: 'user',
         content: m.content || '',
         images: mapImages(m.images),
+        files: mapFiles(m.files),
         createdAt: Number(m.createdAt) || (now + seq++),
         revisions: revisions || undefined,
         activeRevision: typeof m.activeRevision === 'number' ? m.activeRevision : undefined
@@ -163,7 +177,7 @@ async function pullMissing({ settings, existingIds = [], max = 20, persist } = {
   try {
     list = await listRemoteSessions({ baseUrl: ctx.baseUrl, auth: ctx.auth });
   } catch (e) {
-    appLog('[sync] 拉取云端会话列表失败：' + (e && e.message ? e.message : String(e)));
+    appLogError('sync.list', e);
     return []
   }
   const have = {};
@@ -181,7 +195,7 @@ async function pullMissing({ settings, existingIds = [], max = 20, persist } = {
         messages: remoteToMessages(detail.messages)
       });
     } catch (e) {
-      appLog('[sync] 拉取云端会话失败 ' + s.id + '：' + (e && e.message ? e.message : String(e)));
+      appLogError('sync.fetch', e, 'session=' + s.id);
     }
   }
   if (out.length) appLog('[sync] 已从云端恢复 ' + out.length + ' 条会话');
