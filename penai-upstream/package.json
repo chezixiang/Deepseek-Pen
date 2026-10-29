@@ -1,0 +1,15 @@
+{
+  "name": "deepseek-pen-upstream",
+  "version": "1.7.3",
+  "private": true,
+  "type": "module",
+  "description": "DeepSeek 词典笔客户端上游网关：静默注册 + 云控/配额/遥测/会话备份 + OpenAI 兼容转发 + 防反代",
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test \"test/*.test.js\""
+  }
+}

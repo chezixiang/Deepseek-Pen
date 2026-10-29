@@ -1,0 +1,3090 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>词典笔服务 · 管理后台</title>
+<style>
+  :root {
+    --bg: #f4f6f9;
+    --panel: #ffffff;
+    --panel-2: #fafbfd;
+    --border: #e3e7ee;
+    --border-strong: #d3d9e3;
+    --text: #101828;
+    --muted: #667085;
+    --muted-2: #98a2b3;
+    --accent: #2f6bff;
+    --accent-weak: #eef3ff;
+    --accent-dark: #1d4ed8;
+    --ok: #067647;
+    --ok-weak: #ecfdf3;
+    --warn: #b54708;
+    --warn-weak: #fffaeb;
+    --danger: #b42318;
+    --danger-weak: #fef3f2;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --shadow: 0 1px 2px rgba(16, 24, 40, .04), 0 8px 24px rgba(16, 24, 40, .04);
+    --side: 208px;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  button { font: inherit; }
+
+  /* ---------- 框架 ---------- */
+  .app { display: flex; min-height: 100%; }
+  .side {
+    width: var(--side); flex: none; background: #0f1729; color: #c7d2e4;
+    padding: 18px 12px 14px; display: flex; flex-direction: column; gap: 4px;
+    position: sticky; top: 0; height: 100vh;
+  }
+  .brand { display: flex; align-items: center; gap: 9px; padding: 2px 8px 16px; }
+  .brand .logo {
+    width: 30px; height: 30px; border-radius: 9px; flex: none;
+    background: linear-gradient(135deg, #2f6bff, #6aa2ff);
+    display: flex; align-items: center; justify-content: center;
+    color: #fff; font-weight: 700; font-size: 14px;
+  }
+  .brand b { color: #fff; font-size: 13.5px; letter-spacing: .2px; display: block; }
+  .brand small { color: #7f8ea8; font-size: 11px; }
+  .nav-item {
+    display: flex; align-items: center; gap: 9px; width: 100%;
+    padding: 8px 10px; border: 0; border-radius: 8px; background: transparent;
+    color: #b7c3d6; font-size: 13.5px; cursor: pointer; text-align: left;
+  }
+  .nav-item .ico { width: 17px; text-align: center; font-size: 14px; opacity: .9; }
+  .nav-item:hover { background: rgba(255,255,255,.06); color: #fff; }
+  .nav-item.active { background: #1c2b47; color: #fff; font-weight: 600; }
+  .nav-item .badge {
+    margin-left: auto; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px;
+    background: #2f6bff; color: #fff; font-size: 11px; line-height: 18px; text-align: center;
+  }
+  .side-foot { margin-top: auto; padding: 10px 8px 0; border-top: 1px solid rgba(255,255,255,.08); }
+  .side-foot .row { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #7f8ea8; }
+  .side-foot button {
+    margin-top: 8px; width: 100%; padding: 6px 10px; border-radius: 7px; cursor: pointer;
+    background: rgba(255,255,255,.06); color: #c7d2e4; border: 1px solid rgba(255,255,255,.1);
+  }
+  .side-foot button:hover { background: rgba(255,255,255,.12); color: #fff; }
+
+  .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .topbar {
+    background: rgba(255,255,255,.86); backdrop-filter: blur(6px);
+    border-bottom: 1px solid var(--border); padding: 13px 26px;
+    display: flex; align-items: center; gap: 14px; position: sticky; top: 0; z-index: 20;
+  }
+  .topbar h1 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: .2px; }
+  .topbar .desc { color: var(--muted); font-size: 12px; }
+  .topbar .spacer { flex: 1; }
+  .content { padding: 20px 26px 56px; max-width: 1240px; width: 100%; margin: 0 auto; }
+
+  /* ---------- 基础控件 ---------- */
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 3px 9px; border-radius: 999px; font-size: 12px;
+    border: 1px solid var(--border); background: var(--panel-2); color: var(--muted);
+    white-space: nowrap;
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .pill.ok { color: var(--ok); background: var(--ok-weak); border-color: #abefc6; }
+  .pill.bad { color: var(--danger); background: var(--danger-weak); border-color: #fecdca; }
+  .pill.warn { color: var(--warn); background: var(--warn-weak); border-color: #fedf89; }
+  .tag {
+    display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11.5px;
+    border: 1px solid var(--border); background: var(--panel-2); color: var(--muted); white-space: nowrap;
+  }
+  .tag.ok { color: var(--ok); background: var(--ok-weak); border-color: #abefc6; }
+  .tag.warn { color: var(--warn); background: var(--warn-weak); border-color: #fedf89; }
+  .tag.bad { color: var(--danger); background: var(--danger-weak); border-color: #fecdca; }
+  .tag.blue { color: var(--accent-dark); background: var(--accent-weak); border-color: #c7d7fe; }
+  .muted { color: var(--muted); }
+  .mono { font-family: var(--mono); font-size: 12px; }
+  .nowrap { white-space: nowrap; }
+  .right { text-align: right; }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 16px 18px; margin-bottom: 14px; box-shadow: var(--shadow);
+  }
+  .card h2 { font-size: 13px; margin: 0 0 12px; color: var(--muted); font-weight: 600; letter-spacing: .3px; }
+  .card h3 { font-size: 14px; margin: 0 0 4px; }
+  .card .sub { font-size: 12px; color: var(--muted); margin-bottom: 12px; }
+  .card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+  .card-head h2 { margin: 0; }
+  .card-head .hint { margin: 0; }
+
+  .grid { display: grid; gap: 12px; }
+  .grid.c2 { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  .grid.c3 { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .grid.c4 { grid-template-columns: repeat(auto-fit, minmax(156px, 1fr)); }
+
+  .metric { font-size: 24px; font-weight: 650; letter-spacing: -.4px; line-height: 1.25; }
+  .metric small { font-size: 12px; color: var(--muted); font-weight: 400; margin-left: 5px; letter-spacing: 0; }
+  .metric .up { color: var(--ok); }
+  .metric .down { color: var(--danger); }
+
+  .kv { display: flex; justify-content: space-between; gap: 14px; padding: 6px 0; border-bottom: 1px dashed var(--border); font-size: 13px; }
+  .kv:last-child { border-bottom: 0; }
+  .kv > span:first-child { color: var(--muted); flex: none; }
+  .kv > span:last-child { font-family: var(--mono); font-size: 12.5px; text-align: right; word-break: break-all; }
+
+  input, select, textarea {
+    border: 1px solid var(--border-strong); border-radius: 8px; padding: 7px 10px;
+    font: inherit; font-size: 13px; background: #fff; color: var(--text); outline: none;
+    transition: border-color .12s ease, box-shadow .12s ease;
+  }
+  input[type=checkbox] { width: 15px; height: 15px; accent-color: var(--accent); }
+  textarea { resize: vertical; min-height: 64px; font-family: var(--mono); font-size: 12.5px; }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
+  input:disabled, select:disabled { background: #f5f6f8; color: var(--muted); }
+  .field { display: flex; flex-direction: column; gap: 5px; min-width: 140px; }
+  .field > label { font-size: 12px; color: var(--muted); }
+  .field .hint { margin-top: 0; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+  .row.tight { gap: 6px; }
+  .spacer { flex: 1; }
+
+  button.btn {
+    border: 1px solid var(--border-strong); background: #fff; color: var(--text);
+    padding: 7px 13px; border-radius: 8px; cursor: pointer; font-size: 13px; white-space: nowrap;
+    transition: background .12s ease, border-color .12s ease, color .12s ease;
+  }
+  button.btn:hover { background: #f7f9fc; border-color: #b9c2d0; }
+  button.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.btn.primary:hover { background: var(--accent-dark); border-color: var(--accent-dark); }
+  button.btn.ghost { border-color: transparent; background: transparent; color: var(--muted); }
+  button.btn.ghost:hover { background: #eef1f6; color: var(--text); }
+  button.btn.danger { color: var(--danger); border-color: #fecdca; background: var(--danger-weak); }
+  button.btn.sm { padding: 3px 9px; font-size: 12px; border-radius: 6px; }
+  button.btn:disabled { opacity: .5; cursor: not-allowed; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; background: var(--panel-2); white-space: nowrap; }
+  tbody tr:hover { background: #fafcff; }
+  tr.clickable { cursor: pointer; }
+  tr:last-child td { border-bottom: 0; }
+  .table-wrap { overflow-x: auto; }
+
+  .empty { padding: 28px 16px; text-align: center; color: var(--muted); font-size: 13px; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .hint code, code.inline { background: #f1f4f9; padding: 1px 5px; border-radius: 4px; font-family: var(--mono); font-size: 12px; }
+  .msg { font-size: 12.5px; margin-top: 8px; min-height: 18px; }
+  .msg.ok { color: var(--ok); }
+  .msg.err { color: var(--danger); }
+
+  /* 开关 */
+  .switch { display: flex; align-items: flex-start; gap: 9px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--panel-2); cursor: pointer; }
+  .switch:hover { border-color: #c3ccda; background: #fff; }
+  .switch input { margin: 2px 0 0; flex: none; }
+  .switch .txt { min-width: 0; }
+  .switch .txt b { display: block; font-size: 13px; font-weight: 600; }
+  .switch .txt small { display: block; color: var(--muted); font-size: 11.5px; line-height: 1.45; margin-top: 1px; }
+
+  /* 进度条 */
+  .bar { height: 6px; background: #eef1f5; border-radius: 4px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: var(--accent); border-radius: 4px; }
+  .bar > i.warn { background: #f79009; }
+  .bar > i.bad { background: var(--danger); }
+
+  .quota-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; }
+  .quota-cell { border: 1px solid var(--border); border-radius: 9px; padding: 10px 12px; background: var(--panel-2); }
+  .quota-cell .qhead { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--muted); }
+  .quota-cell .qval { font-size: 16px; font-weight: 650; margin: 3px 0 7px; letter-spacing: -.2px; }
+  .quota-cell .qval small { font-size: 12px; color: var(--muted); font-weight: 400; }
+  .quota-cell .qfoot { font-size: 11px; color: var(--muted-2); margin-top: 6px; }
+
+  /* 抽屉 */
+  .drawer-mask { position: fixed; inset: 0; background: rgba(16,24,40,.34); z-index: 60; display: none; }
+  .drawer-mask.show { display: block; }
+  .drawer {
+    position: fixed; top: 0; right: 0; bottom: 0; width: min(760px, 94vw); background: #fff;
+    z-index: 61; display: flex; flex-direction: column; box-shadow: -12px 0 40px rgba(16,24,40,.18);
+    transform: translateX(102%); transition: transform .18s ease;
+  }
+  .drawer.show { transform: translateX(0); }
+  .drawer-head { padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; gap: 12px; align-items: flex-start; }
+  .drawer-head h3 { margin: 0 0 2px; font-size: 15px; }
+  .drawer-head .sub { font-size: 12px; color: var(--muted); }
+  .drawer-body { padding: 16px 20px 96px; overflow-y: auto; }
+  .drawer-foot { padding: 12px 20px; border-top: 1px solid var(--border); display: flex; gap: 8px; justify-content: flex-end; background: var(--panel-2); }
+
+  /* toast / modal */
+  .toast {
+    position: fixed; right: 22px; bottom: 22px; background: #101828; color: #fff;
+    padding: 10px 16px; border-radius: 8px; font-size: 13px; opacity: 0; transform: translateY(8px);
+    transition: all .18s ease; pointer-events: none; max-width: 460px; z-index: 90;
+  }
+  .toast.show { opacity: 1; transform: translateY(0); }
+  .toast.err { background: var(--danger); }
+  .mask {
+    position: fixed; inset: 0; background: rgba(16, 24, 40, .38);
+    display: none; align-items: center; justify-content: center; padding: 20px; z-index: 80;
+  }
+  .mask.show { display: flex; }
+  .modal { background: #fff; border-radius: 12px; padding: 22px; width: 400px; box-shadow: 0 18px 48px rgba(16,24,40,.2); }
+  .modal h3 { margin: 0 0 6px; font-size: 16px; }
+  .modal p { margin: 0 0 14px; color: var(--muted); font-size: 13px; }
+  .modal input { width: 100%; margin-bottom: 12px; }
+  .modal .row { justify-content: flex-end; }
+
+  .sect { border-top: 1px solid var(--border); margin-top: 16px; padding-top: 14px; }
+  .sect:first-child { border-top: 0; margin-top: 0; padding-top: 0; }
+  .sect-title { font-size: 12px; color: var(--muted); font-weight: 600; letter-spacing: .3px; margin-bottom: 10px; }
+
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+  .legend i { display: inline-block; width: 8px; height: 8px; border-radius: 3px; margin-right: 5px; }
+
+  details.json-box summary { cursor: pointer; font-size: 12.5px; color: var(--muted); padding: 4px 0; }
+  details.json-box textarea { width: 100%; margin-top: 8px; min-height: 260px; background: #fbfcfe; }
+
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+  .toolbar input[type=search] { min-width: 220px; }
+
+  input[type=file] { padding: 8px; border: 1px dashed var(--line); border-radius: 8px; background: #fff; font-size: 12.5px; }
+
+  @media (max-width: 860px) {
+    .side { position: fixed; z-index: 70; transform: translateX(-100%); transition: transform .18s ease; }
+    .side.open { transform: translateX(0); }
+    .content { padding: 16px; }
+    .topbar { padding: 12px 16px; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="side" id="side">
+    <div class="brand">
+      <div class="logo">笔</div>
+      <div>
+        <b>词典笔服务</b>
+        <small id="brandVersion">上游网关</small>
+      </div>
+    </div>
+    <button class="nav-item active" data-tab="overview"><span class="ico">▦</span>概览</button>
+    <button class="nav-item" data-tab="monitor"><span class="ico">◉</span>监控<span class="badge" id="navOnline" style="display:none">0</span></button>
+    <button class="nav-item" data-tab="devices"><span class="ico">▤</span>设备</button>
+    <button class="nav-item" data-tab="control"><span class="ico">◈</span>云控</button>
+    <button class="nav-item" data-tab="releases"><span class="ico">⬆</span>发布</button>
+    <button class="nav-item" data-tab="quota"><span class="ico">▧</span>限额</button>
+    <button class="nav-item" data-tab="models"><span class="ico">◇</span>模型</button>
+    <button class="nav-item" data-tab="provider"><span class="ico">⇄</span>上游</button>
+    <button class="nav-item" data-tab="feedback"><span class="ico">✉</span>反馈<span class="badge" id="navFeedback" style="display:none">0</span></button>
+    <button class="nav-item" data-tab="files"><span class="ico">▣</span>文件</button>
+    <button class="nav-item" data-tab="sessions"><span class="ico">☁</span>会话备份</button>
+    <button class="nav-item" data-tab="audit"><span class="ico">≡</span>审计</button>
+    <button class="nav-item" data-tab="security"><span class="ico">⚿</span>安全</button>
+    <div class="side-foot">
+      <div class="row"><span class="dot" id="authDot" style="color:#22c55e"></span><span id="authText">未登录</span></div>
+      <button id="logoutBtn" style="display:none">退出登录</button>
+    </div>
+  </aside>
+
+  <div class="main">
+    <div class="topbar">
+      <div>
+        <h1 id="pageTitle">概览</h1>
+        <div class="desc" id="pageDesc">服务状态与今日用量</div>
+      </div>
+      <span class="spacer"></span>
+      <span class="pill" id="pillMaintenance" style="display:none"><i class="dot"></i><span>维护中</span></span>
+      <span class="pill" id="pillControl"><i class="dot"></i><span>云控</span></span>
+      <span class="pill" id="pillProvider"><i class="dot"></i><span>上游</span></span>
+      <button class="btn sm ghost" id="refreshBtn">刷新</button>
+    </div>
+
+    <div class="content">
+      <!-- ========== 概览 ========== -->
+      <section id="tab-overview">
+        <div class="grid c4" id="overviewCards"></div>
+        <div class="grid c2" style="margin-top:14px">
+          <div class="card">
+            <div class="card-head"><h2>今日用量</h2><span class="hint" id="overviewToday"></span></div>
+            <div id="todayUsage"></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>近 7 天请求</h2><span class="hint">按天累计</span></div>
+            <div id="statsChart"></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>服务配置</h2><span class="hint" id="configMeta"></span></div>
+          <div id="configList"></div>
+        </div>
+      </section>
+
+      <!-- ========== 监控 ========== -->
+      <section id="tab-monitor" style="display:none">
+        <div class="grid c4" id="monitorCards"></div>
+        <div class="grid c2" style="margin-top:14px">
+          <div class="card">
+            <div class="card-head"><h2>客户端版本分布</h2><span class="hint">按最近一次上报</span></div>
+            <div id="versionChart"></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>模型分布</h2><span class="hint">客户端当前使用</span></div>
+            <div id="modelChart"></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <h2>设备在线状态</h2>
+            <div class="row tight">
+              <select id="monitorWindow">
+                <option value="10">10 分钟内在线</option>
+                <option value="30">30 分钟内在线</option>
+                <option value="120">2 小时内在线</option>
+              </select>
+              <button class="btn sm" id="monitorRefresh">刷新</button>
+            </div>
+          </div>
+          <div class="table-wrap" id="monitorTable"></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>最近上报事件</h2><span class="hint">错误与异常优先展示</span></div>
+          <div class="table-wrap" id="monitorEvents"></div>
+        </div>
+      </section>
+
+      <!-- ========== 设备 ========== -->
+      <section id="tab-devices" style="display:none">
+        <div class="card">
+          <div class="card-head">
+            <h2>设备列表</h2>
+            <div class="row tight">
+              <button class="btn sm" id="devicesRefresh">刷新</button>
+            </div>
+          </div>
+          <div class="toolbar">
+            <input type="search" id="deviceSearch" placeholder="搜索 deviceId / IP / 模型 / 备注" />
+            <select id="deviceState">
+              <option value="">全部状态</option>
+              <option value="active">正常</option>
+              <option value="online">在线</option>
+              <option value="disabled">已停用</option>
+              <option value="blocked">已封禁</option>
+              <option value="revoked">已吊销</option>
+              <option value="expired">令牌过期</option>
+            </select>
+            <span class="spacer"></span>
+            <span class="muted" id="deviceSummary"></span>
+            <select id="bulkAction">
+              <option value="">批量操作…</option>
+              <option value="block">封禁 30 分钟</option>
+              <option value="unblock">解除封禁</option>
+              <option value="disable">停用</option>
+              <option value="enable">恢复启用</option>
+              <option value="revoke">吊销令牌</option>
+              <option value="delete">删除设备</option>
+            </select>
+            <button class="btn sm" id="bulkApply">执行</button>
+          </div>
+          <div class="table-wrap" id="devicesTable"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>配对码（备选开户）</h2><span class="hint">默认由设备静默注册，无需配对码</span></div>
+          <div class="row">
+            <div class="field" style="flex:1">
+              <label>设备上显示的配对码</label>
+              <input id="approveCode" placeholder="例如 K7M2PQ9X" autocomplete="off" maxlength="16" />
+            </div>
+            <div class="field" style="flex:1">
+              <label>设备标识（可选，绑定后其他设备无法使用）</label>
+              <input id="approveDevice" placeholder="完整 deviceId" autocomplete="off" />
+            </div>
+            <button class="btn primary" id="approveBtn">批准配对码</button>
+            <button class="btn" id="createPairingBtn">生成新配对码</button>
+          </div>
+          <div class="table-wrap" id="pairingsTable" style="margin-top:12px"></div>
+        </div>
+      </section>
+
+      <!-- ========== 云控 ========== -->
+      <section id="tab-control" style="display:none">
+        <div class="card">
+          <div class="card-head">
+            <h2>云控总开关</h2>
+            <span class="hint" id="controlMeta"></span>
+          </div>
+          <div class="row" style="align-items:center">
+            <label class="switch" style="flex:1;max-width:420px">
+              <input type="checkbox" id="ctlEnabled" disabled />
+              <span class="txt"><b>云端策略生效</b><small>由 config.json 的 control.enabled 控制；关闭后客户端只按本地默认值运行</small></span>
+            </label>
+            <span class="spacer"></span>
+            <button class="btn primary" id="controlSave">保存并下发</button>
+            <button class="btn" id="controlReload">重新加载</button>
+            <button class="btn danger" id="controlReset">恢复默认</button>
+          </div>
+          <div class="msg" id="controlMsg"></div>
+        </div>
+
+        <div class="grid c2">
+          <div class="card">
+            <div class="card-head"><h2>提示词注入</h2><span class="hint">服务端拼进 system，客户端无感</span></div>
+            <label class="switch">
+              <input type="checkbox" id="prEnabled" />
+              <span class="txt"><b>启用注入</b><small>对所有聊天请求生效；单设备可在详情里覆盖</small></span>
+            </label>
+            <div class="field" style="margin-top:10px"><label>系统提示词（放在最前）</label><textarea id="prSystem" rows="4" placeholder="例如：你是词典笔助手，回答尽量简短，不要输出表格。"></textarea></div>
+            <div class="field" style="margin-top:10px"><label>追加提示词（放在最后）</label><textarea id="prAppend" rows="2" placeholder="例如：回答控制在 120 字以内。"></textarea></div>
+            <div class="hint">只改写转发给上游的本次请求，不落盘、不回显；会占用上下文长度。</div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h2>调试模式 / 远程执行</h2><span class="hint">全局只是授权上限，逐台在设备详情里开关</span></div>
+            <label class="switch">
+              <input type="checkbox" id="dbgAllow" />
+              <span class="txt"><b>允许响应调试暗号</b><small>关闭后连续点版本号输入密钥也不会进入调试模式</small></span>
+            </label>
+            <label class="switch" style="margin-top:8px">
+              <input type="checkbox" id="dbgRce" />
+              <span class="txt"><b>允许远程执行</b><small>设备需同时开启调试模式并轮询命令</small></span>
+            </label>
+            <label class="switch" style="margin-top:8px">
+              <input type="checkbox" id="dbgReport" />
+              <span class="txt"><b>调试设备强制上报</b><small>开启调试的设备必须上报状态，后台可见</small></span>
+            </label>
+            <div class="row" style="margin-top:10px">
+              <div class="field"><label>命令轮询间隔（秒）</label><input id="dbgPollSec" type="number" min="5" max="600" step="1" value="20" /></div>
+            </div>
+            <div class="hint">命令下发在「设备 → 详情 → 调试控制台」，执行结果回传后可在同处查看。</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>维护窗口</h2><span class="hint">开启后客户端禁止发消息</span></div>
+          <label class="switch">
+            <input type="checkbox" id="mntEnabled" />
+            <span class="txt"><b>进入维护模式</b><small>服务端同时拒绝聊天请求；白名单设备不受影响</small></span>
+          </label>
+          <div class="field" style="margin-top:10px"><label>提示文案</label><textarea id="mntMessage" rows="2" placeholder="服务正在升级，预计 30 分钟后恢复"></textarea></div>
+          <div class="field" style="margin-top:10px"><label>结束时间（留空表示手动结束）</label><input id="mntUntil" type="datetime-local" /></div>
+          <div class="hint" id="maintenanceHint"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>功能开关</h2><span class="hint">关闭后客户端隐藏入口；标「阻断」的会同时拦截请求</span></div>
+          <div class="grid c3" id="featureGrid"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>客户端限制</h2><span class="hint">下发即生效，不需要发版</span></div>
+          <div class="grid c3" id="limitGrid"></div>
+        </div>
+
+        <div class="grid c2">
+          <div class="card">
+            <div class="card-head"><h2>应用发布</h2><span class="hint">已迁至独立「发布」页</span></div>
+            <div class="hint" style="margin-top:0">
+              更新包上传、版本号/构建号自动识别、发布历史与受保护下载在
+              <button class="btn sm" id="gotoReleases">前往发布管理</button>。
+            </div>
+            <div class="hint" id="releaseSummary" style="margin-top:10px"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h2>通知与上游披露</h2><span class="hint">服务通知只弹窗，按 id 去重</span></div>
+            <div class="field"><label>服务通知</label><textarea id="ctlNotice" rows="3" placeholder="例如：本服务由 XX 提供，问题请联系…"></textarea></div>
+            <div class="row" style="margin-top:10px">
+              <div class="field"><label>通知 ID（变化才会再弹）</label><input id="ctlNoticeId" placeholder="2026-11-notice" /></div>
+              <div class="field"><label>级别</label>
+                <select id="ctlNoticeLevel"><option value="info">普通</option><option value="warn">提醒</option><option value="critical">重要</option></select>
+              </div>
+            </div>
+            <div class="field" style="margin-top:10px"><label>额度说明</label><textarea id="ctlQuotaHint" rows="2" placeholder="每日额度次日 00:00 重置"></textarea></div>
+            <div class="field" style="margin-top:10px"><label>下发模型（逗号分隔，仅展示）</label><input id="ctlModels" placeholder="deepseek-flash,glm-5.3-flash" /></div>
+            <label class="switch" style="margin-top:10px">
+              <input type="checkbox" id="ctlUpDisclose" />
+              <span class="txt"><b>向客户端披露上游信息</b><small>关闭后只显示「内置服务」，不下发上游名称/模型来源</small></span>
+            </label>
+            <div class="row" style="margin-top:10px">
+              <div class="field"><label>对外显示的上游名称</label><input id="ctlUpName" placeholder="留空 = 用真实名称" /></div>
+              <div class="field"><label>上游备注（设置页展示）</label><input id="ctlUpNote" placeholder="可选" /></div>
+            </div>
+            <label class="switch" style="margin-top:10px">
+              <input type="checkbox" id="ctlTelemetry" />
+              <span class="txt"><b>客户端状态上报</b><small>关闭后监控页不再收到心跳与错误事件</small></span>
+            </label>
+          </div>
+        </div>
+
+        <div class="card">
+          <details class="json-box">
+            <summary>高级：查看 / 编辑云控 JSON（保存同样走校验）</summary>
+            <textarea id="controlJson" spellcheck="false"></textarea>
+            <div class="row" style="margin-top:8px">
+              <button class="btn sm primary" id="controlJsonSave">按 JSON 保存</button>
+              <button class="btn sm" id="controlJsonFill">用当前表单填充</button>
+            </div>
+            <div class="msg" id="controlJsonMsg"></div>
+          </details>
+        </div>
+      </section>
+
+      <!-- ========== 限额 ========== -->
+      <section id="tab-quota" style="display:none">
+        <div class="card">
+          <div class="card-head">
+            <h2>按设备的默认限额</h2>
+            <span class="hint" id="quotaMeta"></span>
+          </div>
+          <div class="hint" style="margin-top:0">
+            0 表示该项不限。保存后立即生效并写入 <code class="inline">data/quota.json</code>。
+            RPM / TPM 为固定分钟窗口；5 小时 Token 为「当前小时 + 前 4 个小时桶」的滚动合计；每日 / 每月按 UTC 结算。
+          </div>
+          <div class="row" style="margin-top:12px">
+            <label class="switch" style="flex:1;max-width:360px">
+              <input type="checkbox" id="qEnabled" />
+              <span class="txt"><b>启用限额</b><small>关闭后只保留防反代与全局并发保护</small></span>
+            </label>
+            <span class="spacer"></span>
+            <span class="muted">预设：</span>
+            <button class="btn sm" data-preset="loose">宽松</button>
+            <button class="btn sm" data-preset="normal">标准</button>
+            <button class="btn sm" data-preset="strict">严格</button>
+          </div>
+          <div class="grid c3" id="quotaForm" style="margin-top:14px"></div>
+          <div class="row" style="margin-top:14px">
+            <button class="btn primary" id="quotaSave">保存并生效</button>
+            <button class="btn" id="quotaReload">重新加载</button>
+            <button class="btn danger" id="quotaReset">恢复 config.json</button>
+          </div>
+          <div class="msg" id="quotaMsg"></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>单设备限额覆盖</h2><span class="hint">在「设备 → 详情」里设置</span></div>
+          <div class="table-wrap" id="quotaOverrideTable"></div>
+        </div>
+      </section>
+
+      <!-- ========== 模型 ========== -->
+      <section id="tab-models" style="display:none">
+        <div class="card">
+          <div class="card-head"><h2>对外模型目录</h2><span class="pill" id="modelCount"><i class="dot"></i><span>—</span></span></div>
+          <div class="table-wrap" id="modelCatalogTable"></div>
+          <div class="hint">客户端 <code class="inline">GET /v1/models</code> 只返回这里列出的模型，不实时请求上游。目录外的模型聊天会直接返回 <code class="inline">unsupported_model</code>。</div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>编辑模型目录</h2><span class="hint">保存后立即生效</span></div>
+          <div class="row">
+            <div class="field" style="flex:2"><label>模型列表（每行一个，也支持逗号分隔）</label><textarea id="mdModels" rows="7" placeholder="deepseek-flash&#10;glm-5.3-flash"></textarea></div>
+            <div class="field" style="flex:1">
+              <label>默认模型</label>
+              <input id="mdDefaultModel" placeholder="deepseek-flash" autocomplete="off" spellcheck="false" />
+              <label style="margin-top:10px">模型映射（每行「客户端=上游」，可留空）</label>
+              <textarea id="mdModelMap" rows="5" placeholder="deepseek-chat=deepseek-flash"></textarea>
+            </div>
+          </div>
+          <div class="row" style="margin-top:12px">
+            <button class="btn primary" id="mdSave">保存模型目录</button>
+            <button class="btn" id="mdReload">刷新</button>
+          </div>
+          <div class="msg" id="mdMsg"></div>
+        </div>
+      </section>
+
+      <!-- ========== 上游 ========== -->
+      <section id="tab-provider" style="display:none">
+        <div class="card">
+          <div class="card-head"><h2>当前上游</h2><span class="pill" id="providerState"><i class="dot"></i><span>加载中…</span></span></div>
+          <div id="providerInfo"></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>选择 / 修改上游</h2><span class="hint">保存后立即生效，无需重启</span></div>
+          <div class="row">
+            <div class="field"><label>快速预设</label><select id="providerPreset"><option value="">选择预设…</option></select></div>
+            <div class="field"><label>名称</label><input id="pvName" placeholder="new-api / deepseek" autocomplete="off" /></div>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <div class="field" style="flex:2"><label>上游地址（OpenAI 兼容，通常以 /v1 结尾）</label><input id="pvBaseUrl" placeholder="https://api.deepseek.com/v1" autocomplete="off" spellcheck="false" /></div>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <div class="field" style="flex:1.4"><label>API Key（留空表示保持不变）</label><input id="pvApiKey" type="password" autocomplete="new-password" placeholder="sk-..." /></div>
+            <div class="field"><label>默认模型</label><input id="pvDefaultModel" placeholder="deepseek-flash" autocomplete="off" spellcheck="false" /></div>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <div class="field" style="flex:2"><label>模型列表（逗号分隔，同时作为客户端可见目录）</label><input id="pvModels" placeholder="deepseek-flash,glm-5.3-flash" autocomplete="off" spellcheck="false" /></div>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <div class="field" style="flex:2"><label>模型映射（每行「客户端模型=上游模型」，可留空）</label><textarea id="pvModelMap" rows="3" placeholder="deepseek-chat=deepseek-flash"></textarea></div>
+          </div>
+          <div class="row" style="margin-top:12px">
+            <button class="btn primary" id="pvSave">保存并应用</button>
+            <button class="btn" id="pvTest">测试连接</button>
+            <button class="btn" id="pvTestChat">测试对话</button>
+            <button class="btn" id="pvPull">从上游拉取模型</button>
+            <button class="btn danger" id="pvClearKey">清除已存密钥</button>
+            <button class="btn" id="pvReset">恢复 config.json</button>
+          </div>
+          <div class="msg" id="pvMsg"></div>
+          <div class="hint">密钥只写不读：页面只显示掩码，保存后写入 <code class="inline">data/provider.json</code>（0600）。</div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>联网搜索 / 网页抓取</h2><span class="hint">客户端 tool call 的统一执行点，保存后立即生效</span></div>
+          <div class="row">
+            <span class="pill" id="toolsState"><i class="dot"></i><span>加载中…</span></span>
+          </div>
+          <div id="toolsInfo" style="margin-top:8px"></div>
+          <div class="row" style="margin-top:10px">
+            <div class="field" style="flex:2"><label>DeepSeek API Key（官方平台，Search/Fetch 按次计费；留空保持不变）</label><input id="toolsApiKey" type="password" autocomplete="new-password" placeholder="sk-..." /></div>
+            <div class="field"><label>每设备每天次数上限（0=不限）</label><input id="toolsPerDay" type="number" min="0" placeholder="100" /></div>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <div class="field"><label>搜索返回条数上限（1~50）</label><input id="toolsMaxCount" type="number" min="1" max="50" placeholder="20" /></div>
+            <div class="field"><label>抓取正文字符上限</label><input id="toolsFetchChars" type="number" min="1000" max="100000" placeholder="12000" /></div>
+            <div class="field"><label>结果摘要字符上限</label><input id="toolsResultChars" type="number" min="100" max="20000" placeholder="2000" /></div>
+          </div>
+          <div class="row" style="margin-top:12px">
+            <label class="switch" style="display:flex;align-items:center;gap:8px;margin-right:16px">
+              <input type="checkbox" id="toolsEnabled" />
+              <span>启用联网搜索（关闭后设备端搜索一律失败降级）</span>
+            </label>
+          </div>
+          <div class="row" style="margin-top:12px">
+            <button class="btn primary" id="toolsSave">保存并应用</button>
+            <button class="btn danger" id="toolsClearKey">清除已存密钥</button>
+            <button class="btn" id="toolsReset">恢复 config.json</button>
+          </div>
+          <div class="msg" id="toolsMsg"></div>
+          <div class="hint">设备侧零密钥：搜索请求经设备签名到 <code class="inline">/v1/tools/search|fetch</code>，网关再持 Key 调官方 Search/Fetch API。密钥保存于 <code class="inline">data/tools.json</code>（0600）。</div>
+        </div>
+      </section>
+
+      <!-- ========== 反馈 ========== -->
+      <section id="tab-feedback" style="display:none">
+        <div class="card">
+          <div class="card-head">
+            <h2>意见 / Bug 反馈</h2>
+            <div class="row tight">
+              <button class="btn sm" id="feedbackRefresh">刷新</button>
+              <button class="btn sm" id="feedbackExport">导出 CSV</button>
+            </div>
+          </div>
+          <div class="toolbar">
+            <input type="search" id="feedbackQ" placeholder="搜索内容 / 设备 / 联系 / 备注" />
+            <select id="feedbackStatus">
+              <option value="">全部状态</option>
+              <option value="open">待处理</option>
+              <option value="handled">已处理</option>
+              <option value="ignored">已忽略</option>
+            </select>
+            <select id="feedbackCategory">
+              <option value="">全部类型</option>
+              <option value="bug">Bug</option>
+              <option value="suggestion">建议</option>
+              <option value="other">其它</option>
+            </select>
+            <input id="feedbackDevice" placeholder="deviceId（可空）" style="max-width:220px" />
+            <select id="feedbackDays">
+              <option value="0">全部时间</option>
+              <option value="1">最近 24 小时</option>
+              <option value="7" selected>最近 7 天</option>
+              <option value="30">最近 30 天</option>
+            </select>
+            <button class="btn sm primary" id="feedbackApply">筛选</button>
+          </div>
+          <div class="hint" id="feedbackMeta" style="margin-top:8px"></div>
+          <div class="table-wrap" id="feedbackTable"></div>
+          <div class="row" id="feedbackPager" style="margin-top:10px;display:none">
+            <button class="btn sm" id="feedbackPrev">上一页</button>
+            <span class="hint" id="feedbackPage" style="margin:0"></span>
+            <button class="btn sm" id="feedbackNext">下一页</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ========== 发布管理 ========== -->
+      <section id="tab-releases" style="display:none">
+        <div class="card">
+          <div class="card-head"><h2>当前发布</h2><span class="hint" id="releaseCurrentMeta"></span></div>
+          <div id="releaseCurrent"></div>
+          <div class="hint" style="margin-top:10px">更新包下载已改为短时设备票据；后台列表不再暴露公开直链。</div>
+        </div>
+
+        <div class="grid c2">
+          <div class="card">
+            <div class="card-head"><h2>上传并发布</h2><span class="hint">版本号 / 构建号自动从 AMR 提取</span></div>
+            <div class="field" style="margin-top:10px">
+              <label>更新包（.amr）</label>
+              <div class="row">
+                <input type="file" id="upFile" accept=".amr,.apk,.zip" style="flex:1" />
+                <button class="btn sm primary" id="upUploadBtn">上传并立即发布</button>
+              </div>
+              <div class="hint" id="upFileMsg">选择构建产物后自动识别 appId、version 和 build；无需手填构建号。</div>
+            </div>
+            <div class="row" style="margin-top:10px">
+              <div class="field"><label>构建号（自动识别）</label><input id="upLatest" type="number" min="0" step="1" readonly /></div>
+              <div class="field"><label>版本号（自动识别）</label><input id="upVersion" placeholder="0.2.0" readonly /></div>
+              <div class="field"><label>最低可用（0=不限）</label><input id="upMin" type="number" min="0" step="1" /></div>
+            </div>
+            <label class="switch" style="margin-top:10px">
+              <input type="checkbox" id="upForce" />
+              <span class="txt"><b>强制更新</b><small>低于最新构建号的客户端不可关闭弹窗</small></span>
+            </label>
+            <div class="field" style="margin-top:10px"><label>更新说明</label><textarea id="upNotes" rows="2" placeholder="修复若干问题"></textarea></div>
+            <div class="field" style="margin-top:10px"><label>只灰度为这些设备（逗号分隔 deviceId，留空=全量）</label><input id="upDevices" placeholder="pen-xxxx,pen-yyyy" /></div>
+            <div class="hint" id="upFileInfo"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h2>发布历史</h2><span class="hint" id="releaseCount"></span></div>
+            <div class="table-wrap" id="releasesTable"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ========== 文件 ========== -->
+      <section id="tab-files" style="display:none">
+        <div class="card">
+          <div class="card-head"><h2>上传文件</h2><span class="hint" id="fileMeta"></span></div>
+          <div class="row">
+            <input type="file" id="fileInput" style="flex:1" />
+            <select id="fileKind">
+              <option value="file">普通文件</option>
+              <option value="update">应用包（.amr）</option>
+              <option value="font">字体</option>
+              <option value="image">图片</option>
+              <option value="other">其它</option>
+            </select>
+            <input id="fileNote" placeholder="备注（可选）" style="max-width:220px" />
+            <button class="btn primary" id="fileUploadBtn">上传</button>
+          </div>
+          <div class="hint">上传后生成公开下载地址（/files/…），可直接给词典笔用 curl 拉取；应用包请到「云控 → 更新策略」发布。</div>
+          <div class="msg" id="fileMsg"></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>文件列表</h2><span class="hint" id="fileCount"></span></div>
+          <div class="table-wrap" id="filesTable"></div>
+        </div>
+      </section>
+
+      <!-- ========== 会话 ========== -->
+      <section id="tab-sessions" style="display:none">
+        <div class="card">
+          <div class="card-head">
+            <h2>会话云端备份</h2>
+            <div class="row tight">
+              <button class="btn sm danger" id="purgeSessionsBtn">清空该设备</button>
+              <button class="btn sm" id="loadSessionsBtn">查询</button>
+            </div>
+          </div>
+          <div class="row">
+            <div class="field" style="flex:2">
+              <label>设备</label>
+              <select id="sessDevice"><option value="">选择设备…</option></select>
+            </div>
+            <div class="field" style="flex:1"><label>或直接填 deviceId</label><input id="sessDeviceInput" placeholder="完整 deviceId" /></div>
+          </div>
+          <div class="hint" id="sessMeta"></div>
+          <div class="table-wrap" id="sessionsTable"></div>
+        </div>
+      </section>
+
+      <!-- ========== 审计 ========== -->
+      <section id="tab-audit" style="display:none">
+        <div class="card">
+          <div class="card-head"><h2>审计日志</h2><span class="hint" id="auditMeta"></span></div>
+          <div class="toolbar">
+            <input type="search" id="auditSearch" placeholder="搜索设备 / IP / 类型 / 原因" />
+            <select id="auditType"><option value="">全部类型</option></select>
+            <select id="auditLimit">
+              <option value="100">最近 100 条</option>
+              <option value="300">最近 300 条</option>
+              <option value="800">最近 800 条</option>
+            </select>
+            <button class="btn sm" id="auditRefresh">刷新</button>
+          </div>
+          <div class="table-wrap" id="auditTable"></div>
+        </div>
+      </section>
+
+      <!-- ========== 安全 ========== -->
+      <section id="tab-security" style="display:none">
+        <div class="card">
+          <div class="card-head"><h2>修改管理员密码</h2><span class="hint">只保存 scrypt 哈希</span></div>
+          <div class="row">
+            <div class="field"><label>当前密码</label><input id="secCurrent" type="password" autocomplete="current-password" /></div>
+            <div class="field"><label>新密码（至少 8 位）</label><input id="secNext" type="password" autocomplete="new-password" /></div>
+            <div class="field"><label>确认新密码</label><input id="secConfirm" type="password" autocomplete="new-password" /></div>
+            <button class="btn primary" id="secSave">更新密码</button>
+          </div>
+          <div class="msg" id="secMsg">修改后其它浏览器/设备的后台会话会立即失效。</div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>管理会话</h2><span class="hint">会话保存在进程内，重启需重新登录</span></div>
+          <button class="btn danger" id="logoutAllBtn">退出所有后台会话</button>
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<!-- 反馈详情抽屉 -->
+<aside class="drawer" id="fbDrawer" style="display:none">
+  <div class="drawer-head">
+    <div style="min-width:0">
+      <h3>反馈详情</h3>
+      <div class="sub mono" id="fbSub"></div>
+    </div>
+    <span class="spacer"></span>
+    <button class="btn sm ghost" id="fbClose">关闭</button>
+  </div>
+  <div class="drawer-body" id="fbBody"></div>
+  <div class="drawer-foot">
+    <button class="btn" id="fbOpen">重开</button>
+    <button class="btn" id="fbIgnore">忽略</button>
+    <button class="btn primary" id="fbHandled">标记已处理</button>
+    <button class="btn danger" id="fbDelete">删除</button>
+  </div>
+</aside>
+
+<!-- 会话内容查看器（完整消息，不只是标题） -->
+<aside class="drawer" id="sessDrawer" style="display:none">
+  <div class="drawer-head">
+    <div style="min-width:0">
+      <h3 id="sessDrawerTitle">会话内容</h3>
+      <div class="sub mono" id="sessDrawerSub"></div>
+    </div>
+    <span class="spacer"></span>
+    <button class="btn sm ghost" id="sessDrawerClose">关闭</button>
+  </div>
+  <div class="drawer-body" id="sessDrawerBody"></div>
+</aside>
+
+<!-- 登录 -->
+<div class="mask" id="authMask">
+  <div class="modal">
+    <h3 id="authTitle">登录管理后台</h3>
+    <p id="authHint">输入管理员密码。</p>
+    <input id="authPassword" type="password" placeholder="管理员密码" autocomplete="current-password" />
+    <div class="row"><button class="btn primary" id="authLogin">登录</button></div>
+  </div>
+</div>
+
+<!-- 设备详情抽屉 -->
+<div class="drawer-mask" id="drawerMask"></div>
+<aside class="drawer" id="drawer">
+  <div class="drawer-head">
+    <div style="min-width:0">
+      <h3 id="drawerTitle">设备详情</h3>
+      <div class="sub mono" id="drawerSub"></div>
+    </div>
+    <span class="spacer"></span>
+    <button class="btn sm ghost" id="drawerClose">关闭</button>
+  </div>
+  <div class="drawer-body" id="drawerBody"></div>
+  <div class="drawer-foot">
+    <button class="btn" id="drawerBlock">封禁</button>
+    <button class="btn" id="drawerRevoke">吊销令牌</button>
+    <button class="btn danger" id="drawerDelete">删除设备</button>
+    <button class="btn primary" id="drawerSave">保存设备控制</button>
+  </div>
+</aside>
+
+<script>
+(function () {
+  'use strict'
+
+  var NAV_META = {
+    overview: ['概览', '服务状态与今日用量'],
+    monitor: ['监控', '客户端在线、版本分布与最近事件'],
+    devices: ['设备', '设备列表、额度与控制'],
+    control: ['云控', '不发版调整客户端行为'],
+    releases: ['发布管理', '更新包、版本历史与受保护下载'],
+    quota: ['限额', '按设备计算的全部限制项'],
+    models: ['模型', '客户端可见的模型目录'],
+    provider: ['上游', '真正的 OpenAI 兼容服务'],
+    feedback: ['反馈', '用户提交的意见与 Bug'],
+    files: ['文件', '上传的应用包与资源文件'],
+    sessions: ['会话备份', '云端保存的会话副本'],
+    audit: ['审计', '登录、封禁、配置变更记录'],
+    security: ['安全', '管理员密码与会话']
+  }
+
+  var state = {
+    tab: 'overview',
+    authenticated: false,
+    configured: false,
+    overview: null,
+    devices: [],
+    monitor: null,
+    control: null,
+    controlMeta: null,
+    quota: null,
+    quotaItems: [],
+    provider: null,
+    models: null,
+    files: [],
+    releases: [],
+    feedback: [],
+    feedbackPage: 0,
+    feedbackTotal: 0,
+    feedbackDetail: null,
+    feedbackLogText: '',
+    feedbackLogMeta: null,
+    pairings: [],
+    selected: null,
+    timer: null
+  }
+
+  function $(id) { return document.getElementById(id) }
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+  }
+  function pad(n) { return n < 10 ? '0' + n : '' + n }
+  function fmtTime(ts) {
+    if (!ts) return '—'
+    var d = new Date(Number(ts))
+    if (isNaN(d.getTime())) return '—'
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' +
+      pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds())
+  }
+  function fmtShort(ts) {
+    if (!ts) return '—'
+    var d = new Date(Number(ts))
+    if (isNaN(d.getTime())) return '—'
+    return pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes())
+  }
+  function fmtAgo(ts) {
+    if (!ts) return '从未'
+    var diff = Date.now() - Number(ts)
+    if (diff < 0) diff = 0
+    if (diff < 60e3) return '刚刚'
+    if (diff < 3600e3) return Math.floor(diff / 60e3) + ' 分钟前'
+    if (diff < 86400e3) return Math.floor(diff / 3600e3) + ' 小时前'
+    return Math.floor(diff / 86400e3) + ' 天前'
+  }
+  function fmtDuration(sec) {
+    sec = Math.max(0, Number(sec) || 0)
+    if (sec < 60) return sec + ' 秒'
+    if (sec < 3600) return Math.floor(sec / 60) + ' 分钟'
+    if (sec < 86400) return Math.floor(sec / 3600) + ' 小时'
+    return Math.floor(sec / 86400) + ' 天'
+  }
+  function fmtNum(n) {
+    n = Number(n) || 0
+    if (n >= 1e8) return (n / 1e8).toFixed(1) + ' 亿'
+    if (n >= 1e4) return (n / 1e4).toFixed(1) + ' 万'
+    return String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+  }
+  function toLocalInput(ts) {
+    if (!ts) return ''
+    var d = new Date(Number(ts))
+    if (isNaN(d.getTime())) return ''
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes())
+  }
+  function fromLocalInput(v) {
+    if (!v) return 0
+    var t = new Date(v).getTime()
+    return isNaN(t) ? 0 : t
+  }
+  function kv(k, v) {
+    return '<div class="kv"><span>' + esc(k) + '</span><span>' + esc(v) + '</span></div>'
+  }
+  function toast(msg, isErr) {
+    var el = $('toast')
+    el.textContent = msg
+    el.className = 'toast show' + (isErr ? ' err' : '')
+    clearTimeout(el._t)
+    el._t = setTimeout(function () { el.className = 'toast' }, 2800)
+  }
+
+  // ---------- API ----------
+  function api(path, opts) {
+    opts = opts || {}
+    return fetch(path, {
+      method: opts.method || 'GET',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {}),
+      body: opts.body,
+      credentials: 'same-origin'
+    }).then(function (resp) {
+      return resp.json().catch(function () { return {} }).then(function (data) {
+        var code = data && data.error && data.error.code
+        if (resp.status === 401 && (code === 'admin_unauthorized' || code === 'admin_setup_required')) {
+          state.authenticated = false
+          showAuth(code === 'admin_setup_required'
+            ? '管理员密码尚未初始化。请先在服务器本机执行初始化。'
+            : '登录已失效，请重新输入密码。')
+          throw new Error(code === 'admin_setup_required' ? '后台尚未设置密码' : '请先登录')
+        }
+        if (!resp.ok || (data && data.ok === false)) {
+          var msg = (data && data.error && (data.error.message || data.error.code)) || ('HTTP ' + resp.status)
+          throw new Error(msg)
+        }
+        return data
+      })
+    })
+  }
+
+  function showAuth(message) {
+    $('authMask').className = 'mask show'
+    $('authTitle').textContent = state.configured ? '登录管理后台' : '后台尚未初始化'
+    $('authHint').textContent = message || '请输入管理员密码。'
+    $('authLogin').disabled = !state.configured
+    $('authPassword').disabled = !state.configured
+    $('authPassword').value = ''
+    if (state.configured) setTimeout(function () { $('authPassword').focus() }, 40)
+  }
+  function hideAuth() { $('authMask').className = 'mask' }
+
+  function refreshAuthStatus() {
+    return fetch('/admin/api/auth/status', { credentials: 'same-origin' })
+      .then(function (r) { return r.json() })
+      .then(function (d) {
+        state.configured = !!d.configured
+        state.authenticated = !!d.authenticated
+        return d
+      })
+      .catch(function () { return { configured: false, authenticated: false } })
+  }
+
+  function login() {
+    var password = $('authPassword').value || ''
+    if (!password) { toast('请输入管理员密码', true); return }
+    $('authLogin').disabled = true
+    api('/admin/api/auth/login', { method: 'POST', body: JSON.stringify({ password: password }) })
+      .then(function () {
+        state.authenticated = true
+        hideAuth()
+        $('logoutBtn').style.display = ''
+        $('authText').textContent = '已登录'
+        $('authDot').style.color = '#22c55e'
+        toast('已登录')
+        loadShell()
+        ensureMeta()
+        loadTab(state.tab)
+      })
+      .catch(function (e) { toast(e.message, true) })
+      .then(function () { $('authLogin').disabled = !state.configured })
+  }
+
+  // ---------- 导航 ----------
+  function switchTab(tab) {
+    state.tab = tab
+    var meta = NAV_META[tab] || ['', '']
+    $('pageTitle').textContent = meta[0]
+    $('pageDesc').textContent = meta[1]
+    Object.keys(NAV_META).forEach(function (t) {
+      var el = $('tab-' + t)
+      if (el) el.style.display = t === tab ? '' : 'none'
+    })
+    Array.prototype.forEach.call(document.querySelectorAll('.nav-item'), function (b) {
+      b.className = 'nav-item' + (b.getAttribute('data-tab') === tab ? ' active' : '')
+    })
+    $('side').className = 'side'
+    loadTab(tab)
+  }
+
+  function loadTab(tab) {
+    if (tab === 'overview') { loadOverview(); loadStats(); }
+    if (tab === 'monitor') loadMonitor();
+    if (tab === 'devices') { loadDevices(); loadPairings(); }
+    if (tab === 'control') loadControl();
+    if (tab === 'releases') { loadReleases(); loadControl(); }
+    if (tab === 'quota') loadQuota();
+    if (tab === 'models') loadModels();
+    if (tab === 'provider') { loadProvider(); loadTools(); }
+    if (tab === 'feedback') loadFeedback();
+    if (tab === 'files') loadFiles();
+    if (tab === 'sessions') loadSessionDevices();
+    if (tab === 'audit') loadAudit();
+  }
+
+  // ---------- 顶部状态 ----------
+  function loadShell() {
+    api('/admin/api/overview').then(function (d) {
+      state.overview = d
+      renderShell(d)
+      if (state.tab === 'overview') { renderOverview(d); loadStats(); }
+    }).catch(function () {})
+  }
+
+  function renderShell(d) {
+    var p = d.provider || {}
+    var ct = d.control || {}
+    var pillP = $('pillProvider')
+    pillP.className = 'pill ' + (p.configured ? 'ok' : 'bad')
+    pillP.innerHTML = '<i class="dot"></i><span>上游 ' + (p.configured ? '已配置' : '未配置') + '</span>'
+
+    var pillC = $('pillControl')
+    pillC.className = 'pill ' + (ct.enabled ? 'ok' : 'warn')
+    pillC.innerHTML = '<i class="dot"></i><span>云控 ' + (ct.enabled ? '生效' : '关闭') + (ct.updatedAt ? ' · ' + fmtAgo(ct.updatedAt) : ' · 未下发') + '</span>'
+
+    var pillM = $('pillMaintenance')
+    if (ct.maintenance) {
+      pillM.style.display = ''
+      pillM.className = 'pill warn'
+      pillM.innerHTML = '<i class="dot"></i><span>维护中</span>'
+    } else {
+      pillM.style.display = 'none'
+    }
+    $('brandVersion').textContent = 'v' + ((d.server && d.server.version) || '')
+
+    var online = (d.monitor && d.monitor.online) || 0
+    var navOnline = $('navOnline')
+    navOnline.textContent = online
+    navOnline.style.display = online ? '' : 'none'
+
+    var fbOpen = (d.feedback && d.feedback.open) || 0
+    $('navFeedback').textContent = fbOpen
+    $('navFeedback').style.display = fbOpen ? '' : 'none'
+  }
+
+  // ---------- 概览 ----------
+  function renderOverview(d) {
+    var c = d.counts || {}
+    var today = d.today || {}
+    var t = d.totals || {}
+    var mon = d.monitor || {}
+    var cards = [
+      { label: '在线设备', value: (mon.online || 0) + ' / ' + (c.devices || 0), sub: '10 分钟内有上报' },
+      { label: '今日请求', value: fmtNum(today.requests || 0), sub: '错误 ' + fmtNum(today.errors || 0) },
+      { label: '今日 Token', value: fmtNum(today.tokens || 0), sub: '累计 ' + fmtNum((t.tokens && t.tokens.total) || 0) },
+      { label: '待处理反馈', value: String((d.feedback && d.feedback.open) || 0), sub: '共 ' + ((d.feedback && d.feedback.total) || 0) + ' 条' },
+      { label: '设备状态', value: (c.activeDevices || 0) + ' 正常', sub: (c.blockedDevices || 0) + ' 封禁 · ' + (c.disabledDevices || 0) + ' 停用' },
+      { label: '运行时长', value: fmtDuration((d.server && d.server.uptimeSec) || 0), sub: '版本 ' + ((d.server && d.server.version) || '') }
+    ]
+    $('overviewCards').innerHTML = cards.map(function (x) {
+      return '<div class="card"><h2>' + esc(x.label) + '</h2><div class="metric">' + esc(String(x.value)) +
+        '<small>' + esc(x.sub) + '</small></div></div>'
+    }).join('')
+
+    var devices = c.devices || 0
+    var active = c.activeDevices || 0
+    var blocked = c.blockedDevices || 0
+    var disabled = c.disabledDevices || 0
+    $('overviewToday').textContent = '今日 ' + (today.devices ? Object.keys(today.devices).length : 0) + ' 台设备活跃'
+    $('todayUsage').innerHTML =
+      usageRow('正常设备', active, devices, '') +
+      usageRow('封禁设备', blocked, devices, 'bad') +
+      usageRow('停用设备', disabled, devices, 'warn') +
+      '<div style="margin-top:12px">' +
+      kv('今日请求', fmtNum(today.requests || 0)) +
+      kv('今日 Token', fmtNum(today.tokens || 0)) +
+      kv('今日错误', fmtNum(today.errors || 0)) +
+      kv('待用配对码', String(c.pairingsPending || 0)) +
+      '</div>'
+
+    var p = d.provider || {}
+    var q = d.quota || {}
+    var ct = d.control || {}
+    var en = d.enroll || {}
+    var g = d.guard || {}
+    var lim = d.limits || {}
+    var tel = d.telemetry || {}
+    $('configMeta').textContent = '云控更新于 ' + fmtTime(ct.updatedAt)
+    $('configList').innerHTML = [
+      kv('上游', (p.name || '') + ' · ' + (p.baseUrl || '未配置') + (p.configured ? '' : '（无密钥）')),
+      kv('默认模型', p.defaultModel || '—'),
+      kv('模型目录', (p.models || []).join('、') || '—'),
+      kv('全局并发上限', String(lim.maxConcurrentGlobal || 0)),
+      kv('设备令牌有效期', fmtDuration(lim.tokenTtlSec) + ' / 签名窗口 ' + (lim.signatureWindowSec || 0) + ' 秒'),
+      kv('静默注册', (en.enabled ? '开启' : '关闭') + ' · 上限 ' + (en.maxDevices || 0) + ' 台 · 单 IP/天 ' + (en.perIpPerDay || 0) + (en.requiresToken ? ' · 需注册令牌' : '')),
+      kv('默认限额', q.enabled
+        ? ('并发 ' + q.maxConcurrent + ' · RPM ' + q.rpm + ' · TPM ' + q.tpm + ' · 5H ' + q.fiveHourTokens + ' · 日 ' + q.dailyTokens + ' · 月 ' + q.monthlyTokens)
+        : '已关闭'),
+      kv('云控', (ct.enabled ? '开启' : '关闭') + (ct.maintenance ? ' · 维护中' : '') + ' · 设备覆盖 ' + (ct.overrides || 0) + ' 台'),
+      kv('状态上报', (tel.enabled ? '开启' : '关闭') + ' · 在线 ' + (tel.online || 0) + ' / 已上报 ' + (tel.reported || 0) + ' · 异常 ' + (tel.errorDevices || 0)),
+      kv('防反代', (g.enabled ? '开启' : '关闭') + ' · 阈值 ' + (g.riskThreshold || 0) + ' · 封禁 ' + fmtDuration(g.blockDurationSec)),
+      kv('会话备份', (d.sessions && d.sessions.enabled ? '开启' : '关闭') + ' · 单设备上限 ' + ((d.sessions && d.sessions.maxPerDevice) || 0)),
+      kv('运行时', 'nonce ' + (d.nonceCache || 0) + ' 条')
+    ].join('')
+  }
+
+  function usageRow(label, value, total, cls) {
+    var pct = total > 0 ? Math.round(value / total * 100) : 0
+    return '<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">' +
+      '<span class="muted" style="width:70px;font-size:12px">' + esc(label) + '</span>' +
+      '<span style="width:44px;font-size:12px;text-align:right">' + value + '</span>' +
+      '<div class="bar" style="flex:1"><i class="' + cls + '" style="width:' + pct + '%"></i></div>' +
+      '<span class="muted" style="width:38px;font-size:11px;text-align:right">' + pct + '%</span></div>'
+  }
+
+  function loadOverview() {
+    return api('/admin/api/overview').then(function (d) {
+      state.overview = d
+      renderShell(d)
+      renderOverview(d)
+    }).catch(function (e) { toast(e.message, true) })
+  }
+
+  function loadStats() {
+    return api('/admin/api/stats?days=7').then(function (d) {
+      var days = d.days || []
+      if (!days.length) { $('statsChart').innerHTML = '<div class="empty">暂无数据</div>'; return }
+      var max = Math.max.apply(null, days.map(function (x) { return x.requests || 0 }).concat([1]))
+      $('statsChart').innerHTML = days.map(function (x) {
+        var pct = Math.max(2, Math.round((x.requests || 0) / max * 100))
+        return '<div style="display:flex;align-items:center;gap:10px;margin-bottom:7px">' +
+          '<span class="mono muted" style="width:62px;font-size:11px">' + esc((x.day || '').slice(5)) + '</span>' +
+          '<div class="bar" style="flex:1"><i style="width:' + pct + '%"></i></div>' +
+          '<span style="width:52px;text-align:right;font-size:12px">' + fmtNum(x.requests || 0) + '</span>' +
+          '<span class="muted" style="width:42px;text-align:right;font-size:11px">' + (x.errors ? (x.errors + ' 错') : '') + '</span>' +
+          '</div>'
+      }).join('')
+    }).catch(function () {})
+  }
+
+  // ---------- 监控 ----------
+  function loadMonitor(silent) {
+    var minutes = $('monitorWindow').value || 10
+    return api('/admin/api/monitor?onlineMinutes=' + encodeURIComponent(minutes)).then(function (d) {
+      state.monitor = d
+      var c = d.counts || {}
+      $('monitorCards').innerHTML = [
+        { label: '在线', value: c.online || 0, sub: '窗口 ' + d.onlineMinutes + ' 分钟' },
+        { label: '已上报', value: c.reported || 0, sub: '有上报记录的设备' },
+        { label: '离线', value: c.offline || 0, sub: '超过窗口未上报' },
+        { label: '异常设备', value: c.errorDevices || 0, sub: '最近一次上报有错误' }
+      ].map(function (x) {
+        return '<div class="card"><h2>' + esc(x.label) + '</h2><div class="metric">' + x.value +
+          '<small>' + esc(x.sub) + '</small></div></div>'
+      }).join('')
+
+      $('versionChart').innerHTML = distHtml(d.versions || [], 'version', '版本')
+      $('modelChart').innerHTML = distHtml(d.models || [], 'model', '模型')
+
+      var list = d.devices || []
+      if (!list.length) {
+        $('monitorTable').innerHTML = '<div class="empty">还没有设备</div>'
+      } else {
+        $('monitorTable').innerHTML = '<table><thead><tr><th>设备</th><th>状态</th><th>版本 / 构建</th><th>模型</th><th>页面</th><th>最近上报</th><th>最近错误</th></tr></thead><tbody>' +
+          list.map(function (x) {
+            return '<tr class="clickable" data-device="' + esc(x.deviceId) + '">' +
+              '<td class="mono" style="max-width:220px;word-break:break-all">' + esc(x.deviceId) + '</td>' +
+              '<td>' + (x.online ? '<span class="tag ok">在线</span>' : '<span class="tag">离线</span>') +
+                (x.state !== 'active' ? ' ' + stateTag(x.state) : '') + '</td>' +
+              '<td class="mono">' + esc(x.version || '—') + '<div class="muted" style="font-size:11px">build ' + esc(x.build || '—') + '</div></td>' +
+              '<td class="mono">' + esc(x.model || '—') + '</td>' +
+              '<td class="mono">' + esc(x.page || '—') + '</td>' +
+              '<td>' + (x.reportedAt ? esc(fmtShort(x.reportedAt)) + '<div class="muted" style="font-size:11px">' + esc(fmtAgo(x.reportedAt)) + '</div>' : '<span class="muted">未上报</span>') + '</td>' +
+              '<td>' + (x.lastError && x.lastError.code ? '<span class="tag bad">' + esc(x.lastError.code) + '</span><div class="muted" style="font-size:11px">' + esc((x.lastError.message || '').slice(0, 60)) + '</div>' : '<span class="muted">—</span>') + '</td>' +
+              '</tr>'
+          }).join('') + '</tbody></table>'
+      }
+
+      var events = d.events || []
+      if (!events.length) {
+        $('monitorEvents').innerHTML = '<div class="empty">还没有收到客户端事件</div>'
+      } else {
+        $('monitorEvents').innerHTML = '<table><thead><tr><th>时间</th><th>设备</th><th>类型</th><th>代码</th><th>说明</th></tr></thead><tbody>' +
+          events.map(function (e) {
+            var cls = /error|fail|block/.test(e.type) ? 'bad' : (/warn/.test(e.type) ? 'warn' : '')
+            return '<tr class="clickable" data-device="' + esc(e.deviceId) + '">' +
+              '<td class="mono nowrap">' + esc(fmtShort(e.t)) + '</td>' +
+              '<td class="mono" style="max-width:200px;word-break:break-all">' + esc(e.deviceId || '—') + '</td>' +
+              '<td><span class="tag ' + cls + '">' + esc(e.type) + '</span></td>' +
+              '<td class="mono">' + esc(e.code || '—') + '</td>' +
+              '<td style="max-width:420px;word-break:break-word">' + esc(e.message || '') + '</td></tr>'
+          }).join('') + '</tbody></table>'
+      }
+    }).catch(function (e) { if (!silent) toast(e.message, true) })
+  }
+
+  function distHtml(list, key, label) {
+    if (!list.length) return '<div class="empty">暂无数据</div>'
+    var total = list.reduce(function (s, x) { return s + (x.count || 0) }, 0) || 1
+    return list.map(function (x) {
+      var pct = Math.max(2, Math.round((x.count || 0) / total * 100))
+      return '<div style="display:flex;align-items:center;gap:10px;margin-bottom:7px">' +
+        '<span class="mono" style="width:150px;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(x[key] || '—') + '</span>' +
+        '<div class="bar" style="flex:1"><i style="width:' + pct + '%"></i></div>' +
+        '<span style="width:42px;text-align:right;font-size:12px">' + (x.count || 0) + '</span></div>'
+    }).join('')
+  }
+
+  // ---------- 设备 ----------
+  function stateTag(s) {
+    var map = {
+      active: ['ok', '正常'], blocked: ['bad', '已封禁'], revoked: ['bad', '已吊销'],
+      expired: ['warn', '令牌过期'], unknown: ['', '未知']
+    }
+    var v = map[s] || ['', s || '—']
+    return '<span class="tag ' + v[0] + '">' + esc(v[1]) + '</span>'
+  }
+
+  function loadDevices(silent) {
+    return api('/admin/api/devices').then(function (d) {
+      state.devices = d.devices || []
+      renderDevices()
+      fillSessionDevices()
+    }).catch(function (e) { if (!silent) toast(e.message, true) })
+  }
+
+  function filteredDevices() {
+    var q = ($('deviceSearch').value || '').trim().toLowerCase()
+    var st = $('deviceState').value || ''
+    return state.devices.filter(function (x) {
+      if (st === 'online' && !x.online) return false
+      if (st === 'disabled' && !x.disabled) return false
+      if (st && st !== 'online' && st !== 'disabled' && x.state !== st) return false
+      if (!q) return true
+      var hay = [x.deviceId, x.lastIp, x.model, x.build, x.ua, x.control && x.control.note].filter(Boolean).join(' ').toLowerCase()
+      return hay.indexOf(q) >= 0
+    })
+  }
+
+  function renderDevices() {
+    var list = filteredDevices()
+    var total = state.devices.length
+    var online = state.devices.filter(function (x) { return x.online }).length
+    $('deviceSummary').textContent = '共 ' + total + ' 台 · 在线 ' + online + ' · 显示 ' + list.length
+    // 实时刷新（5s）会整体重建表格：先记住勾选，重建后还原，避免打断批量操作
+    var checked = []
+    Array.prototype.forEach.call(document.querySelectorAll('.dev-check'), function (el) {
+      if (el.checked) checked.push(el.value)
+    })
+    if (!list.length) {
+      $('devicesTable').innerHTML = '<div class="empty">' + (total ? '没有匹配的设备' : '还没有设备注册') + '</div>'
+      return
+    }
+    $('devicesTable').innerHTML = '<table><thead><tr>' +
+      '<th style="width:26px"><input type="checkbox" id="devCheckAll"' + (checked.length && checked.length === list.length ? ' checked' : '') + '></th>' +
+      '<th>设备</th><th>状态</th><th>版本</th><th>今日</th><th>额度</th><th>最后在线</th><th></th>' +
+      '</tr></thead><tbody>' + list.map(function (x) {
+        var tags = stateTag(x.state)
+        if (x.disabled) tags += ' <span class="tag bad">已停用</span>'
+        if (x.maintenanceBypass) tags += ' <span class="tag blue">维护白名单</span>'
+        if (x.debug) tags += ' <span class="tag warn">调试</span>'
+        if (x.rce) tags += ' <span class="tag bad">RCE</span>'
+        var tel = x.telemetry || {}
+        var q = x.quota || {}
+        return '<tr class="clickable" data-device="' + esc(x.deviceId) + '">' +
+          '<td onclick="event.stopPropagation()"><input type="checkbox" class="dev-check" value="' + esc(x.deviceId) + '"' + (checked.indexOf(x.deviceId) >= 0 ? ' checked' : '') + '></td>' +
+          '<td class="mono" style="max-width:230px;word-break:break-all">' + esc(x.deviceId) +
+            '<div class="muted" style="font-size:11px">' + esc(x.lastIp || '—') + (x.control && x.control.note ? ' · ' + esc(x.control.note) : '') + '</div></td>' +
+          '<td>' + tags + (x.online ? ' <span class="tag ok">在线</span>' : '') + '</td>' +
+          '<td class="mono" style="font-size:11px">' + esc(tel.version || x.build || '—') +
+            '<div class="muted">' + esc(tel.model || x.model || '—') + '</div></td>' +
+          '<td>' + fmtNum(x.dayRequests) + ' 次<div class="muted" style="font-size:11px">' + fmtNum(x.dayTokens) + ' tokens</div></td>' +
+          '<td style="min-width:120px">' + quotaMini(q) + '</td>' +
+          '<td class="nowrap">' + esc(fmtAgo(x.lastSeenAt)) + '</td>' +
+          '<td class="right"><span class="btn sm" style="pointer-events:none">详情</span></td></tr>'
+      }).join('') + '</tbody></table>'
+  }
+
+  function quotaMini(q) {
+    if (!q || !q.items) return '<span class="muted">—</span>'
+    if (!q.enabled) return '<span class="tag">不限</span>'
+    var out = []
+    var limited = q.items.filter(function (i) { return Number(i.limit) > 0 }).slice(0, 3)
+    limited.forEach(function (i) {
+      var pct = i.limit > 0 ? Math.min(100, Math.round(i.used / i.limit * 100)) : 0
+      var cls = pct >= 100 ? 'bad' : (pct >= 90 ? 'warn' : '')
+      out.push('<div style="font-size:11px;margin-bottom:3px">' +
+        '<span class="muted">' + esc(i.short) + '</span> ' + i.used + '/' + i.limit +
+        '<div class="bar" style="height:4px;margin-top:2px"><i class="' + cls + '" style="width:' + pct + '%"></i></div></div>')
+    })
+    return out.join('') || '<span class="tag">不限</span>'
+  }
+
+  function renderPairings() {
+    var list = state.pairings || []
+    if (!list.length) { $('pairingsTable').innerHTML = '<div class="empty">没有配对码</div>'; return }
+    $('pairingsTable').innerHTML = '<table><thead><tr><th>配对码</th><th>绑定设备</th><th>状态</th><th>到期</th><th>创建</th><th></th></tr></thead><tbody>' +
+      list.map(function (p) {
+        var cls = p.state === 'approved' ? 'ok' : (p.state === 'pending' ? 'warn' : (p.state === 'expired' ? 'bad' : ''))
+        var label = { approved: '已批准', pending: '待批准', used: '已使用', expired: '已过期' }[p.state] || p.state
+        return '<tr><td><span class="mono" style="font-weight:600;letter-spacing:1px">' + esc(p.code) + '</span></td>' +
+          '<td class="mono">' + (p.deviceId ? esc(p.deviceId) : '<span class="muted">未绑定</span>') + '</td>' +
+          '<td><span class="tag ' + cls + '">' + esc(label) + '</span></td>' +
+          '<td class="mono nowrap">' + esc(fmtShort(p.expiresAt)) + '</td>' +
+          '<td class="mono nowrap">' + esc(fmtShort(p.createdAt)) + '</td>' +
+          '<td class="right"><button class="btn sm danger" data-act="del-pair" data-code="' + esc(p.code) + '">删除</button></td></tr>'
+      }).join('') + '</tbody></table>'
+  }
+
+  function loadPairings() {
+    return api('/admin/api/pairings').then(function (d) {
+      state.pairings = d.pairings || []
+      renderPairings()
+    }).catch(function () {})
+  }
+
+  // ---------- 设备抽屉 ----------
+  function ensureMeta() {
+    var jobs = []
+    if (!state.controlMeta) {
+      jobs.push(api('/admin/api/control').then(function (c) { state.controlMeta = c.meta || { features: [], limits: [] } }).catch(function () {}))
+    }
+    if (!state.quotaItems.length) {
+      jobs.push(api('/admin/api/quota').then(function (q) { state.quotaItems = q.items || [] }).catch(function () {}))
+    }
+    return Promise.all(jobs)
+  }
+
+  function openDevice(id) {
+    ensureMeta().then(function () {
+      return api('/admin/api/devices/' + encodeURIComponent(id))
+    }).then(function (d) {
+      state.selected = d
+      renderDrawer(d)
+      $('drawer').className = 'drawer show'
+      $('drawerMask').className = 'drawer-mask show'
+      startDrawerLivePoll(id)
+    }).catch(function (e) { toast(e.message, true) })
+  }
+
+  function closeDrawer() {
+    $('drawer').className = 'drawer'
+    $('drawerMask').className = 'drawer-mask'
+    state.selected = null
+    stopDrawerLivePoll()
+  }
+
+  // 抽屉在线状态实时刷新：5s 轮询轻量 /status 端点，只补状态行与最近错误，
+  // 不重渲染整个抽屉（管理员正在填表时不打断）。
+  var drawerLiveTimer = null
+  function startDrawerLivePoll(id) {
+    stopDrawerLivePoll()
+    drawerLiveTimer = setInterval(function () {
+      if (document.hidden) return
+      var body = $('drawerBody')
+      var ae = document.activeElement
+      if (body && ae && ae !== document.body && body.contains(ae)) return
+      api('/admin/api/devices/' + encodeURIComponent(id) + '/status').then(function (d) {
+        var live = $('devLive')
+        if (!live || $('drawer').className.indexOf('show') < 0) { stopDrawerLivePoll(); return }
+        $('drawerSub').textContent = (d.online ? '在线 · ' : '离线 · ') + '最后活跃 ' + fmtAgo(d.lastSeenAt) + ' · ' + (d.lastIp || '无 IP')
+        var errHtml = d.lastError
+          ? '<span class="bad" style="font-size:11px">最近错误 ' + esc(d.lastError.code) + '：' + esc(String(d.lastError.message || '').slice(0, 120)) + '</span>'
+          : '<span class="muted" style="font-size:11px">无上报错误</span>'
+        live.innerHTML = '<span class="tag ' + (d.online ? 'ok' : '') + '">' + (d.online ? '在线' : '离线') + '</span> ' +
+          '<span class="muted" style="font-size:11px">build ' + esc(d.build || '—') + ' · ' + esc(d.model || '—') +
+          ' · ' + esc(d.page || '—') + ' · 上报 ' + esc(fmtAgo(d.reportedAt)) + '</span><br>' + errHtml
+      }).catch(function () {})
+    }, 5000)
+  }
+
+  function stopDrawerLivePoll() {
+    if (drawerLiveTimer) { clearInterval(drawerLiveTimer); drawerLiveTimer = null }
+  }
+
+  function renderDrawer(d) {
+    var x = d.device || {}
+    var q = d.quota || {}
+    var tel = d.telemetry || {}
+    var ov = (d.control && d.control.override) || {}
+    var eff = (d.control && d.control.effective) || {}
+    var global = (d.control && d.control.global) || {}
+    var use = d.usage || {}
+
+    $('drawerTitle').textContent = x.deviceId || '设备详情'
+    $('drawerSub').textContent = (x.online ? '在线 · ' : '离线 · ') + '最后在线 ' + fmtAgo(x.lastSeenAt) + ' · ' + (x.lastIp || '无 IP')
+
+    var html = ''
+    html += '<div class="sect"><div class="sect-title">概况</div>' +
+      '<div id="devLive" class="mono" style="font-size:11px;margin-bottom:8px;line-height:1.8"></div>' +
+      kv('状态', stateText(x) + (x.disabled ? '（后台停用）' : '')) +
+      kv('构建 / 模型', (tel.build || x.build || '—') + ' / ' + (tel.model || x.model || '—')) +
+      kv('注册时间', fmtTime(x.createdAt)) +
+      kv('令牌到期', fmtTime(x.expiresAt)) +
+      kv('请求总数', fmtNum(x.requestCount) + ' 次 · 错误 ' + fmtNum(x.errorCount) + ' 次') +
+      kv('Token 总量', fmtNum(x.tokenCount)) +
+      kv('UA', x.ua || '—') +
+      kv('今日', fmtNum(x.dayRequests) + ' 次 · ' + fmtNum(x.dayTokens) + ' tokens') +
+      '</div>'
+
+    html += '<div class="sect"><div class="sect-title">额度（生效值' + (q.override ? ' · 含单设备覆盖' : '') + '）</div>' +
+      '<div class="quota-grid">' + (q.items || []).map(function (i) {
+        return quotaCell(i)
+      }).join('') + '</div>' +
+      '<div class="hint">剩余量为服务端实时计算；' + (q.override ? '该设备有限额覆盖。' : '使用全局限额。') + '</div></div>'
+
+    html += '<div class="sect"><div class="sect-title">云端控制（单设备覆盖）</div>' +
+      '<div class="grid c2">' +
+      '<label class="switch"><input type="checkbox" id="ovDisabled"' + (ov.disabled ? ' checked' : '') + '><span class="txt"><b>停用该设备</b><small>聊天返回 403，云控/上报仍可用</small></span></label>' +
+      '<label class="switch"><input type="checkbox" id="ovBypass"' + (ov.maintenanceBypass ? ' checked' : '') + '><span class="txt"><b>维护白名单</b><small>全局维护时该设备仍可聊天</small></span></label>' +
+      '</div>' +
+      '<div class="row" style="margin-top:10px">' +
+      '<div class="field" style="flex:1"><label>备注（仅后台可见）</label><input id="ovNote" value="' + esc(ov.note || '') + '" placeholder="例如：测试机 / 内部账号" /></div>' +
+      '</div>' +
+      '<div class="field" style="margin-top:10px"><label>单独通知（覆盖全局 notice，留空表示不覆盖）</label><input id="ovNotice" value="' + esc(ov.notice || '') + '" placeholder="该设备的专属提示" /></div>' +
+      '<div class="sect-title" style="margin-top:12px">功能覆盖</div>' +
+      '<div class="grid c3">' + (state.controlMeta ? state.controlMeta.features : []).map(function (f) {
+        var v = ov.features && Object.prototype.hasOwnProperty.call(ov.features, f.key) ? String(ov.features[f.key]) : ''
+        var g = global.features ? global.features[f.key] : true
+        return '<div class="field"><label>' + esc(f.label) + '（全局' + (g === false ? '关' : '开') + '）</label>' +
+          '<select data-ov-feat="' + esc(f.key) + '">' +
+          '<option value=""' + (v === '' ? ' selected' : '') + '>继承</option>' +
+          '<option value="true"' + (v === 'true' ? ' selected' : '') + '>开</option>' +
+          '<option value="false"' + (v === 'false' ? ' selected' : '') + '>关</option>' +
+          '</select></div>'
+      }).join('') + '</div>' +
+      '<div class="sect-title" style="margin-top:12px">限额覆盖（留空继承 · 0 表示不限）</div>' +
+      '<div class="grid c3">' + (state.quotaItems || []).map(function (i) {
+        var v = ov.quota && Object.prototype.hasOwnProperty.call(ov.quota, i.key) ? ov.quota[i.key] : ''
+        var effVal = q[i.key] ? q[i.key].limit : ''
+        return '<div class="field"><label>' + esc(i.label) + '（生效 ' + (effVal === 0 ? '不限' : effVal) + '）</label>' +
+          '<input type="number" min="0" step="1" data-ov-quota="' + esc(i.key) + '" value="' + esc(v) + '" placeholder="继承" /></div>'
+      }).join('') + '</div>' +
+      '<div class="sect-title" style="margin-top:12px">客户端限制覆盖（留空继承）</div>' +
+      '<div class="grid c3">' + (state.controlMeta ? state.controlMeta.limits : []).map(function (l) {
+        var v = ov.limits && Object.prototype.hasOwnProperty.call(ov.limits, l.key) ? ov.limits[l.key] : ''
+        return '<div class="field"><label>' + esc(l.label) + '（' + l.unit + '，' + l.min + '~' + l.max + '）</label>' +
+          '<input type="number" min="' + l.min + '" max="' + l.max + '" step="1" data-ov-limit="' + esc(l.key) + '" value="' + esc(v) + '" placeholder="继承" /></div>'
+      }).join('') + '</div>' +
+      '<div class="sect-title" style="margin-top:12px">更新灰度（留空继承全局 · 只能抬高最低构建号）</div>' +
+      '<div class="grid c3">' +
+      '<div class="field"><label>最新构建号</label><input id="ovUpLatest" type="number" min="0" value="' + esc(ov.update && ov.update.latestBuild != null ? ov.update.latestBuild : '') + '" placeholder="继承" /></div>' +
+      '<div class="field"><label>最低可用（≥全局）</label><input id="ovUpMin" type="number" min="0" value="' + esc(ov.update && ov.update.minBuild != null ? ov.update.minBuild : '') + '" placeholder="继承" /></div>' +
+      '<div class="field"><label>版本号</label><input id="ovUpVersion" value="' + esc(ov.update && ov.update.version || '') + '" placeholder="继承" /></div>' +
+      '</div>' +
+      '<div class="field" style="margin-top:8px"><label>下载地址（留空继承）</label><input id="ovUpUrl" value="' + esc(ov.update && ov.update.url || '') + '" placeholder="继承全局" /></div>' +
+      '<label class="switch" style="margin-top:8px"><input type="checkbox" id="ovUpForce"' + (ov.update && ov.update.force ? ' checked' : '') + '><span class="txt"><b>对该设备强制更新</b><small>勾选后该设备低于全局最新版也强制</small></span></label>' +
+      '<div class="sect-title" style="margin-top:12px">提示词覆盖（留空继承）</div>' +
+      '<div class="grid c2">' +
+      '<div class="field"><label>启用</label><select id="ovPrEnabled"><option value="">继承</option><option value="true"' + (ov.prompt && ov.prompt.enabled === true ? ' selected' : '') + '>强制开</option><option value="false"' + (ov.prompt && ov.prompt.enabled === false ? ' selected' : '') + '>强制关</option></select></div>' +
+      '<div class="field"><label>追加（append）</label><input id="ovPrAppend" value="' + esc(ov.prompt && ov.prompt.append || '') + '" placeholder="继承" /></div>' +
+      '</div>' +
+      '<div class="field" style="margin-top:8px"><label>系统提示词（填写后覆盖全局）</label><textarea id="ovPrSystem" rows="3" placeholder="留空继承全局">' + esc(ov.prompt && ov.prompt.system || '') + '</textarea></div>' +
+      '<div class="sect-title" style="margin-top:12px">调试授权（留空继承全局）</div>' +
+      '<div class="grid c3">' +
+      '<div class="field"><label>响应调试暗号</label><select id="ovDbgAllow"><option value="">继承</option><option value="true"' + (ov.debug && ov.debug.allow === true ? ' selected' : '') + '>允许</option><option value="false"' + (ov.debug && ov.debug.allow === false ? ' selected' : '') + '>禁止</option></select></div>' +
+      '<div class="field"><label>远程执行</label><select id="ovDbgRce"><option value="">继承</option><option value="true"' + (ov.debug && ov.debug.rce === true ? ' selected' : '') + '>允许</option><option value="false"' + (ov.debug && ov.debug.rce === false ? ' selected' : '') + '>禁止</option></select></div>' +
+      '<div class="field"><label>轮询间隔（秒）</label><input id="ovDbgPoll" type="number" min="5" max="600" value="' + esc(ov.debug && ov.debug.pollSec != null ? ov.debug.pollSec : '') + '" placeholder="继承" /></div>' +
+      '</div>' +
+      '<div class="hint">保存后该设备下次拉取云控（' + ((eff.limits && eff.limits.pollSec) || 300) + ' 秒内）生效。</div>' +
+      '</div>'
+
+    html += '<div class="sect"><div class="sect-title">状态上报</div>' +
+      (tel.reportedAt
+        ? kv('最近上报', fmtTime(tel.reportedAt) + '（' + fmtAgo(tel.reportedAt) + '，共 ' + (tel.reportCount || 0) + ' 次）') +
+          kv('客户端', (tel.version || '—') + ' · build ' + (tel.build || '—') + ' · ' + (tel.page || '—')) +
+          kv('本地数据', (tel.stats && tel.stats.conversations || 0) + ' 条会话 · ' + (tel.stats && tel.stats.messages || 0) + ' 条消息') +
+          kv('最近错误', tel.lastError ? (tel.lastError.code + '：' + (tel.lastError.message || '')).slice(0, 120) : '无')
+        : '<div class="empty">该设备还没有上报过状态</div>')
+    var events = (tel.events || []).slice().sort(function (a, b) { return (b.t || 0) - (a.t || 0) }).slice(0, 12)
+    if (events.length) {
+      html += '<div class="table-wrap" style="margin-top:10px"><table><thead><tr><th>时间</th><th>类型</th><th>代码</th><th>说明</th></tr></thead><tbody>' +
+        events.map(function (e) {
+          return '<tr><td class="mono nowrap">' + esc(fmtShort(e.t)) + '</td><td>' + esc(e.type) + '</td>' +
+            '<td class="mono">' + esc(e.code || '—') + '</td><td>' + esc(e.message || '') + '</td></tr>'
+        }).join('') + '</tbody></table></div>'
+    }
+    html += '</div>'
+
+    var dbg = (d.debug && d.debug.effective) || {}
+    var queue = (d.debug && d.debug.queue) || { pending: [], results: [] }
+    var results = (queue.results || []).slice(0, 6).map(function (r) {
+      return '<div class="field" style="margin-top:8px"><label>' + esc(fmtTime(r.at)) + ' · ' +
+        (r.ok ? '成功' : '失败') + ' · ' + (r.durationMs || 0) + 'ms</label>' +
+        '<pre class="mono" style="max-height:160px;overflow:auto;white-space:pre-wrap;word-break:break-all;background:#f8fafc;padding:8px;border-radius:6px;font-size:11px">' +
+        esc(r.ok ? (r.output || '(空)') : (r.error || '执行失败')) + '</pre></div>'
+    }).join('')
+    html += '<div class="sect"><div class="sect-title">调试控制台</div>' +
+      kv('授权', dbg.allow ? (dbg.rce ? '允许响应暗号 + 远程执行' : '仅允许响应调试暗号') : '禁止响应调试暗号') +
+      kv('设备状态', x.debug ? ('调试模式已开启 · ' + fmtAgo(x.debugAt)) : '未开启调试模式') +
+      kv('队列', (queue.pending || []).length + ' 条待取 · ' + (queue.delivered || []).length + ' 条已取走 · ' + (queue.results || []).length + ' 条结果') +
+      (dbg.allow && dbg.rce
+        ? '<div class="field" style="margin-top:8px"><label>命令类型</label>' +
+          '<select id="dbgType">' +
+          '<option value="eval">JS（设备端 eval，返回值回传）</option>' +
+          '<option value="shell">Shell（设备 root 执行，stdout/stderr/exit code 回传）</option>' +
+          '</select></div>' +
+          '<div class="field" style="margin-top:8px"><label id="dbgCodeLabel">下发 JS</label>' +
+          '<textarea id="dbgCode" rows="4" placeholder="例如：JSON.stringify({ ok: 1, build: BUILD_NUM })"></textarea></div>' +
+          '<div class="field" style="margin-top:8px;display:none" id="dbgTimeoutRow"><label>超时（秒，可留空，默认 15，上限 60）</label>' +
+          '<input id="dbgTimeout" type="number" min="2" max="60" placeholder="15"></div>' +
+          '<div class="row"><button class="btn sm primary" id="dbgRun">下发执行</button>' +
+          '<button class="btn sm" id="dbgRefresh">刷新</button>' +
+          '<button class="btn sm danger" id="dbgClear">清空队列</button></div>'
+        : '<div class="hint">该设备当前未被授权远程执行；先在上面的「调试授权」里开启（或调整全局云控）。</div>') +
+      results + '</div>'
+
+    html += '<div class="sect"><div class="sect-title">会话备份</div>' +
+      (d.sessions && d.sessions.enabled
+        ? kv('统计', (d.sessions.stats && d.sessions.stats.sessions || 0) + ' 条会话 · ' + (d.sessions.stats && d.sessions.stats.messages || 0) + ' 条消息')
+        : '<div class="muted">服务未开启会话备份</div>')
+    var sess = (d.sessions && d.sessions.list) || []
+    if (sess.length) {
+      html += '<div class="table-wrap" style="margin-top:8px"><table><thead><tr><th>标题</th><th>消息</th><th>更新时间</th><th></th></tr></thead><tbody>' +
+        sess.slice(0, 8).map(function (s) {
+          return '<tr><td>' + esc(s.title || '(无标题)') + '</td><td>' + (s.messageCount || 0) + '</td><td class="mono nowrap">' + esc(fmtShort(s.updatedAt)) + '</td>' +
+            '<td class="right"><button class="btn sm" data-act="sess-open" data-device="' + esc(x.deviceId) + '" data-session="' + esc(s.id) + '">查看内容</button></td></tr>'
+        }).join('') + '</tbody></table></div>'
+    }
+    html += '</div>'
+
+    var audit = d.audit || []
+    if (audit.length) {
+      html += '<div class="sect"><div class="sect-title">最近审计</div><div class="table-wrap"><table><thead><tr><th>时间</th><th>类型</th><th>详情</th></tr></thead><tbody>' +
+        audit.slice(0, 12).map(function (e) {
+          var extra = Object.assign({}, e)
+          delete extra.t; delete extra.type; delete extra.deviceId; delete extra.ip
+          return '<tr><td class="mono nowrap">' + esc(fmtShort(e.t)) + '</td><td><span class="tag">' + esc(e.type) + '</span></td>' +
+            '<td class="mono" style="font-size:11px;word-break:break-all">' + esc(JSON.stringify(extra).slice(0, 160)) + '</td></tr>'
+        }).join('') + '</tbody></table></div></div>'
+    }
+
+    $('drawerBody').innerHTML = html
+    $('drawerBlock').textContent = x.state === 'blocked' ? '解除封禁' : '封禁 30 分钟'
+    $('drawerRevoke').style.display = x.state === 'revoked' ? 'none' : ''
+    var runBtn = $('dbgRun')
+    if (runBtn) runBtn.addEventListener('click', runDebugCommand)
+    var refreshBtn = $('dbgRefresh')
+    if (refreshBtn) refreshBtn.addEventListener('click', function () { openDevice(state.selected.device.deviceId) })
+    var clearBtn = $('dbgClear')
+    if (clearBtn) clearBtn.addEventListener('click', clearDebugQueue)
+    var typeSel = $('dbgType')
+    if (typeSel) typeSel.addEventListener('change', function () {
+      var shell = typeSel.value === 'shell'
+      var label = $('dbgCodeLabel')
+      var ta = $('dbgCode')
+      var tr = $('dbgTimeoutRow')
+      if (label) label.textContent = shell ? '下发 Shell 命令' : '下发 JS'
+      if (ta) ta.placeholder = shell ? '例如：uname -a; ps | grep ds-free-api' : '例如：JSON.stringify({ ok: 1, build: BUILD_NUM })'
+      if (tr) tr.style.display = shell ? '' : 'none'
+    })
+  }
+
+  function runDebugCommand() {
+    if (!state.selected) return
+    var id = state.selected.device.deviceId
+    var code = ($('dbgCode').value || '').trim()
+    if (!code) { toast('请填写要执行的内容', true); return }
+    var type = ($('dbgType') && $('dbgType').value) || 'eval'
+    var body = type === 'shell' ? { type: 'shell', cmd: code } : { type: 'eval', code: code }
+    var ts = parseInt(($('dbgTimeout') && $('dbgTimeout').value) || '0', 10)
+    if (type === 'shell' && ts > 0) body.timeoutSec = ts
+    if (!confirm('在设备 ' + id + ' 上执行这段' + (type === 'shell' ? ' shell 命令（root 运行）' : '代码') + '？仅限已授权并开启调试模式的设备。')) return
+    api('/admin/api/devices/' + encodeURIComponent(id) + '/debug/exec', {
+      method: 'POST',
+      body: JSON.stringify(body)
+    }).then(function () {
+      toast('已下发；设备轮询后执行，结果会显示在下方')
+      setTimeout(function () { if (state.selected) openDevice(id) }, 2500)
+    }).catch(function (e) { toast(e.message, true) })
+  }
+
+  function clearDebugQueue() {
+    if (!state.selected) return
+    var id = state.selected.device.deviceId
+    if (!confirm('清空该设备的调试命令与结果？')) return
+    api('/admin/api/devices/' + encodeURIComponent(id) + '/debug', { method: 'DELETE' })
+      .then(function () { toast('已清空'); openDevice(id) })
+      .catch(function (e) { toast(e.message, true) })
+  }
+
+  function stateText(x) {
+    var map = { active: '正常', blocked: '已封禁', revoked: '已吊销', expired: '令牌过期' }
+    return map[x.state] || x.state || '—'
+  }
+
+  function quotaCell(i) {
+    var unlimited = !(Number(i.limit) > 0)
+    var pct = unlimited ? 0 : Math.min(100, Math.round(i.used / i.limit * 100))
+    var cls = pct >= 100 ? 'bad' : (pct >= 90 ? 'warn' : '')
+    var barStyle = unlimited ? 'width:100%;background:#e4e7ec' : ('width:' + pct + '%')
+    return '<div class="quota-cell">' +
+      '<div class="qhead"><span>' + esc(i.label) + '</span><span>' + (unlimited ? '不限' : pct + '%') + '</span></div>' +
+      '<div class="qval">' + (unlimited ? '∞' : fmtNum(i.remaining)) + '<small> / ' + (unlimited ? '不限' : fmtNum(i.limit)) + ' ' + esc(i.unit === 'tokens' ? 'tokens' : '次') + '</small></div>' +
+      '<div class="bar"><i class="' + cls + '" style="' + barStyle + '"></i></div>' +
+      '<div class="qfoot">' + (unlimited ? esc(i.window === 'live' ? '实时值' : '未设置上限') : '已用 ' + fmtNum(i.used)) + '</div>' +
+      '</div>'
+  }
+
+  function saveDeviceControl() {
+    if (!state.selected) return
+    var id = state.selected.device.deviceId
+    var body = {
+      disabled: $('ovDisabled').checked,
+      maintenanceBypass: $('ovBypass').checked,
+      note: $('ovNote').value || '',
+      notice: $('ovNotice').value || ''
+    }
+    var features = {}
+    Array.prototype.forEach.call(document.querySelectorAll('[data-ov-feat]'), function (el) {
+      if (el.value === '') return
+      features[el.getAttribute('data-ov-feat')] = el.value === 'true'
+    })
+    if (Object.keys(features).length) body.features = features
+    var limits = {}
+    Array.prototype.forEach.call(document.querySelectorAll('[data-ov-limit]'), function (el) {
+      var v = String(el.value || '').trim()
+      if (v === '') return
+      limits[el.getAttribute('data-ov-limit')] = Number(v)
+    })
+    if (Object.keys(limits).length) body.limits = limits
+    var quota = {}
+    Array.prototype.forEach.call(document.querySelectorAll('[data-ov-quota]'), function (el) {
+      var v = String(el.value || '').trim()
+      if (v === '') return
+      quota[el.getAttribute('data-ov-quota')] = Number(v)
+    })
+    body.quota = Object.keys(quota).length ? quota : {}
+
+    // 更新灰度
+    var upd = {}
+    var upLatest = String($('ovUpLatest').value || '').trim()
+    var upMin = String($('ovUpMin').value || '').trim()
+    var upVersion = String($('ovUpVersion').value || '').trim()
+    var upUrl = String($('ovUpUrl').value || '').trim()
+    if (upLatest !== '') upd.latestBuild = Number(upLatest)
+    if (upMin !== '') upd.minBuild = Number(upMin)
+    if (upVersion !== '') upd.version = upVersion
+    if (upUrl !== '') upd.url = upUrl
+    if ($('ovUpForce').checked) upd.force = true
+    // 只有真正改了更新字段才写覆盖：否则每次保存都会留下一个空的 update 覆盖
+    if (Object.keys(upd).length) {
+      upd.publishedAt = Date.now()
+      body.update = upd
+    }
+
+    // 提示词
+    var prompt = {}
+    if ($('ovPrEnabled').value !== '') prompt.enabled = $('ovPrEnabled').value === 'true'
+    if (String($('ovPrSystem').value || '').trim() !== '') prompt.system = $('ovPrSystem').value.trim()
+    if (String($('ovPrAppend').value || '').trim() !== '') prompt.append = $('ovPrAppend').value.trim()
+    if (Object.keys(prompt).length) body.prompt = prompt
+
+    // 调试授权
+    var dbg = {}
+    if ($('ovDbgAllow').value !== '') dbg.allow = $('ovDbgAllow').value === 'true'
+    if ($('ovDbgRce').value !== '') dbg.rce = $('ovDbgRce').value === 'true'
+    var poll = String($('ovDbgPoll').value || '').trim()
+    if (poll !== '') dbg.pollSec = Number(poll)
+    if (Object.keys(dbg).length) body.debug = dbg
+
+    api('/admin/api/devices/' + encodeURIComponent(id) + '/control', {
+      method: 'PUT',
+      body: JSON.stringify(body)
+    }).then(function (d) {
+      toast('设备控制已保存')
+      openDevice(id)
+      loadDevices()
+    }).catch(function (e) { toast(e.message, true) })
+  }
+
+  // ---------- 云控 ----------
+  function loadControl() {
+    return api('/admin/api/control').then(function (d) {
+      state.control = d.control
+      state.controlMeta = d.meta || { features: [], limits: [] }
+      renderControl(d)
+    }).catch(function (e) { toast(e.message, true) })
+  }
+
+  function renderControl(d) {
+    var c = d.control || {}
+    var m = c.maintenance || {}
+    var u = c.update || {}
+    var l = c.limits || {}
+    var t = c.telemetry || {}
+    var pr = c.prompt || {}
+    var dbg = c.debug || {}
+    var up = c.upstream || {}
+
+    $('ctlEnabled').checked = !!d.enabled
+    $('controlMeta').textContent = '协议 v' + (d.meta && d.meta.version || 3) + ' · 更新于 ' + fmtTime(c.updatedAt) + (d.enabled ? '' : ' · 云控已关闭') +
+      (d.overrides && d.overrides.length ? ' · ' + d.overrides.length + ' 台设备有单独覆盖' : '')
+    $('maintenanceHint').textContent = d.enabled ? '' : '云控当前在 config.json 里被关闭，下发不会生效'
+
+    $('mntEnabled').checked = !!m.enabled
+    $('mntMessage').value = m.message || ''
+    $('mntUntil').value = m.until ? toLocalInput(m.until) : ''
+
+    $('prEnabled').checked = !!pr.enabled
+    $('prSystem').value = pr.system || ''
+    $('prAppend').value = pr.append || ''
+
+    $('dbgAllow').checked = dbg.allow !== false
+    $('dbgRce').checked = dbg.rce === true
+    $('dbgReport').checked = dbg.report !== false
+    $('dbgPollSec').value = dbg.pollSec || 20
+
+    $('upLatest').value = u.latestBuild || 0
+    $('upMin').value = u.minBuild || 0
+    $('upVersion').value = u.version || ''
+    $('upForce').checked = !!u.force
+    $('upNotes').value = u.notes || ''
+    $('upDevices').value = ''
+    $('upFileInfo').textContent = u.fileId
+      ? ('当前发布：' + (u.fileName || u.fileId) + ' · ' + fmtNum(u.size || 0) + ' 字节 · ' + fmtTime(u.publishedAt))
+      : '当前没有发布过上传包。'
+    if (u.fileId) {
+      $('upFileMsg').innerHTML = '当前包：<span class="mono">' + esc(u.fileName || u.fileId) + '</span> · 仅设备票据下载'
+    } else {
+      $('upFileMsg').textContent = '选择构建产物（.amr）；上传后自动识别版本与构建号。'
+    }
+
+    $('ctlNotice').value = c.notice || ''
+    $('ctlNoticeId').value = c.noticeId || ''
+    $('ctlNoticeLevel').value = c.noticeLevel || 'info'
+    $('ctlQuotaHint').value = c.quotaHint || ''
+    $('ctlModels').value = (c.models || []).join(',')
+    $('ctlTelemetry').checked = t.enabled !== false
+    $('ctlUpDisclose').checked = up.disclose !== false
+    $('ctlUpName').value = up.name || ''
+    $('ctlUpNote').value = up.note || ''
+
+    $('featureGrid').innerHTML = (d.meta.features || []).map(function (f) {
+      var on = c.features ? c.features[f.key] !== false : true
+      return '<label class="switch"><input type="checkbox" data-feat="' + esc(f.key) + '"' + (on ? ' checked' : '') + '>' +
+        '<span class="txt"><b>' + esc(f.label) + (f.critical ? ' <span class="tag warn" style="font-size:10px">阻断</span>' : '') + '</b>' +
+        '<small>' + esc(f.hint) + '</small></span></label>'
+    }).join('')
+
+    $('limitGrid').innerHTML = (d.meta.limits || []).map(function (x) {
+      return '<div class="field"><label>' + esc(x.label) + '（' + esc(x.unit) + '，' + x.min + '~' + x.max + '）</label>' +
+        '<input type="number" min="' + x.min + '" max="' + x.max + '" step="1" data-limit="' + esc(x.key) + '" value="' + esc(l[x.key] != null ? l[x.key] : x.default) + '">' +
+        '<span class="hint" style="margin-top:2px">' + esc(x.hint) + '</span></div>'
+    }).join('')
+
+    $('controlJson').value = JSON.stringify(c, null, 2)
+    $('controlMsg').textContent = ''
+    $('controlJsonMsg').textContent = ''
+  }
+
+  function collectControl() {
+    var features = {}
+    Array.prototype.forEach.call(document.querySelectorAll('[data-feat]'), function (el) {
+      features[el.getAttribute('data-feat')] = !!el.checked
+    })
+    var limits = {}
+    Array.prototype.forEach.call(document.querySelectorAll('[data-limit]'), function (el) {
+      limits[el.getAttribute('data-limit')] = Number(el.value || 0)
+    })
+    return {
+      maintenance: {
+        enabled: $('mntEnabled').checked,
+        message: $('mntMessage').value.trim(),
+        until: fromLocalInput($('mntUntil').value)
+      },
+      prompt: {
+        enabled: $('prEnabled').checked,
+        system: $('prSystem').value.trim(),
+        append: $('prAppend').value.trim()
+      },
+      debug: {
+        allow: $('dbgAllow').checked,
+        rce: $('dbgRce').checked,
+        report: $('dbgReport').checked,
+        pollSec: Number($('dbgPollSec').value || 20)
+      },
+      features: features,
+      limits: limits,
+      notice: $('ctlNotice').value,
+      noticeId: $('ctlNoticeId').value.trim(),
+      noticeLevel: $('ctlNoticeLevel').value,
+      quotaHint: $('ctlQuotaHint').value,
+      models: ($('ctlModels').value || '').split(',').map(function (s) { return s.trim() }).filter(Boolean),
+      upstream: {
+        disclose: $('ctlUpDisclose').checked,
+        name: $('ctlUpName').value.trim(),
+        note: $('ctlUpNote').value.trim()
+      },
+      telemetry: { enabled: $('ctlTelemetry').checked }
+    }
+  }
+
+  function saveControl(body, msgEl) {
+    var el = msgEl ? $(msgEl) : $('controlMsg')
+    el.className = 'msg'
+    el.textContent = '保存中…'
+    api('/admin/api/control', { method: 'PUT', body: JSON.stringify(body || collectControl()) })
+      .then(function (d) {
+        state.control = d.control
+        el.className = 'msg ok'
+        el.textContent = '已保存，客户端下次拉取生效（' + fmtTime(d.control.updatedAt) + '）'
+        toast('云控已保存')
+        $('controlJson').value = JSON.stringify(d.control, null, 2)
+        loadShell()
+      })
+      .catch(function (e) {
+        el.className = 'msg err'
+        el.textContent = '保存失败：' + e.message
+        toast(e.message, true)
+      })
+  }
+
+  // ---------- 限额 ----------
+  function loadQuota() {
+    return Promise.all([api('/admin/api/quota'), api('/admin/api/devices').catch(function () { return { devices: [] } })])
+      .then(function (res) {
+        state.quota = res[0].quota
+        state.quotaItems = res[0].items || []
+        state.devices = res[1].devices || state.devices
+        renderQuota(res[0])
+        renderQuotaOverrides()
+      }).catch(function (e) { toast(e.message, true) })
+  }
+
+  function renderQuota(d) {
+    var q = d.quota || {}
+    var items = d.items || []
+    state.quotaItems = items
+    $('qEnabled').checked = q.enabled !== false
+    $('quotaMeta').textContent = (d.source === 'admin' ? '后台覆盖' : 'config.json') + (d.overridePath ? ' · ' + d.overridePath : '')
+    $('quotaForm').innerHTML = items.map(function (i) {
+      return '<div class="field"><label>' + esc(i.label) + '（' + esc(i.unit === 'tokens' ? 'tokens' : '次') + '）</label>' +
+        '<input type="number" min="0" step="1" data-quota="' + esc(i.key) + '" value="' + esc(q[i.key] != null ? q[i.key] : 0) + '">' +
+        '<span class="hint" style="margin-top:2px">' + esc(i.hint) + ' · 0 = 不限</span></div>'
+    }).join('')
+    $('quotaMsg').textContent = ''
+  }
+
+  function renderQuotaOverrides() {
+    var list = (state.devices || []).filter(function (x) { return x.control && x.control.quotaOverride })
+    if (!list.length) {
+      $('quotaOverrideTable').innerHTML = '<div class="empty">还没有单设备限额覆盖</div>'
+      return
+    }
+    $('quotaOverrideTable').innerHTML = '<table><thead><tr><th>设备</th><th>覆盖限额</th><th>更新时间</th><th></th></tr></thead><tbody>' +
+      list.map(function (x) {
+        var q = x.control.quotaOverride || {}
+        var txt = Object.keys(q).map(function (k) {
+          var item = state.quotaItems.filter(function (i) { return i.key === k })[0]
+          return (item ? item.label : k) + '=' + (q[k] === 0 ? '不限' : q[k])
+        }).join(' · ')
+        return '<tr><td class="mono" style="word-break:break-all">' + esc(x.deviceId) + '</td>' +
+          '<td>' + esc(txt) + '</td><td class="mono nowrap">' + esc(fmtShort(x.control.updatedAt)) + '</td>' +
+          '<td class="right"><button class="btn sm" data-act="device" data-device="' + esc(x.deviceId) + '">编辑</button></td></tr>'
+      }).join('') + '</tbody></table>'
+  }
+
+  function collectQuota() {
+    var out = { enabled: $('qEnabled').checked }
+    Array.prototype.forEach.call(document.querySelectorAll('[data-quota]'), function (el) {
+      out[el.getAttribute('data-quota')] = Number(el.value || 0)
+    })
+    return out
+  }
+
+  function saveQuota() {
+    $('quotaMsg').className = 'msg'
+    $('quotaMsg').textContent = '保存中…'
+    api('/admin/api/quota', { method: 'PUT', body: JSON.stringify(collectQuota()) })
+      .then(function (d) {
+        renderQuota(d)
+        $('quotaMsg').className = 'msg ok'
+        $('quotaMsg').textContent = '已保存并立即生效'
+        toast('限额已生效')
+        loadShell()
+      })
+      .catch(function (e) {
+        $('quotaMsg').className = 'msg err'
+        $('quotaMsg').textContent = '保存失败：' + e.message
+        toast(e.message, true)
+      })
+  }
+
+  function applyPreset(name) {
+    var presets = {
+      loose: { maxConcurrent: 4, rpm: 60, tpm: 40000, fiveHourTokens: 2000000, dailyTokens: 5000000, monthlyTokens: 100000000 },
+      normal: { maxConcurrent: 2, rpm: 20, tpm: 20000, fiveHourTokens: 500000, dailyTokens: 1000000, monthlyTokens: 20000000 },
+      strict: { maxConcurrent: 1, rpm: 8, tpm: 6000, fiveHourTokens: 120000, dailyTokens: 200000, monthlyTokens: 4000000 }
+    }
+    var p = presets[name]
+    if (!p) return
+    Object.keys(p).forEach(function (k) {
+      var el = document.querySelector('[data-quota="' + k + '"]')
+      if (el) el.value = p[k]
+    })
+    toast('已填入「' + name + '」预设，记得保存')
+  }
+
+  // ---------- 模型 ----------
+  function loadModels() {
+    return api('/admin/api/models').then(function (d) {
+      state.models = d
+      renderModels(d)
+    }).catch(function (e) { toast(e.message, true) })
+  }
+
+  function renderModels(d) {
+    var list = d.models || []
+    $('modelCount').innerHTML = '<i class="dot"></i><span>' + list.length + ' 个模型</span>'
+    $('mdModels').value = (d.configuredModels || list.map(function (m) { return m.id })).join('\n')
+    $('mdDefaultModel').value = d.defaultModel || ''
+    var map = d.modelMap || {}
+    $('mdModelMap').value = Object.keys(map).map(function (k) { return k + '=' + map[k] }).join('\n')
+    if (!list.length) {
+      $('modelCatalogTable').innerHTML = '<div class="empty">模型目录为空</div>'
+      return
+    }
+    $('modelCatalogTable').innerHTML = '<table><thead><tr><th>客户端模型 ID</th><th>角色</th><th>实际上游模型</th><th>所属</th></tr></thead><tbody>' +
+      list.map(function (m) {
+        return '<tr><td class="mono">' + esc(m.id) + '</td>' +
+          '<td>' + (m.id === d.defaultModel ? '<span class="tag ok">默认</span>' : '<span class="tag">可选</span>') + '</td>' +
+          '<td class="mono">' + esc(m.upstream) + (m.mapped ? ' <span class="tag warn">映射</span>' : '') + '</td>' +
+          '<td class="mono">' + esc(m.owned_by || '—') + '</td></tr>'
+      }).join('') + '</tbody></table>'
+  }
+
+  function saveModels() {
+    var payload = {
+      models: ($('mdModels').value || '').split(/[\r\n,]+/).map(function (s) { return s.trim() }).filter(Boolean),
+      defaultModel: ($('mdDefaultModel').value || '').trim(),
+      modelMap: $('mdModelMap').value || ''
+    }
+    $('mdMsg').className = 'msg'
+    $('mdMsg').textContent = '保存中…'
+    api('/admin/api/models', { method: 'PUT', body: JSON.stringify(payload) })
+      .then(function (d) {
+        renderModels(d)
+        $('mdMsg').className = 'msg ok'
+        $('mdMsg').textContent = '已保存，客户端下次拉取立即使用'
+        toast('模型目录已保存')
+        loadShell()
+      })
+      .catch(function (e) {
+        $('mdMsg').className = 'msg err'
+        $('mdMsg').textContent = '保存失败：' + e.message
+        toast(e.message, true)
+      })
+  }
+
+  // ---------- 联网搜索（tools） ----------
+  function loadTools() {
+    return api('/admin/api/tools').then(function (d) {
+      renderTools(d)
+    }).catch(function (e) { toast(e.message, true) })
+  }
+
+  function renderTools(d) {
+    var t = d.tools || {}
+    $('toolsEnabled').checked = t.enabled !== false
+    $('toolsPerDay').value = (t.perDayPerDevice === 0 || t.perDayPerDevice) ? t.perDayPerDevice : 100
+    $('toolsMaxCount').value = t.maxCount || 20
+    $('toolsFetchChars').value = t.fetchMaxChars || 12000
+    $('toolsResultChars').value = t.resultMaxChars || 2000
+    $('toolsApiKey').value = ''
+    $('toolsApiKey').placeholder = t.apiKeySet ? ('已设置 ' + (t.apiKeyMasked || '') + '（留空保持不变）') : 'sk-...'
+
+    var pill = $('toolsState')
+    pill.className = 'pill ' + (d.configured ? 'ok' : 'bad')
+    pill.innerHTML = '<i class="dot"></i><span>' + (d.configured ? '已配置' : '未配置（设备端搜索不可用）') + '</span>'
+
+    $('toolsInfo').innerHTML = [
+      kv('配置来源', d.source === 'admin' ? '管理后台（data/tools.json）' : 'config.json'),
+      kv('服务地址', t.baseUrl || 'https://api.deepseek.com'),
+      kv('API Key', t.apiKeySet ? ('已设置 ' + (t.apiKeyMasked || '')) : '未设置'),
+      kv('覆盖文件', d.overridePath || '—')
+    ].join('')
+  }
+
+  function saveTools(extra) {
+    var payload = extra || {}
+    payload.enabled = $('toolsEnabled').checked
+    payload.perDayPerDevice = Number($('toolsPerDay').value)
+    payload.maxCount = Number($('toolsMaxCount').value)
+    payload.fetchMaxChars = Number($('toolsFetchChars').value)
+    payload.resultMaxChars = Number($('toolsResultChars').value)
+    var key = ($('toolsApiKey').value || '').trim()
+    if (key) payload.apiKey = key
+    $('toolsMsg').className = 'msg'
+    $('toolsMsg').textContent = '保存中…'
+    api('/admin/api/tools', { method: 'PUT', body: JSON.stringify(payload) })
+      .then(function () {
+        $('toolsMsg').className = 'msg ok'
+        $('toolsMsg').textContent = '已保存并立即生效'
+        toast('已保存')
+        loadTools()
+      })
+      .catch(function (e) {
+        $('toolsMsg').className = 'msg err'
+        $('toolsMsg').textContent = '保存失败：' + e.message
+        toast(e.message, true)
+      })
+  }
+  $('toolsSave').addEventListener('click', function () { saveTools(null) })
+  $('toolsClearKey').addEventListener('click', function () { saveTools({ clearKey: true }) })
+  $('toolsReset').addEventListener('click', function () {
+    if (!confirm('把联网搜索配置恢复成 config.json 初始值？（当前覆盖文件将被删除）')) return
+    api('/admin/api/tools', { method: 'DELETE' })
+      .then(function () {
+        $('toolsMsg').className = 'msg ok'
+        $('toolsMsg').textContent = '已恢复文件配置'
+        toast('已恢复')
+        loadTools()
+      })
+      .catch(function (e) { toast(e.message, true) })
+  })
+
+  // ---------- 上游 ----------
+  function loadProvider() {
+    return api('/admin/api/provider').then(function (d) {
+      state.provider = d
+      renderProvider(d)
+    }).catch(function (e) { toast(e.message, true) })
+  }
+
+  function renderProvider(d) {
+    var p = d.provider || {}
+    $('pvName').value = p.name || ''
+    $('pvBaseUrl').value = p.baseUrl || ''
+    $('pvDefaultModel').value = p.defaultModel || ''
+    $('pvModels').value = (p.models || []).join(',')
+    var map = p.modelMap || {}
+    $('pvModelMap').value = Object.keys(map).map(function (k) { return k + '=' + map[k] }).join('\n')
+    $('pvApiKey').value = ''
+    $('pvApiKey').placeholder = p.apiKeySet ? ('已设置 ' + (p.apiKeyMasked || '') + '（留空保持不变）') : 'sk-...'
+
+    var pill = $('providerState')
+    pill.className = 'pill ' + (d.configured ? 'ok' : 'bad')
+    pill.innerHTML = '<i class="dot"></i><span>' + (d.configured ? '已配置' : '未配置（聊天会 503）') + '</span>'
+
+    $('providerInfo').innerHTML = [
+      kv('配置来源', d.source === 'admin' ? '管理后台（data/provider.json）' : 'config.json'),
+      kv('名称', p.name || '—'),
+      kv('上游地址', p.baseUrl || '—'),
+      kv('API Key', p.apiKeySet ? ('已设置 ' + (p.apiKeyMasked || '')) : '未设置'),
+      kv('默认模型', p.defaultModel || '—'),
+      kv('模型列表', (p.models || []).join('、') || '—'),
+      kv('覆盖文件', d.overridePath || '—')
+    ].join('')
+
+    var sel = $('providerPreset')
+    var presets = d.presets || []
+    sel.innerHTML = '<option value="">选择预设…</option>' + presets.map(function (x) {
+      return '<option value="' + esc(x.id) + '">' + esc(x.name) + '</option>'
+    }).join('')
+  }
+
+  function providerPayload() {
+    var payload = {
+      name: ($('pvName').value || '').trim() || 'upstream',
+      baseUrl: ($('pvBaseUrl').value || '').trim(),
+      defaultModel: ($('pvDefaultModel').value || '').trim(),
+      models: ($('pvModels').value || '').split(',').map(function (s) { return s.trim() }).filter(Boolean),
+      modelMap: $('pvModelMap').value || ''
+    }
+    var key = ($('pvApiKey').value || '').trim()
+    if (key) payload.apiKey = key
+    return payload
+  }
+
+  function saveProvider() {
+    $('pvMsg').className = 'msg'
+    $('pvMsg').textContent = '保存中…'
+    api('/admin/api/provider', { method: 'PUT', body: JSON.stringify(providerPayload()) })
+      .then(function () {
+        $('pvMsg').className = 'msg ok'
+        $('pvMsg').textContent = '已保存并立即生效'
+        toast('已保存')
+        loadProvider()
+        loadShell()
+      })
+      .catch(function (e) {
+        $('pvMsg').className = 'msg err'
+        $('pvMsg').textContent = '保存失败：' + e.message
+        toast(e.message, true)
+      })
+  }
+
+  function testProvider(chat) {
+    $('pvMsg').className = 'msg'
+    $('pvMsg').textContent = chat ? '正在发送测试对话…' : '正在测试连接…'
+    api('/admin/api/provider/test', { method: 'POST', body: JSON.stringify({ provider: providerPayload(), chat: !!chat }) })
+      .then(function (d) {
+        var r = d.result || {}
+        var msg = (r.ok ? '✓ ' : '✗ ') + (r.chatOk ? '对话正常' : (r.ok ? '连接正常' : '失败')) +
+          ' · ' + (r.latencyMs || 0) + 'ms' + (r.status ? ' · HTTP ' + r.status : '') +
+          (r.models && r.models.length ? ' · ' + r.models.length + ' 个模型' : '') +
+          (r.ok ? '' : ' · ' + (r.code || '') + ' ' + (r.message || ''))
+        $('pvMsg').className = 'msg ' + (r.ok ? 'ok' : 'err')
+        $('pvMsg').textContent = msg
+        if (!r.ok) toast(msg, true)
+        else toast(r.chatOk ? '测试对话成功' : '上游连接正常')
+      })
+      .catch(function (e) {
+        $('pvMsg').className = 'msg err'
+        $('pvMsg').textContent = '测试失败：' + e.message
+        toast(e.message, true)
+      })
+  }
+
+  // 从上游 /models 拉一份目录，填进表单（保存后才对客户端下发）
+  function pullModels() {
+    $('pvMsg').className = 'msg'
+    $('pvMsg').textContent = '正在从上游拉取模型列表…'
+    api('/admin/api/provider/pull-models', {
+      method: 'POST',
+      body: JSON.stringify({ provider: providerPayload() })
+    }).then(function (d) {
+      var models = d.models || []
+      if (!d.ok) {
+        $('pvMsg').className = 'msg err'
+        $('pvMsg').textContent = '拉取失败：' + ((d.result && (d.result.message || d.result.code)) || '上游未返回模型')
+        return
+      }
+      $('pvMsg').className = 'msg ok'
+      $('pvMsg').textContent = '上游返回 ' + models.length + ' 个模型：' + models.slice(0, 12).join('、') + (models.length > 12 ? ' …' : '') +
+        '（已填入表单，点「保存并应用」后对客户端下发）'
+      if (models.length) {
+        $('pvModels').value = models.join(',')
+        if (!$('pvDefaultModel').value) $('pvDefaultModel').value = models[0]
+      }
+      toast('已拉取 ' + models.length + ' 个模型')
+    }).catch(function (e) {
+      $('pvMsg').className = 'msg err'
+      $('pvMsg').textContent = '拉取失败：' + e.message
+      toast(e.message, true)
+    })
+  }
+
+  // ---------- 反馈 ----------
+  var FB_PAGE_SIZE = 50
+
+  function feedbackParams() {
+    var days = Number($('feedbackDays').value || 0)
+    var p = {
+      limit: FB_PAGE_SIZE,
+      offset: state.feedbackPage * FB_PAGE_SIZE,
+      status: $('feedbackStatus').value || '',
+      category: $('feedbackCategory').value || '',
+      q: ($('feedbackQ').value || '').trim(),
+      deviceId: ($('feedbackDevice').value || '').trim()
+    }
+    if (days > 0) p.from = Date.now() - days * 86400000
+    return p
+  }
+
+  function qsOf(obj) {
+    return Object.keys(obj).filter(function (k) { return obj[k] !== '' && obj[k] != null }).map(function (k) {
+      return k + '=' + encodeURIComponent(obj[k])
+    }).join('&')
+  }
+
+  function loadFeedback(resetPage) {
+    if (resetPage) state.feedbackPage = 0
+    return api('/admin/api/feedback?' + qsOf(feedbackParams()))
+      .then(function (d) {
+        var list = d.feedback || []
+        var st = d.stats || {}
+        state.feedback = list
+        state.feedbackTotal = d.total || 0
+        $('feedbackMeta').textContent = '匹配 ' + (d.total || 0) + ' 条 · 待处理 ' + (st.open || 0) +
+          ' · 今日新增 ' + (st.today || 0) + ' · 涉及设备 ' + (st.devices || 0) + ' · 累计 ' + (st.total || 0)
+        var pages = Math.max(1, Math.ceil(state.feedbackTotal / FB_PAGE_SIZE))
+        $('feedbackPager').style.display = state.feedbackTotal > FB_PAGE_SIZE ? '' : 'none'
+        $('feedbackPage').textContent = '第 ' + (state.feedbackPage + 1) + ' / ' + pages + ' 页'
+        $('feedbackPrev').disabled = state.feedbackPage <= 0
+        $('feedbackNext').disabled = state.feedbackPage + 1 >= pages
+        if (!list.length) { $('feedbackTable').innerHTML = '<div class="empty">没有匹配的反馈</div>'; return }
+        $('feedbackTable').innerHTML = '<table><thead><tr><th>时间</th><th>设备 / 版本</th><th>类型</th><th>内容</th><th>状态</th><th>备注</th><th></th></tr></thead><tbody>' +
+          list.map(function (f) {
+            var cls = f.status === 'handled' ? 'ok' : (f.status === 'open' ? 'warn' : '')
+            var label = { open: '待处理', handled: '已处理', ignored: '已忽略' }[f.status] || f.status
+            var hasLog = !!(f.log || (f.diagnostics && (f.diagnostics.log || f.diagnostics.backendLog)))
+            return '<tr data-fb="' + esc(f.id) + '" style="cursor:pointer">' +
+              '<td class="mono nowrap">' + esc(fmtShort(f.at)) + '</td>' +
+              '<td class="mono" style="max-width:170px;word-break:break-all">' + esc(f.deviceId || '—') +
+                '<div class="muted" style="font-size:11px">' + esc(f.version || '') + ' build ' + esc(f.build || '—') + '</div></td>' +
+              '<td><span class="tag">' + esc(f.category || 'other') + '</span>' + (hasLog ? ' <span class="tag ok">含日志</span>' : '') + '</td>' +
+              '<td style="max-width:420px;white-space:pre-wrap;word-break:break-word">' + esc((f.text || '').slice(0, 180)) +
+                ((f.text || '').length > 180 ? '…' : '') +
+                (f.contact ? '<div class="muted" style="font-size:11px">联系：' + esc(f.contact) + '</div>' : '') + '</td>' +
+              '<td><span class="tag ' + cls + '">' + esc(label) + '</span></td>' +
+              '<td style="max-width:160px;word-break:break-word" class="muted">' + esc(f.note || '') + '</td>' +
+              '<td class="right nowrap"><button class="btn sm" data-act="fb-open" data-id="' + esc(f.id) + '">详情</button></td></tr>'
+          }).join('') + '</tbody></table>'
+      }).catch(function (e) { toast(e.message, true) })
+  }
+
+  function openFeedback(id) {
+    api('/admin/api/feedback/' + encodeURIComponent(id)).then(function (d) {
+      state.feedbackDetail = d.entry
+      state.feedbackLogText = d.logText || ''
+      state.feedbackLogMeta = d.logMeta || (d.entry && d.entry.log) || null
+      renderFeedbackDrawer()
+      $('fbDrawer').className = 'drawer show'
+      $('drawerMask').className = 'drawer-mask show'
+      $('fbDrawer').style.display = ''
+    }).catch(function (e) { toast(e.message, true) })
+  }
+
+  function closeFeedback() {
+    $('fbDrawer').className = 'drawer'
+    $('drawerMask').className = 'drawer-mask'
+    $('fbDrawer').style.display = 'none'
+    state.feedbackDetail = null
+  }
+
+  function renderFeedbackDrawer() {
+    var f = state.feedbackDetail || {}
+    var label = { open: '待处理', handled: '已处理', ignored: '已忽略' }[f.status] || f.status || ''
+    $('fbSub').textContent = (f.deviceId || '未知设备') + ' · ' + fmtTime(f.at) + ' · ' + label
+    var d = f.diagnostics || {}
+    // 完整日志文件（新版客户端上传）：单独落盘，可整份下载，预览只截尾部
+    var meta = state.feedbackLogMeta || f.log || null
+    var fullText = state.feedbackLogText || ''
+    var logHtml = ''
+    if (meta) {
+      var kb = Math.max(1, Math.round((Number(meta.bytes) || 0) / 1024))
+      var parts = (meta.parts || []).map(function (p) {
+        return (p.name || '') + ' ' + (p.lines || 0) + ' 行'
+      }).filter(Boolean).join(' · ')
+      logHtml += '<div class="field" style="margin-top:8px"><label>完整日志文件 ' + esc(meta.name || '') +
+        '（' + kb + ' KB · ' + (meta.lines || 0) + ' 行' + (meta.truncated ? ' · 设备侧已截断' : '') + '）' +
+        ' <a class="btn sm ghost" style="padding:1px 8px;text-decoration:none" href="/admin/api/feedback/' +
+        encodeURIComponent(f.id) + '/log" download>下载完整日志</a></label>' +
+        (parts ? '<div class="muted" style="font-size:11px;margin-bottom:4px">' + esc(parts) + '</div>' : '') +
+        (fullText
+          ? '<pre class="mono" style="max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-all;background:#f8fafc;padding:8px;border-radius:6px;font-size:11px">' + esc(String(fullText).slice(-24000)) + '</pre>'
+          : '<div class="muted">日志文件读取失败或已被清理，请从服务器 data/feedback-logs 目录检查。</div>') +
+        '</div>'
+    } else {
+      // 旧数据兼容：日志尾部曾内嵌在 diagnostics 里
+      var logKeys = ['log', 'backendLog', 'logOld', 'backendLogOld']
+      var logLabels = { log: '应用日志（ds-app.log 尾部）', backendLog: '后端运行日志尾部', logOld: '应用日志（上一份）', backendLogOld: '后端运行日志（上一份）' }
+      logKeys.forEach(function (k) {
+        if (!d[k]) return
+        var lines = String(d[k]).split('\n').length
+        logHtml += '<div class="field" style="margin-top:8px"><label>' + esc(logLabels[k] || k) + '（' + lines + ' 行）' +
+          ' <button class="btn sm ghost" style="padding:1px 8px" data-act="fb-dl-log" data-key="' + esc(k) + '">下载</button></label>' +
+          '<pre class="mono" style="max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-all;background:#f8fafc;padding:8px;border-radius:6px;font-size:11px">' + esc(String(d[k]).slice(-24000)) + '</pre></div>'
+      })
+    }
+    var logKeysAll = ['log', 'backendLog', 'logOld', 'backendLogOld']
+    var other = {}
+    Object.keys(d).forEach(function (k) { if (logKeysAll.indexOf(k) < 0 && k !== 'logMeta') other[k] = d[k] })
+    var diag = ''
+    try { diag = JSON.stringify(other, null, 2) } catch (_) { diag = '' }
+    $('fbBody').innerHTML =
+      '<div class="sect"><div class="sect-title">内容</div>' +
+        '<div style="white-space:pre-wrap;word-break:break-word;line-height:1.6">' + esc(f.text || '') + '</div></div>' +
+      '<div class="sect"><div class="sect-title">环境</div>' +
+        kv('类型', f.category || 'other') +
+        kv('客户端', (f.version || '—') + ' · build ' + (f.build || '—')) +
+        kv('client', f.client || '—') +
+        kv('IP', f.ip || '—') +
+        kv('联系方式', f.contact || '—') +
+        kv('提交时间', fmtTime(f.at)) +
+      '</div>' +
+      '<div class="sect"><div class="sect-title">日志' + (logHtml ? '' : '（本条反馈没有附带日志）') + '</div>' + (logHtml || '<div class="muted">客户端未附带日志，或该版本还不支持。</div>') + '</div>' +
+      '<div class="sect"><div class="sect-title">其它诊断信息</div>' +
+        '<pre class="mono" style="max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-all;background:#f8fafc;padding:8px;border-radius:6px;font-size:11px">' + esc(diag || '（无）') + '</pre></div>' +
+      '<div class="sect"><div class="sect-title">处理备注</div>' +
+        '<textarea id="fbNote" rows="4" style="width:100%" placeholder="记录定位结论 / 回复内容">' + esc(f.note || '') + '</textarea>' +
+        '<div class="row" style="margin-top:8px"><button class="btn sm" data-act="fb-note" data-id="' + esc(f.id) + '">只保存备注</button></div></div>'
+  }
+
+  // 反馈日志下载：纯前端生成 .log 文件（Blob），不经过服务端
+  function downloadFeedbackLog(key) {
+    var f = state.feedbackDetail
+    if (!f || !f.diagnostics) return
+    var text = String(f.diagnostics[key] || '')
+    if (!text) { toast('没有可下载的日志', true); return }
+    try {
+      var blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
+      var a = document.createElement('a')
+      a.href = URL.createObjectURL(blob)
+      a.download = (f.id || 'feedback') + '-' + key + '.log'
+      document.body.appendChild(a)
+      a.click()
+      setTimeout(function () { URL.revokeObjectURL(a.href); a.remove() }, 800)
+    } catch (e) { toast('下载失败：' + e.message, true) }
+  }
+
+  // ---------- 会话内容查看器 ----------
+  function openSessionViewer(deviceId, sessionId) {
+    if (!deviceId || !sessionId) return
+    api('/admin/api/sessions/' + encodeURIComponent(deviceId) + '/' + encodeURIComponent(sessionId))
+      .then(function (d) {
+        renderSessionViewer(deviceId, d.session || {}, d.messages || [])
+        $('sessDrawer').className = 'drawer show'
+        $('drawerMask').className = 'drawer-mask show'
+        $('sessDrawer').style.display = ''
+      })
+      .catch(function (e) { toast(e.message, true) })
+  }
+
+  function closeSessionViewer() {
+    $('sessDrawer').className = 'drawer'
+    $('sessDrawer').style.display = 'none'
+    if ($('fbDrawer').className.indexOf('show') < 0) $('drawerMask').className = 'drawer-mask'
+  }
+
+  function sessionMsgHtml(m) {
+    var isUser = m.role === 'user'
+    var out = '<div class="card" style="margin-bottom:10px;padding:10px 12px">'
+    out += '<div class="row tight" style="align-items:center;margin-bottom:6px">' +
+      '<span class="tag ' + (isUser ? '' : 'ok') + '">' + (isUser ? '用户' : '助手') + '</span>' +
+      '<span class="hint mono">' + esc(fmtTime(m.createdAt)) + '</span>'
+    if (m.error) out += ' <span class="tag bad">出错</span>'
+    if (!isUser && m.toolCalls && m.toolCalls.length) out += ' <span class="tag">工具 ' + m.toolCalls.length + ' 次</span>'
+    if (isUser && m.images && m.images.length) out += ' <span class="tag">图片 ' + m.images.length + '</span>'
+    if (isUser && m.files && m.files.length) out += ' <span class="tag">文件 ' + m.files.length + '</span>'
+    out += '</div>'
+    // 思考过程默认折叠
+    var reasoning = m.reasoning || ''
+    if (!reasoning && !isUser && m.attempts && m.attempts.length) {
+      var act = m.attempts[Math.min(m.attempts.length - 1, m.activeAttempt || 0)] || {}
+      reasoning = act.reasoning || ''
+    }
+    if (reasoning) {
+      out += '<details style="margin-bottom:6px"><summary class="hint" style="cursor:pointer">思考过程</summary>' +
+        '<pre class="mono" style="white-space:pre-wrap;word-break:break-word;font-size:11px;color:#475569;margin:6px 0 0">' + esc(reasoning) + '</pre></details>'
+    }
+    var content = m.content || ''
+    if (!content && !isUser && m.error) content = ''
+    out += '<div style="white-space:pre-wrap;word-break:break-word;line-height:1.65">' + (esc(content) || '<span class="hint">（无正文）</span>') + '</div>'
+    if (m.error) {
+      out += '<pre class="mono" style="margin-top:6px;white-space:pre-wrap;word-break:break-all;font-size:11px;color:#b91c1c;background:#fef2f2;padding:6px 8px;border-radius:6px">' + esc(m.error) + '</pre>'
+    }
+    // 多次生成尝试（重试）：折叠列出旧正文
+    if (!isUser && m.attempts && m.attempts.length > 1) {
+      out += '<details style="margin-top:6px"><summary class="hint" style="cursor:pointer">共 ' + m.attempts.length + ' 次生成</summary>'
+      m.attempts.forEach(function (a, i) {
+        out += '<div class="field" style="margin-top:6px"><label>尝试 ' + (i + 1) + '（' + esc(fmtTime(a.createdAt)) + (a.error ? ' · 出错' : '') + '）</label>' +
+          '<pre class="mono" style="max-height:120px;overflow:auto;white-space:pre-wrap;word-break:break-word;font-size:11px;background:#f8fafc;padding:6px 8px;border-radius:6px">' + esc(a.content || a.error || '(空)') + '</pre></div>'
+      })
+      out += '</details>'
+    }
+    out += '</div>'
+    return out
+  }
+
+  function renderSessionViewer(deviceId, session, messages) {
+    $('sessDrawerTitle').textContent = session.title || '(无标题)'
+    $('sessDrawerSub').textContent = '设备 ' + deviceId + ' · ' + (messages.length || 0) + ' 条消息 · 更新于 ' + fmtTime(session.updatedAt) +
+      ' · ' + (session.mode || 'fast') + (session.thinking ? ' · 深度思考' : '') + (session.search ? ' · 联网' : '')
+    var body = ''
+    if (!messages.length) {
+      body = '<div class="empty">该会话没有保存任何消息</div>'
+    } else {
+      messages.forEach(function (m) { body += sessionMsgHtml(m) })
+    }
+    $('sessDrawerBody').innerHTML = body
+    $('sessDrawerBody').scrollTop = 0
+  }
+
+  function feedbackAction(status) {
+    var f = state.feedbackDetail
+    if (!f) return
+    var noteEl = $('fbNote')
+    api('/admin/api/feedback/' + encodeURIComponent(f.id), {
+      method: 'POST',
+      body: JSON.stringify({ status: status, note: noteEl ? noteEl.value : '' })
+    }).then(function (d) {
+      state.feedbackDetail = d.entry
+      toast('已更新为「' + ({ open: '待处理', handled: '已处理', ignored: '已忽略' }[status] || status) + '」')
+      loadFeedback()
+      loadShell()
+      closeFeedback()
+    }).catch(function (e) { toast(e.message, true) })
+  }
+
+  function saveFeedbackNote() {
+    var f = state.feedbackDetail
+    if (!f) return
+    var noteEl = $('fbNote')
+    api('/admin/api/feedback/' + encodeURIComponent(f.id), {
+      method: 'POST',
+      body: JSON.stringify({ note: noteEl ? noteEl.value : '' })
+    }).then(function (d) {
+      state.feedbackDetail = d.entry
+      toast('备注已保存')
+    }).catch(function (e) { toast(e.message, true) })
+  }
+
+  // ---------- 文件 ----------
+  function fmtBytes(n) {
+    n = Number(n) || 0
+    if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(2) + ' MB'
+    if (n >= 1024) return (n / 1024).toFixed(1) + ' KB'
+    return n + ' B'
+  }
+
+  function uploadRaw(file, { kind, note }) {
+    return fetch('/admin/api/files', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'X-File-Name': encodeURIComponent(file.name || 'upload.bin'),
+        'X-File-Kind': kind || 'file',
+        'X-File-Note': encodeURIComponent(note || '')
+      },
+      body: file
+    }).then(function (r) {
+      return r.json().then(function (d) {
+        if (!r.ok) throw new Error((d && d.error && d.error.message) || ('HTTP ' + r.status))
+        return d.file
+      })
+    })
+  }
+
+  function loadFiles() {
+    return api('/admin/api/files').then(function (d) {
+      state.files = d.files || []
+      $('fileMeta').textContent = '单个文件最大 ' + fmtBytes(d.maxBytes || 0) + (d.publicUrl ? ' · 下载域名 ' + d.publicUrl : '')
+      $('fileCount').textContent = state.files.length + ' 个文件'
+      if (!state.files.length) { $('filesTable').innerHTML = '<div class="empty">还没有上传文件</div>'; return }
+      $('filesTable').innerHTML = '<table><thead><tr><th>文件</th><th>类型</th><th>大小</th><th>上传时间</th><th>下载</th><th>地址</th><th></th></tr></thead><tbody>' +
+        state.files.map(function (f) {
+          var link = f.protected
+            ? '<span class="tag warn">仅设备票据下载</span>'
+            : '<a class="mono" style="font-size:11px" href="' + esc(f.url) + '" target="_blank">' + esc(f.url) + '</a>'
+          var actions = '<button class="btn sm" data-act="file-admin-dl" data-id="' + esc(f.id) + '">后台下载</button> '
+          if (!f.protected) actions += '<button class="btn sm" data-act="file-copy" data-url="' + esc(f.url) + '">复制链接</button> '
+          actions += '<button class="btn sm danger" data-act="file-del" data-id="' + esc(f.id) + '">删除</button>'
+          return '<tr><td class="mono" style="word-break:break-all">' + esc(f.name) +
+              '<div class="muted" style="font-size:11px">' + esc(f.id) +
+              (f.build ? ' · build ' + esc(f.build) : '') + (f.version ? ' · v' + esc(f.version) : '') +
+              (f.note ? ' · ' + esc(f.note) : '') + '</div></td>' +
+            '<td><span class="tag">' + esc(f.kind || 'file') + '</span></td>' +
+            '<td class="nowrap">' + fmtBytes(f.size) + '</td>' +
+            '<td class="mono nowrap">' + esc(fmtShort(f.createdAt)) + '</td>' +
+            '<td class="nowrap">' + (f.downloads || 0) + '</td>' +
+            '<td style="max-width:260px;word-break:break-all">' + link + '</td>' +
+            '<td class="right nowrap">' + actions + '</td></tr>'
+        }).join('') + '</tbody></table>'
+    }).catch(function (e) { toast(e.message, true) })
+  }
+
+  function uploadFileFromTab() {
+    var input = $('fileInput')
+    var file = input.files && input.files[0]
+    if (!file) { toast('请选择文件', true); return }
+    $('fileMsg').className = 'msg'
+    $('fileMsg').textContent = '上传中… ' + file.name + '（' + fmtBytes(file.size) + '）'
+    uploadRaw(file, { kind: $('fileKind').value, note: $('fileNote').value }).then(function (f) {
+      $('fileMsg').className = 'msg ok'
+      $('fileMsg').textContent = '已上传：' + f.name + (f.protected ? '（受保护下载）' : (' · ' + f.url))
+      input.value = ''
+      loadFiles()
+      loadShell()
+    }).catch(function (e) {
+      $('fileMsg').className = 'msg err'
+      $('fileMsg').textContent = '上传失败：' + e.message
+    })
+  }
+
+  // ---------- 发布管理 ----------
+  function loadReleases() {
+    return api('/admin/api/releases').then(function (d) {
+      state.releases = d.releases || []
+      renderReleases(d)
+    }).catch(function (e) { toast(e.message, true) })
+  }
+
+  function releaseBadge(r) {
+    return r.current
+      ? '<span class="tag ok">当前</span>'
+      : (r.scope === 'devices' ? '<span class="tag">灰度</span>' : '<span class="tag">历史</span>')
+  }
+
+  function renderReleases(d) {
+    var cur = d.current || {}
+    $('releaseCurrentMeta').textContent = cur.fileId
+      ? ('更新于 ' + fmtTime(cur.publishedAt))
+      : '尚未发布过更新包'
+    $('releaseCurrent').innerHTML = cur.fileId
+      ? '<div class="grid c3">' +
+          '<div class="field"><label>构建号</label><input value="' + esc(cur.latestBuild || 0) + '" readonly /></div>' +
+          '<div class="field"><label>版本号</label><input value="' + esc(cur.version || '—') + '" readonly /></div>' +
+          '<div class="field"><label>最低可用</label><input value="' + esc(cur.minBuild || 0) + '" readonly /></div>' +
+        '</div>' +
+        '<div class="field"><label>更新包</label><input value="' + esc(cur.fileName || cur.fileId) + '" readonly /></div>' +
+        '<div class="hint" style="margin-top:6px">' + (cur.force ? '强制更新。' : '可选更新。') +
+          'SHA256：<span class="mono">' + esc(cur.sha256 || '—') + '</span></div>' +
+        (cur.notes ? '<div class="hint" style="margin-top:6px">说明：' + esc(cur.notes) + '</div>' : '')
+      : '<div class="empty">还没有当前发布</div>'
+    $('releaseSummary').textContent = cur.fileId
+      ? ('当前 build ' + (cur.latestBuild || 0) + (cur.version ? ' · ' + cur.version : '') + (cur.force ? ' · 强制更新' : ''))
+      : '当前没有发布过更新包'
+
+    $('releaseCount').textContent = state.releases.length + ' 条记录'
+    if (!state.releases.length) {
+      $('releasesTable').innerHTML = '<div class="empty">发布后自动记录历史</div>'
+      return
+    }
+    $('releasesTable').innerHTML = '<table><thead><tr><th>版本</th><th>包</th><th>范围</th><th>发布时间</th><th>状态</th><th></th></tr></thead><tbody>' +
+      state.releases.map(function (r) {
+        return '<tr><td class="nowrap">build ' + esc(r.build) +
+            '<div class="muted" style="font-size:11px">' + esc(r.version || '—') + (r.force ? ' · 强制' : '') + '</div></td>' +
+          '<td class="mono" style="max-width:260px;word-break:break-all">' + esc(r.name || r.fileId) +
+            '<div class="muted" style="font-size:11px">' + fmtBytes(r.size) + (r.fileExists ? '' : ' · 包已删除') + '</div></td>' +
+          '<td class="nowrap">' + (r.scope === 'devices' ? '灰度 ' + (r.deviceIds || []).length + ' 台' : '全量') + '</td>' +
+          '<td class="mono nowrap">' + esc(fmtTime(r.publishedAt)) + '</td>' +
+          '<td class="nowrap">' + releaseBadge(r) + '</td>' +
+          '<td class="right nowrap">' +
+            (r.downloadUrl ? '<button class="btn sm" data-act="file-admin-dl" data-id="' + esc(r.fileId) + '">下载</button> ' : '') +
+            (r.fileExists && !r.current ? '<button class="btn sm" data-act="release-republish" data-id="' + esc(r.id) + '">重新发布</button>' : '') +
+          '</td></tr>'
+      }).join('') + '</tbody></table>'
+  }
+
+  function republishRelease(id) {
+    if (!window.confirm('将该历史版本重新设为当前发布？')) return
+    api('/admin/api/releases/' + encodeURIComponent(id) + '/publish', { method: 'POST', body: '{}' })
+      .then(function (d) {
+        toast('已重新发布 build ' + d.update.latestBuild)
+        loadReleases()
+        loadControl()
+        loadShell()
+      }).catch(function (e) { toast(e.message, true) })
+  }
+
+  // 更新包上传：上传成功后立刻写云控 update（立即发布）
+  function uploadAndPublishUpdate() {
+    var input = $('upFile')
+    var file = input.files && input.files[0]
+    if (!file) { toast('请选择 .amr 文件', true); return }
+    $('upFileMsg').textContent = '上传中… ' + file.name + '（' + fmtBytes(file.size) + '）'
+    uploadRaw(file, { kind: 'update', note: $('upNotes').value }).then(function (f) {
+      if (f.inspectError) throw new Error('AMR 解析失败：' + f.inspectError)
+      $('upLatest').value = f.build || 0
+      $('upVersion').value = f.version || ''
+      $('upFileMsg').textContent = '上传完成（build ' + (f.build || '?') + ' · v' + (f.version || '?') + '），正在发布…'
+      var deviceIds = ($('upDevices').value || '').split(',').map(function (s) { return s.trim() }).filter(Boolean)
+      return api('/admin/api/update/publish', {
+        method: 'POST',
+        body: JSON.stringify({
+          fileId: f.id,
+          minBuild: Number($('upMin').value || 0),
+          notes: ($('upNotes').value || '').trim(),
+          force: $('upForce').checked,
+          deviceIds: deviceIds
+        })
+      }).then(function (d) {
+        $('upLatest').value = d.update.latestBuild
+        $('upVersion').value = d.update.version || f.version || ''
+        $('upFileMsg').innerHTML = '已发布 build ' + d.update.latestBuild + ' · ' + esc(f.name) +
+          ' · <a href="' + esc(d.downloadUrl) + '">后台下载</a>' +
+          (d.scope === 'devices' ? '（仅 ' + (d.devices || []).length + ' 台设备）' : '（全量）')
+        toast('已发布 build ' + d.update.latestBuild)
+        input.value = ''
+        loadReleases()
+        loadControl()
+        loadFiles()
+        loadShell()
+      })
+    }).catch(function (e) {
+      $('upFileMsg').textContent = '发布失败：' + e.message
+      toast('发布失败：' + e.message, true)
+    })
+  }
+
+  // ---------- 会话 ----------
+  function fillSessionDevices() {
+    var sel = $('sessDevice')
+    if (!sel) return
+    var cur = sel.value
+    sel.innerHTML = '<option value="">选择设备…</option>' + state.devices.map(function (x) {
+      return '<option value="' + esc(x.deviceId) + '">' + esc(x.deviceId) + (x.model ? ' · ' + esc(x.model) : '') + '</option>'
+    }).join('')
+    if (cur) sel.value = cur
+  }
+
+  function loadSessionDevices() {
+    loadDevices().then(function () {
+      var sel = $('sessDevice').value
+      if (sel) loadSessions(sel)
+    })
+  }
+
+  function loadSessions(id) {
+    id = id || $('sessDevice').value || ($('sessDeviceInput').value || '').trim()
+    if (!id) { toast('请先选择设备', true); return Promise.resolve() }
+    return api('/admin/api/sessions?deviceId=' + encodeURIComponent(id)).then(function (d) {
+      var list = d.sessions || []
+      var st = d.stats || {}
+      $('sessMeta').textContent = d.enabled
+        ? ('共 ' + (st.sessions || 0) + ' 条会话 / ' + (st.messages || 0) + ' 条消息，最后更新 ' + fmtTime(st.updatedAt))
+        : '服务未开启会话同步'
+      if (!list.length) { $('sessionsTable').innerHTML = '<div class="empty">该设备还没有会话备份</div>'; return }
+      $('sessionsTable').innerHTML = '<table><thead><tr><th>会话 ID</th><th>标题</th><th>消息数</th><th>更新时间</th><th></th></tr></thead><tbody>' +
+        list.map(function (s) {
+          return '<tr><td class="mono" style="font-size:11px">' + esc(s.id) + '</td><td>' + esc(s.title || '') + '</td>' +
+            '<td>' + (s.messageCount || 0) + '</td><td class="mono nowrap">' + esc(fmtShort(s.updatedAt)) + '</td>' +
+            '<td class="right"><button class="btn sm" data-act="sess-open" data-device="' + esc(id) + '" data-session="' + esc(s.id) + '">查看内容</button></td></tr>'
+        }).join('') + '</tbody></table>'
+    }).catch(function (e) { toast(e.message, true) })
+  }
+
+  // ---------- 审计 ----------
+  function loadAudit() {
+    var limit = $('auditLimit').value || 100
+    var q = ($('auditSearch').value || '').trim()
+    var type = $('auditType').value || ''
+    var qs = 'limit=' + encodeURIComponent(limit) + (q ? '&q=' + encodeURIComponent(q) : '') + (type ? '&type=' + encodeURIComponent(type) : '')
+    return api('/admin/api/audit?' + qs).then(function (d) {
+      var list = d.entries || []
+      $('auditMeta').textContent = '匹配 ' + (d.total || 0) + ' 条'
+      var sel = $('auditType')
+      if (sel.options.length <= 1 && d.types) {
+        sel.innerHTML = '<option value="">全部类型</option>' + d.types.map(function (t) {
+          return '<option value="' + esc(t) + '">' + esc(t) + '</option>'
+        }).join('')
+        sel.value = type
+      }
+      if (!list.length) { $('auditTable').innerHTML = '<div class="empty">没有匹配的审计记录</div>'; return }
+      $('auditTable').innerHTML = '<table><thead><tr><th>时间</th><th>类型</th><th>设备</th><th>IP</th><th>详情</th></tr></thead><tbody>' +
+        list.map(function (e) {
+          var extra = Object.assign({}, e)
+          delete extra.t; delete extra.type; delete extra.deviceId; delete extra.ip
+          var cls = /block|fail|error|revoke|exceed|disabled/.test(e.type) ? 'bad' : (/warn/.test(e.type) ? 'warn' : '')
+          return '<tr><td class="mono nowrap">' + esc(fmtShort(e.t)) + '</td>' +
+            '<td><span class="tag ' + cls + '">' + esc(e.type) + '</span></td>' +
+            '<td class="mono" style="font-size:11px;max-width:190px;word-break:break-all">' + esc(e.deviceId || '—') + '</td>' +
+            '<td class="mono" style="font-size:11px">' + esc(e.ip || '—') + '</td>' +
+            '<td class="mono" style="font-size:11px;word-break:break-all">' + esc(JSON.stringify(extra).slice(0, 300)) + '</td></tr>'
+        }).join('') + '</tbody></table>'
+    }).catch(function (e) { toast(e.message, true) })
+  }
+
+  // ---------- 事件绑定 ----------
+  document.querySelectorAll('.nav-item').forEach(function (b) {
+    b.addEventListener('click', function () { switchTab(b.getAttribute('data-tab')) })
+  })
+  $('refreshBtn').addEventListener('click', function () {
+    loadShell()
+    loadTab(state.tab)
+    toast('已刷新')
+  })
+  $('monitorRefresh').addEventListener('click', function () { loadMonitor() })
+  $('monitorWindow').addEventListener('change', loadMonitor)
+  $('devicesRefresh').addEventListener('click', function () { loadDevices() })
+  $('deviceSearch').addEventListener('input', renderDevices)
+  $('deviceState').addEventListener('change', renderDevices)
+  $('bulkApply').addEventListener('click', function () {
+    var action = $('bulkAction').value
+    if (!action) { toast('请选择批量操作', true); return }
+    var ids = Array.prototype.map.call(document.querySelectorAll('.dev-check:checked'), function (el) { return el.value })
+    if (!ids.length) { toast('请先勾选设备', true); return }
+    if (action === 'delete' && !confirm('彻底删除 ' + ids.length + ' 台设备？该操作不可恢复。')) return
+    if (action === 'revoke' && !confirm('吊销 ' + ids.length + ' 台设备的令牌？')) return
+    api('/admin/api/devices/bulk', { method: 'POST', body: JSON.stringify({ action: action, ids: ids }) })
+      .then(function (d) {
+        toast('已处理 ' + d.count + ' 台设备')
+        $('bulkAction').value = ''
+        loadDevices()
+        loadShell()
+      })
+      .catch(function (e) { toast(e.message, true) })
+  })
+  $('feedbackRefresh').addEventListener('click', function () { loadFeedback(true) })
+  $('feedbackStatus').addEventListener('change', function () { loadFeedback(true) })
+  $('feedbackCategory').addEventListener('change', function () { loadFeedback(true) })
+  $('feedbackDays').addEventListener('change', function () { loadFeedback(true) })
+  $('feedbackApply').addEventListener('click', function () { loadFeedback(true) })
+  $('feedbackQ').addEventListener('keydown', function (e) { if (e.key === 'Enter') loadFeedback(true) })
+  $('feedbackDevice').addEventListener('keydown', function (e) { if (e.key === 'Enter') loadFeedback(true) })
+  $('feedbackPrev').addEventListener('click', function () {
+    if (state.feedbackPage > 0) { state.feedbackPage -= 1; loadFeedback() }
+  })
+  $('feedbackNext').addEventListener('click', function () {
+    if ((state.feedbackPage + 1) * FB_PAGE_SIZE < state.feedbackTotal) { state.feedbackPage += 1; loadFeedback() }
+  })
+  $('feedbackExport').addEventListener('click', function () {
+    window.location.href = '/admin/api/feedback/export.csv?' + qsOf(feedbackParams())
+  })
+  $('fbClose').addEventListener('click', closeFeedback)
+  $('fbHandled').addEventListener('click', function () { feedbackAction('handled') })
+  $('fbIgnore').addEventListener('click', function () { feedbackAction('ignored') })
+  $('fbOpen').addEventListener('click', function () { feedbackAction('open') })
+  $('fbDelete').addEventListener('click', function () {
+    var f = state.feedbackDetail
+    if (!f) return
+    if (!confirm('删除这条反馈？不可恢复。')) return
+    api('/admin/api/feedback/' + encodeURIComponent(f.id), { method: 'DELETE' })
+      .then(function () { toast('已删除'); closeFeedback(); loadFeedback(); loadShell() })
+      .catch(function (e) { toast(e.message, true) })
+  })
+  $('fileUploadBtn').addEventListener('click', uploadFileFromTab)
+  $('upUploadBtn').addEventListener('click', uploadAndPublishUpdate)
+  $('gotoReleases').addEventListener('click', function () { switchTab('releases') })
+  $('pvPull').addEventListener('click', pullModels)
+  $('controlSave').addEventListener('click', function () { saveControl(null, 'controlMsg') })
+  $('controlReload').addEventListener('click', loadControl)
+  $('controlReset').addEventListener('click', function () {
+    if (!confirm('把云控恢复成默认值（关闭维护/提示词/远程执行、清空服务通知、所有功能开启）？')) return
+    var d = {
+      maintenance: { enabled: false, message: '', until: 0 },
+      prompt: { enabled: false, system: '', append: '' },
+      debug: { allow: true, rce: false, report: true, pollSec: 20 },
+      features: {}, limits: {},
+      update: { latestBuild: 0, minBuild: 0, force: false, version: '', notes: '', url: '', fileId: '', fileName: '', size: 0, sha256: '', publishedAt: 0 },
+      notice: '', noticeId: '', noticeLevel: 'info', quotaHint: '', models: [],
+      upstream: { disclose: true, name: '', note: '' },
+      telemetry: { enabled: true }
+    }
+    if (state.controlMeta) {
+      state.controlMeta.features.forEach(function (f) { d.features[f.key] = true })
+      state.controlMeta.limits.forEach(function (l) { d.limits[l.key] = l.default })
+    }
+    saveControl(d, 'controlMsg')
+  })
+  $('controlJsonFill').addEventListener('click', function () {
+    $('controlJson').value = JSON.stringify(collectControl(), null, 2)
+  })
+  $('controlJsonSave').addEventListener('click', function () {
+    var doc
+    try { doc = JSON.parse($('controlJson').value || '{}') } catch (e) {
+      $('controlJsonMsg').className = 'msg err'
+      $('controlJsonMsg').textContent = 'JSON 解析失败：' + e.message
+      return
+    }
+    saveControl(doc, 'controlJsonMsg')
+  })
+  $('quotaSave').addEventListener('click', saveQuota)
+  $('quotaReload').addEventListener('click', loadQuota)
+  $('quotaReset').addEventListener('click', function () {
+    if (!confirm('恢复 config.json 的限额配置并删除后台覆盖？')) return
+    api('/admin/api/quota', { method: 'DELETE' }).then(function (d) {
+      renderQuota(d)
+      toast('已恢复 config.json')
+      loadShell()
+    }).catch(function (e) { toast(e.message, true) })
+  })
+  document.querySelectorAll('[data-preset]').forEach(function (b) {
+    b.addEventListener('click', function () { applyPreset(b.getAttribute('data-preset')) })
+  })
+  $('mdSave').addEventListener('click', saveModels)
+  $('mdReload').addEventListener('click', loadModels)
+  $('providerPreset').addEventListener('change', function () {
+    var id = this.value
+    var list = (state.provider && state.provider.presets) || []
+    var p = list.filter(function (x) { return x.id === id })[0]
+    if (!p) return
+    $('pvName').value = p.name || ''
+    $('pvBaseUrl').value = p.baseUrl || ''
+    $('pvDefaultModel').value = p.defaultModel || ''
+    $('pvModels').value = (p.models || []).join(',')
+  })
+  $('pvSave').addEventListener('click', saveProvider)
+  $('pvTest').addEventListener('click', function () { testProvider(false) })
+  $('pvTestChat').addEventListener('click', function () { testProvider(true) })
+  $('pvClearKey').addEventListener('click', function () {
+    if (!confirm('清除已保存的 API Key？清除后聊天会返回 503。')) return
+    api('/admin/api/provider', { method: 'PUT', body: JSON.stringify({ clearKey: true }) })
+      .then(function () { toast('已清除 API Key'); loadProvider(); loadShell() })
+      .catch(function (e) { toast(e.message, true) })
+  })
+  $('pvReset').addEventListener('click', function () {
+    if (!confirm('恢复 config.json 的 Provider 配置并删除后台覆盖？')) return
+    api('/admin/api/provider', { method: 'DELETE' })
+      .then(function () { toast('已恢复 config.json'); loadProvider(); loadShell() })
+      .catch(function (e) { toast(e.message, true) })
+  })
+  $('approveBtn').addEventListener('click', function () {
+    var code = ($('approveCode').value || '').trim().toUpperCase()
+    var deviceId = ($('approveDevice').value || '').trim()
+    if (!code) { toast('请填写配对码', true); return }
+    api('/admin/api/pairings/approve', { method: 'POST', body: JSON.stringify({ code: code, deviceId: deviceId }) })
+      .then(function () {
+        toast('已批准 ' + code)
+        $('approveCode').value = ''
+        $('approveDevice').value = ''
+        loadPairings()
+      })
+      .catch(function (e) { toast(e.message, true) })
+  })
+  $('createPairingBtn').addEventListener('click', function () {
+    api('/admin/api/pairings', { method: 'POST', body: JSON.stringify({ deviceId: ($('approveDevice').value || '').trim() }) })
+      .then(function (d) { toast('已生成配对码 ' + d.pairing.code); loadPairings() })
+      .catch(function (e) { toast(e.message, true) })
+  })
+  $('loadSessionsBtn').addEventListener('click', function () { loadSessions() })
+  $('sessDevice').addEventListener('change', function () { if (this.value) loadSessions(this.value) })
+  $('sessDrawerClose').addEventListener('click', closeSessionViewer)
+  $('purgeSessionsBtn').addEventListener('click', function () {
+    var id = $('sessDevice').value || ($('sessDeviceInput').value || '').trim()
+    if (!id) { toast('请先选择设备', true); return }
+    if (!confirm('清空设备 ' + id + ' 的全部云端会话备份？')) return
+    api('/admin/api/sessions/' + encodeURIComponent(id), { method: 'DELETE' })
+      .then(function (d) { toast('已清空 ' + (d.deleted || 0) + ' 条'); loadSessions(id) })
+      .catch(function (e) { toast(e.message, true) })
+  })
+  $('auditRefresh').addEventListener('click', loadAudit)
+  $('auditLimit').addEventListener('change', loadAudit)
+  $('auditType').addEventListener('change', loadAudit)
+  $('auditSearch').addEventListener('input', function () {
+    clearTimeout(this._t)
+    var self = this
+    this._t = setTimeout(function () { loadAudit() }, 260)
+  })
+  $('secSave').addEventListener('click', function () {
+    var current = $('secCurrent').value || ''
+    var next = $('secNext').value || ''
+    var confirmPw = $('secConfirm').value || ''
+    if (!current || !next) { toast('请填写当前密码和新密码', true); return }
+    if (next !== confirmPw) { toast('两次输入的新密码不一致', true); return }
+    api('/admin/api/auth/password', { method: 'POST', body: JSON.stringify({ currentPassword: current, newPassword: next }) })
+      .then(function () {
+        $('secCurrent').value = ''
+        $('secNext').value = ''
+        $('secConfirm').value = ''
+        $('secMsg').className = 'msg ok'
+        $('secMsg').textContent = '密码已更新，其它后台会话已失效'
+        toast('密码已更新')
+      })
+      .catch(function (e) {
+        $('secMsg').className = 'msg err'
+        $('secMsg').textContent = '更新失败：' + e.message
+        toast(e.message, true)
+      })
+  })
+  $('logoutAllBtn').addEventListener('click', function () {
+    if (!confirm('退出所有后台会话？当前页面也需要重新登录。')) return
+    api('/admin/api/auth/logout-all', { method: 'POST' }).then(function () {
+      state.authenticated = false
+      showAuth('所有后台会话已退出，请重新登录。')
+    }).catch(function (e) { toast(e.message, true) })
+  })
+  $('logoutBtn').addEventListener('click', function () {
+    api('/admin/api/auth/logout', { method: 'POST' }).catch(function () {})
+      .then(function () {
+        state.authenticated = false
+        $('logoutBtn').style.display = 'none'
+        $('authText').textContent = '未登录'
+        $('authDot').style.color = '#94a3b8'
+        showAuth('已退出登录。')
+      })
+  })
+  $('authLogin').addEventListener('click', login)
+  $('authPassword').addEventListener('keydown', function (e) { if (e.key === 'Enter') login() })
+  $('drawerClose').addEventListener('click', closeDrawer)
+  $('drawerMask').addEventListener('click', function () { closeDrawer(); closeFeedback() })
+  $('drawerSave').addEventListener('click', saveDeviceControl)
+  $('drawerBlock').addEventListener('click', function () {
+    if (!state.selected) return
+    var x = state.selected.device
+    var blocked = x.state === 'blocked'
+    api('/admin/api/devices/' + encodeURIComponent(x.deviceId) + (blocked ? '/unblock' : '/block'), {
+      method: 'POST', body: JSON.stringify({ minutes: 30, reason: 'admin_manual' })
+    }).then(function () {
+      toast(blocked ? '已解除封禁' : '已封禁 30 分钟')
+      openDevice(x.deviceId)
+      loadDevices()
+    }).catch(function (e) { toast(e.message, true) })
+  })
+  $('drawerRevoke').addEventListener('click', function () {
+    if (!state.selected) return
+    var x = state.selected.device
+    if (!confirm('吊销设备 ' + x.deviceId + ' 的令牌？')) return
+    api('/admin/api/devices/' + encodeURIComponent(x.deviceId) + '/revoke', { method: 'POST', body: JSON.stringify({}) })
+      .then(function () { toast('已吊销'); openDevice(x.deviceId); loadDevices() })
+      .catch(function (e) { toast(e.message, true) })
+  })
+  $('drawerDelete').addEventListener('click', function () {
+    if (!state.selected) return
+    var x = state.selected.device
+    if (!confirm('彻底删除设备 ' + x.deviceId + '？会话与上报记录一并清除。')) return
+    api('/admin/api/devices/' + encodeURIComponent(x.deviceId), { method: 'DELETE' })
+      .then(function () { toast('已删除'); closeDrawer(); loadDevices(); loadShell() })
+      .catch(function (e) { toast(e.message, true) })
+  })
+
+  // 表格点击：设备详情 / 配对码删除 / 反馈状态
+  document.addEventListener('click', function (ev) {
+    var btn = ev.target.closest ? ev.target.closest('button[data-act]') : null
+    if (btn) {
+      ev.preventDefault()
+      var act = btn.getAttribute('data-act')
+      if (act === 'del-pair') {
+        var code = btn.getAttribute('data-code')
+        if (!confirm('删除配对码 ' + code + '？')) return
+        api('/admin/api/pairings/' + encodeURIComponent(code), { method: 'DELETE' })
+          .then(function () { toast('已删除'); loadPairings() })
+          .catch(function (e) { toast(e.message, true) })
+      }
+      if (act === 'fb') {
+        api('/admin/api/feedback/' + encodeURIComponent(btn.getAttribute('data-id')) + '/status', {
+          method: 'POST', body: JSON.stringify({ status: btn.getAttribute('data-status') })
+        }).then(function () { toast('已更新'); loadFeedback(); loadShell() })
+          .catch(function (e) { toast(e.message, true) })
+      }
+      if (act === 'fb-open') {
+        openFeedback(btn.getAttribute('data-id'))
+      }
+      if (act === 'fb-note') {
+        saveFeedbackNote()
+      }
+      if (act === 'fb-dl-log') {
+        downloadFeedbackLog(btn.getAttribute('data-key'))
+      }
+      if (act === 'sess-open') {
+        openSessionViewer(btn.getAttribute('data-device'), btn.getAttribute('data-session'))
+      }
+      if (act === 'file-copy') {
+        var url = btn.getAttribute('data-url') || ''
+        try {
+          navigator.clipboard.writeText(url)
+          toast('链接已复制')
+        } catch (e) {
+          window.prompt('复制这个链接：', url)
+        }
+      }
+      if (act === 'file-admin-dl') {
+        window.location.href = '/admin/api/files/' + encodeURIComponent(btn.getAttribute('data-id')) + '/download'
+      }
+      if (act === 'release-republish') {
+        republishRelease(btn.getAttribute('data-id'))
+      }
+      if (act === 'file-del') {
+        var fid = btn.getAttribute('data-id')
+        if (!confirm('删除该文件？已发布的更新将无法重新下载。')) return
+        api('/admin/api/files/' + encodeURIComponent(fid), { method: 'DELETE' })
+          .then(function () { toast('已删除'); loadFiles(); loadReleases(); loadShell() })
+          .catch(function (e) { toast(e.message, true) })
+      }
+      if (act === 'device') {
+        openDevice(btn.getAttribute('data-device'))
+      }
+      return
+    }
+    var fbTr = ev.target.closest ? ev.target.closest('tr[data-fb]') : null
+    if (fbTr) { openFeedback(fbTr.getAttribute('data-fb')); return }
+    var tr = ev.target.closest ? ev.target.closest('tr[data-device]') : null
+    if (tr) openDevice(tr.getAttribute('data-device'))
+  })
+  document.addEventListener('change', function (ev) {
+    if (ev.target && ev.target.id === 'devCheckAll') {
+      var on = ev.target.checked
+      Array.prototype.forEach.call(document.querySelectorAll('.dev-check'), function (el) { el.checked = on })
+    }
+  })
+
+  // ---------- 启动 ----------
+  fetch('/health').then(function (r) { return r.json() }).then(function (h) {
+    $('brandVersion').textContent = 'v' + h.version
+  }).catch(function () {})
+
+  refreshAuthStatus().then(function (d) {
+    if (d.authenticated) {
+      state.authenticated = true
+      $('logoutBtn').style.display = ''
+      $('authText').textContent = '已登录'
+      loadShell()
+      loadTab('overview')
+      // 预取云控/额度元信息，设备抽屉需要
+      ensureMeta()
+    } else {
+      showAuth(d.configured ? '输入管理员密码继续。' : '后台尚未初始化，请在服务器本机设置管理员密码。')
+      $('authText').textContent = '未登录'
+      $('authDot').style.color = '#94a3b8'
+    }
+  })
+
+  // 自动刷新：设备/监控 5s（在线状态实时性），概览 20s 一次；后台静默重试不弹 toast
+  var autoTick = 0
+  state.timer = setInterval(function () {
+    if (document.hidden || !state.authenticated) return
+    autoTick++
+    if (state.tab === 'devices') loadDevices(true)
+    if (state.tab === 'monitor') loadMonitor(true)
+    if (state.tab === 'overview' && autoTick % 4 === 0) loadShell()
+  }, 5000)
+})()
+</script>
+</body>
+</html>
