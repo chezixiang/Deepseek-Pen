@@ -1,5 +1,6 @@
 
 import { httpRequest } from './http.js'
+import { appLog, appLogError, debugLog } from './app-log.js'
 
 // 后端健康检查服务
 
@@ -89,7 +90,7 @@ async function checkBackendHealth(options = {}) {
                     }
                 } else if (accounts && accounts.total === 0) {
                     // 没有可用账号，但后端已启动
-                    console.warn('BACKEND_HEALTH | 后端已启动但无可用账号');
+                    appLog('[health] 后端已启动但没有可用账号');
                     return {
                         success: true,
                         data: result.data,
@@ -112,7 +113,7 @@ async function checkBackendHealth(options = {}) {
                 }
             }
         } catch (e) {
-            console.error('BACKEND_HEALTH | attempt ' + attempt + ' failed: ' + (e.message || String(e)));
+            debugLog('[health] 第 ' + attempt + ' 次探测失败：' + (e.message || String(e)));
             
             if (attempt < maxAttempts) {
                 // 还有重试机会
@@ -154,7 +155,7 @@ async function quickHealthCheck() {
 
         return { ok: false }
     } catch (e) {
-        console.error('BACKEND_HEALTH | quick check failed: ' + (e.message || String(e)));
+        debugLog('[health] 快速检查失败：' + (e.message || String(e)));
         return { ok: false }
     }
 }
@@ -180,14 +181,14 @@ function createBackendMonitor(callbacks = {}, interval = 10000) {
             // 后端正常
             if (!isConnected) {
                 // 之前断开，现在恢复
-                console.log('BACKEND_MONITOR | 后端已重新连接');
+                appLog('[health] 后端已重新连接');
                 isConnected = true;
                 consecutiveFailures = 0;
                 if (callbacks.onReconnect) {
                     try {
                         callbacks.onReconnect();
                     } catch (e) {
-                        console.error('BACKEND_MONITOR | onReconnect callback error:', e);
+                        appLogError('health.onReconnect', e);
                     }
                 }
             } else {
@@ -200,13 +201,13 @@ function createBackendMonitor(callbacks = {}, interval = 10000) {
             
             if (isConnected && consecutiveFailures >= MAX_FAILURES) {
                 // 连续多次失败，认为断开
-                console.error('BACKEND_MONITOR | 后端连接断开');
+                appLog('[health] 后端连接断开（连续 ' + consecutiveFailures + ' 次探测失败）');
                 isConnected = false;
                 if (callbacks.onDisconnect) {
                     try {
                         callbacks.onDisconnect();
                     } catch (e) {
-                        console.error('BACKEND_MONITOR | onDisconnect callback error:', e);
+                        appLogError('health.onDisconnect', e);
                     }
                 }
             }
@@ -216,7 +217,7 @@ function createBackendMonitor(callbacks = {}, interval = 10000) {
     return {
         start() {
             if (timer) return
-            console.log('BACKEND_MONITOR | 开始监控后端状态');
+            debugLog('[health] 开始监控后端状态（间隔 ' + interval + 'ms）');
             // 立即检查一次
             check();
             // 定期检查
@@ -224,7 +225,7 @@ function createBackendMonitor(callbacks = {}, interval = 10000) {
         },
         stop() {
             if (timer) {
-                console.log('BACKEND_MONITOR | 停止监控后端状态');
+                debugLog('[health] 停止监控后端状态');
                 clearInterval(timer);
                 timer = null;
             }

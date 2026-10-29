@@ -1,4 +1,4 @@
-import { dataDirBase, execShell, joinPath, readFile, sleep, statSize, waitForFile, writeFile } from './store.js'
+import { appLogError, dataDirBase, execShell, joinPath, readFile, sleep, statSize, waitForFile, writeFile } from './store.js'
 
 // 拍照与取景：JPEG 帧循环取景 + 单帧拍照。
 const VIDEO_MAIN = '/dev/video29';
@@ -122,7 +122,7 @@ function startFramePreview(onFrame) {
             const script = joinPath(dataDirBase(), 'camfeed.sh');
             await writeFile(script, CAMFEED_SH.replace(/__FRAME_BASE__/g, frameBase));
             execShell('( nohup sh ' + shq(script) + ' >/dev/null 2>&1 & )');
-        } catch (e) { /* 脚本写失败则永远无帧，UI 保持黑底（可接受降级） */ }
+        } catch (e) { appLogError('camera.feed', e, '取景脚本写入失败，画面将保持黑屏') }
         let lastN = 0;
         while (seq === framePollSeq) {
             // done 内容是单调帧号；每帧使用新文件名，避免 image 组件缓存覆盖后的旧内容。

@@ -1,4 +1,4 @@
-import { appLog, dataDirBase, execShell, exists, joinPath, shq, statSize, waitForFile } from './store.js'
+import { appLog, appLogError, dataDirBase, execShell, exists, joinPath, shq, statSize, waitForFile } from './store.js'
 
 // Emoji 字体（实验）：下载 NotoColorEmoji 并通过 dom.addRule 注册，
 
@@ -98,7 +98,7 @@ async function ensureEmojiFont() {
           }
         }
       } catch (e) {
-        appLog('[emoji] 下载异常 ' + (e && e.message ? e.message : String(e)));
+        appLogError('emoji.download', e);
       }
     }
     try { execShell('rm -f ' + shq(path + '.part') + ' ' + shq(resultFile)); } catch (e) { /* 忽略 */ }

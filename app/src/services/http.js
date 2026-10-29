@@ -1,5 +1,6 @@
 import http from 'http';
 import { isPaired, signRequest, urlPath, randomHex } from './api-auth.js'
+import { appLog, appLogError, debugLog } from './app-log.js'
 
 // HTTP 客户端：用设备框架自带的 `http` 模块（import http from 'http'）。
 
@@ -108,15 +109,23 @@ async function httpRequest({ url, method = 'GET', headers = {}, data, timeout = 
     const resp = await Promise.race([devicePromise, timeoutPromise]);
     if (timer) clearTimeout(timer);
     if (resp && resp.error) {
+      // 设备 http 模块把失败塞在 resp.error（不抛异常）：以前只 console，设备上看不到
+      appLog('[http] ' + method + ' ' + url + ' 失败：' + resp.error);
       return { statusCode: 0, data: null, error: resp.error }
     }
     const status = (resp && resp.status) || 0;
     const parsed = parseBody(resp && resp.body);
-    try { console.error('DEEPSEEK_HTTP | ' + method + ' ' + url + ' => status=' + status); } catch (e) { /* 忽略 */ }
+    if (status >= 400) {
+      // 4xx/5xx 的响应体往往就是服务端的错误原因，留 200 字符进日志
+      const bodyText = typeof resp.body === 'string' ? resp.body : '';
+      appLog('[http] ' + method + ' ' + url + ' => HTTP ' + status + (bodyText ? ' ' + bodyText.replace(/\s+/g, ' ').slice(0, 200) : ''));
+    } else {
+      debugLog('HTTP ' + method + ' ' + url + ' => ' + status);
+    }
     return { statusCode: status, data: parsed, error: status >= 400 ? ('HTTP ' + status) : undefined }
   } catch (e) {
     if (timer) clearTimeout(timer);
-    try { console.error('DEEPSEEK_HTTP | ' + method + ' ' + url + ' => err=' + String(e)); } catch (e2) { /* 忽略 */ }
+    appLogError('http', e, method + ' ' + url);
     return { statusCode: 0, data: null, error: e && e.message ? e.message : String(e) }
   }
 }
