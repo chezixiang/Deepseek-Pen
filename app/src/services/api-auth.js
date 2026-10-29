@@ -186,7 +186,7 @@ const AUTH_HEADER_SIGNATURE = 'X-Ds-Signature';
 // 服务端 /^(deepseek-pen|pen-miniapp)\/[0-9A-Za-z._-]+$/。
 const CLIENT_HEADER = 'X-Ds-Client';
 const CLIENT_ID = 'deepseek-pen';
-const CLIENT_VERSION$1 = '0.1.5-build-' + BUILD_NUM;
+const CLIENT_VERSION$1 = '0.2.0-build-' + BUILD_NUM;
 
 function clientHeaders() {
   const h = {};
@@ -261,5 +261,21 @@ function maskDeviceId(id) {
   return v.slice(0, 6) + '****' + v.slice(-4)
 }
 
+// 设备令牌只对签发它的服务有效。设置里同时存着「内置服务」和「自定义端点」两套
+// 地址，切换模式后旧的设备令牌还在——拿着 A 服务的令牌去请求 B 服务，必然 401，
+// 而且报错会被解释成"令牌过期"，把用户引到错误的处置上。
+// 这里只比较主机名：协议、端口、/v1 前缀、路径写法都不影响归属判断。
+function urlHost(url) {
+  const m = String(url || '').trim().match(/^[a-z][a-z0-9+.-]*:\/\/([^/?#]+)/i);
+  return m ? m[1].toLowerCase() : ''
+}
 
-export { AUTH_HEADER_DEVICE_ID, AUTH_HEADER_NONCE, AUTH_HEADER_SIGNATURE, AUTH_HEADER_TIMESTAMP, CLIENT_HEADER, CLIENT_ID, CLIENT_VERSION$1, PAIRING_ALPHABET, PAIRING_CODE_LEN, SHA256_K, clientHeaders, generatePairingCode, hmacSha256Hex, isPaired, maskDeviceId, randByte, randomHex, rotr, sha256Bytes, sha256Hex, signRequest, signatureBase, toHex, tokenExpiringSoon, urlPath, utf8Bytes, uuidV4 };
+function isSameHost(a, b) {
+  const ha = urlHost(a);
+  const hb = urlHost(b);
+  if (!ha || !hb) return false
+  return ha === hb
+}
+
+
+export { AUTH_HEADER_DEVICE_ID, AUTH_HEADER_NONCE, AUTH_HEADER_SIGNATURE, AUTH_HEADER_TIMESTAMP, CLIENT_HEADER, CLIENT_ID, CLIENT_VERSION$1, PAIRING_ALPHABET, PAIRING_CODE_LEN, SHA256_K, clientHeaders, generatePairingCode, hmacSha256Hex, isPaired, isSameHost, maskDeviceId, randByte, randomHex, rotr, sha256Bytes, sha256Hex, signRequest, signatureBase, toHex, tokenExpiringSoon, urlHost, urlPath, utf8Bytes, uuidV4 };
