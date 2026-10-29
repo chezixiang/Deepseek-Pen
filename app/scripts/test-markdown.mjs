@@ -2,7 +2,10 @@
 // markdown.js 回归用例：块解析（代码块缩进保留）、行内强调、公式段、emoji 拆分。
 // 核心回归：旧版在围栏解析前对全文做 [ \t]{2,} 折叠，代码块缩进被压掉，
 // 且缩进丢失会随消息持久化、作为历史回传给模型（丢语义）。
-import { markdownToBlocks, inlineSpans, splitEmojiRuns, splitMathSegments, bracesBalanced } from '../src/services/markdown.js'
+// 说明：emoji 分段逻辑已迁到 emoji-subst.js（模板按段套字体），这里只保留
+// markdown 结构解析相关用例，emoji 用例改为从新模块导入，避免测试与实现脱节。
+import { markdownToBlocks, inlineSpans, splitMathSegments, bracesBalanced } from '../src/services/markdown.js'
+import { splitEmojiRuns } from '../src/services/emoji-subst.js'
 
 let fail = 0
 function check(name, got, want) {

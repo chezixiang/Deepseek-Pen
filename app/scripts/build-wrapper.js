@@ -17,6 +17,7 @@ const arg = (process.argv[2] || '').toLowerCase();
 const isDev = arg === 'dev';
 const minify = arg === 'prod';
 const qjsc = arg === 'prod';
+let buildNum = 0;
 
 async function main() {
   // 必须先初始化 appInfo，否则 getFalconBuildDir 会抛异常
@@ -54,15 +55,27 @@ async function main() {
     const infoSrc = fs.readFileSync(infoPath, 'utf8');
     const m = infoSrc.match(/BUILD_NUM\s*=\s*(\d+)/);
     const next = (m ? parseInt(m[1], 10) : 0) + 1;
+    buildNum = next;
     const stamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
+    // APP_VERSION 必须是构建期融合好的单个字符串字面量（"0.2.0 build 177"），
+    // 绝不能在运行时拼接：发布后台（penai-upstream/src/amr.js）靠扫描 AMR 包内
+    // JS/字节码文本里的 "<version> build <N>" 字面量自动识别构建号，而拼接形态
+    // （'0.2.0 build ' + BUILD_NUM）在 dev/未常量折叠的产物里不生成可扫描的
+    // 完整字面量，后台就会报「未能从包内提取构建号」。字符串字面量能穿过
+    // minify 与 qjsc 字节码常量池，是唯一在所有产物形态下都存活的"标记"。
+    const pkgForVersion = JSON.parse(fs.readFileSync(path.resolve(__dirname, '..', 'package.json'), 'utf8'));
+    const versionBase = String(pkgForVersion.version || '0.0.0');
     fs.writeFileSync(
       infoPath,
       '// 构建信息：BUILD_NUM 由 scripts/build-wrapper.js 在每次构建时自动 +1（#17）。\n' +
       '// 手动编辑本文件即可校准版本号。提交到 git，保证不同克隆的构建序号连续。\n' +
+      '// APP_VERSION 是构建期融合的单个字面量，不要改回运行时拼接：发布后台\n' +
+      '// 靠扫描包内 "<version> build <N>" 字面量自动识别构建号。\n' +
       'export const BUILD_NUM = ' + next + '\n' +
-      'export const BUILD_AT = \'' + stamp + '\'\n'
+      'export const BUILD_AT = \'' + stamp + '\'\n' +
+      'export const APP_VERSION = \'' + versionBase + ' build ' + next + '\'\n'
     );
-    console.log('[build-wrapper] 版本号递增 => build ' + next + '（' + stamp + '）');
+    console.log('[build-wrapper] 版本号递增 => ' + versionBase + ' build ' + next + '（' + stamp + '）');
   } catch (e) {
     console.error('[build-wrapper] 版本号递增失败（不影响构建继续）: ' + e.message);
   }
@@ -112,6 +125,21 @@ async function main() {
   // 5. Generate manifest
   console.log('[build-wrapper] 生成 manifest...')
   await manifest.generate();
+  // 发布管理器直接从 AMR 读取 build；显式写一份元数据，避免依赖压缩包里的
+  // 版本字符串格式（minify/qjsc 变化不影响构建号提取）。
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.resolve(__dirname, '..', 'package.json'), 'utf8'))
+    fs.writeFileSync(path.join(falconDir, 'release.json'), JSON.stringify({
+      appId: pkg.appid || '',
+      appName: pkg.name || '',
+      version: pkg.version || '',
+      build: buildNum,
+      builtAt: new Date().toISOString()
+    }, null, 2) + '\n');
+    console.log('[build-wrapper] release.json 已写入（build ' + buildNum + '）')
+  } catch (e) {
+    console.warn('[build-wrapper] 写 release.json 失败（服务器仍可从 JS 包提取）: ' + e.message)
+  }
   console.log('[build-wrapper] manifest 生成完成')
 
   // 6. Pack

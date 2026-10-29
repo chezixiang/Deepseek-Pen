@@ -4,8 +4,11 @@ import fs from 'node:fs'
 const camera = fs.readFileSync(new URL('../src/services/camera.js', import.meta.url), 'utf8')
 const page = fs.readFileSync(new URL('../src/pages/index/index.vue', import.meta.url), 'utf8')
 
+// startPreview 在文件末尾统一导出，定义处没有 export 前缀——按定义位置切片，
+// 兼容两种写法（旧版断言写死 export 前缀，源码改了导出方式后就一直读成空串）
+const previewDefine = camera.search(/export\s+async\s+function\s+startPreview|async\s+function\s+startPreview/)
 const previewStart = camera.slice(
-  camera.indexOf('export async function startPreview'),
+  previewDefine,
   camera.indexOf('export function stopPreview')
 )
 assert.doesNotMatch(
